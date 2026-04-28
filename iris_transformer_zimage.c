@@ -40,7 +40,6 @@
 
 #define ZI_SEQ_MULTI_OF     32      /* Pad sequences to multiples of 32 */
 #define ZI_NORM_EPS         1e-5f   /* RMSNorm epsilon */
-#define ZI_BF16_SDPA_SEQ    1024    /* Prefer bf16 SDPA at large sequence lengths */
 #define ZI_MAX_SHARDS       32
 
 /* Cumulative zImage timing counters (defined in iris_sample.c). */
@@ -202,11 +201,6 @@ typedef struct {
     iris_gpu_tensor_t gate_up;  /* [seq, ffn_dim] */
     iris_gpu_tensor_t up;       /* [seq, ffn_dim] */
     iris_gpu_tensor_t down;     /* [seq, dim] */
-    /* BF16 attention scratch (for SDPA path via iris_gpu_attention_fused_bf16) */
-    iris_gpu_tensor_t q_bf16;       /* [seq, dim] bf16 */
-    iris_gpu_tensor_t k_bf16;       /* [seq, dim] bf16 */
-    iris_gpu_tensor_t v_bf16;       /* [seq, dim] bf16 */
-    iris_gpu_tensor_t attn_out_bf16;/* [seq, dim] bf16 */
     float *mod;                     /* [4*dim] CPU modulation scratch */
     float *fused_attn_norm;         /* [dim] CPU fused RMS weight scratch */
     float *fused_ffn_norm;          /* [dim] CPU fused RMS weight scratch */
@@ -225,10 +219,6 @@ static void zi_gpu_scratch_free(zi_gpu_scratch_t *s) {
     if (s->gate_up) iris_gpu_tensor_free(s->gate_up);
     if (s->up) iris_gpu_tensor_free(s->up);
     if (s->down) iris_gpu_tensor_free(s->down);
-    if (s->q_bf16) iris_gpu_tensor_free(s->q_bf16);
-    if (s->k_bf16) iris_gpu_tensor_free(s->k_bf16);
-    if (s->v_bf16) iris_gpu_tensor_free(s->v_bf16);
-    if (s->attn_out_bf16) iris_gpu_tensor_free(s->attn_out_bf16);
     if (s->mod) free(s->mod);
     if (s->fused_attn_norm) free(s->fused_attn_norm);
     if (s->fused_ffn_norm) free(s->fused_ffn_norm);
@@ -259,18 +249,6 @@ static int zi_gpu_scratch_init(zi_gpu_scratch_t *s, int seq, int dim, int ffn_di
         !s->proj || !s->norm2 || !s->gate_up || !s->up || !s->down) {
         zi_gpu_scratch_free(s);
         return 0;
-    }
-
-    {
-        size_t qkv_elems = (size_t)seq * dim;
-        s->q_bf16 = iris_gpu_tensor_alloc_f16(qkv_elems);
-        s->k_bf16 = iris_gpu_tensor_alloc_f16(qkv_elems);
-        s->v_bf16 = iris_gpu_tensor_alloc_f16(qkv_elems);
-        s->attn_out_bf16 = iris_gpu_tensor_alloc_f16(qkv_elems);
-        if (!s->q_bf16 || !s->k_bf16 || !s->v_bf16 || !s->attn_out_bf16) {
-            zi_gpu_scratch_free(s);
-            return 0;
-        }
     }
 
     s->mod = (float *)malloc(4 * (size_t)dim * sizeof(float));
@@ -343,47 +321,17 @@ static int zi_gpu_linear_into_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
     return 0;
 }
 
-/* Self-attention dispatcher for GPU. Tries bf16 SDPA first for large
- * sequences (>= 1024 tokens) since bf16 attention fits in memory better,
- * then falls back to f32 fused attention, then tries the other precision,
- * and finally falls back to the legacy f32->f16->f32 path. This cascading
- * fallback ensures attention works at any sequence length. */
+/* Self-attention dispatcher for GPU. Uses f32 fused attention exclusively —
+ * the f32->bf16->sdpa->bf16->f32 round-trip causes grid artifacts at non-square
+ * resolutions due to error accumulation across 30+ transformer layers with
+ * 3-axis RoPE. The f32 kernel fits in threadgroup memory for all supported
+ * Z-Image dimensions (max ~7680 tokens at 32KB; 1792x1792 needs ~3648). */
 static int zi_gpu_attention(iris_gpu_tensor_t out_f32,
                              iris_gpu_tensor_t q_f32, iris_gpu_tensor_t k_f32, iris_gpu_tensor_t v_f32,
                              int seq, int n_heads, int head_dim, float attn_scale,
                              zi_gpu_scratch_t *scratch) {
-    int prefer_bf16 = (seq >= ZI_BF16_SDPA_SEQ);
-
-    if (prefer_bf16) {
-        if (iris_gpu_convert_f32_to_bf16_into(scratch->q_bf16, q_f32) &&
-            iris_gpu_convert_f32_to_bf16_into(scratch->k_bf16, k_f32) &&
-            iris_gpu_convert_f32_to_bf16_into(scratch->v_bf16, v_f32) &&
-            iris_gpu_attention_fused_bf16(scratch->attn_out_bf16,
-                                          scratch->q_bf16, scratch->k_bf16, scratch->v_bf16,
-                                          seq, seq, n_heads, head_dim, attn_scale) &&
-            iris_gpu_convert_bf16_to_f32_into(out_f32, scratch->attn_out_bf16)) {
-            return 1;
-        }
-    }
-
-    if (iris_gpu_attention_fused(out_f32, q_f32, k_f32, v_f32,
-                                 seq, seq, n_heads, head_dim, attn_scale)) {
-        return 1;
-    }
-
-    if (!prefer_bf16) {
-        if (iris_gpu_convert_f32_to_bf16_into(scratch->q_bf16, q_f32) &&
-            iris_gpu_convert_f32_to_bf16_into(scratch->k_bf16, k_f32) &&
-            iris_gpu_convert_f32_to_bf16_into(scratch->v_bf16, v_f32) &&
-            iris_gpu_attention_fused_bf16(scratch->attn_out_bf16,
-                                          scratch->q_bf16, scratch->k_bf16, scratch->v_bf16,
-                                          seq, seq, n_heads, head_dim, attn_scale) &&
-            iris_gpu_convert_bf16_to_f32_into(out_f32, scratch->attn_out_bf16)) {
-            return 1;
-        }
-    }
-
-    return iris_gpu_attention_bf16(out_f32, q_f32, k_f32, v_f32,
+    (void)scratch;
+    return iris_gpu_attention_fused(out_f32, q_f32, k_f32, v_f32,
                                     seq, seq, n_heads, head_dim, attn_scale);
 }
 

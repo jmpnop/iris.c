@@ -88,8 +88,7 @@ static const char *schedule_name(int sched) {
 }
 
 static int cli_default_steps(iris_ctx *ctx) {
-    if (iris_is_zimage(ctx)) return 9;
-    return iris_is_distilled(ctx) ? 4 : 50;
+    return iris_default_steps(ctx);
 }
 
 /* ======================================================================
@@ -592,11 +591,7 @@ static void cmd_help(void) {
     printf("  !seed <n>             Set seed (-1 for random)\n");
     printf("  !size <W>x<H>         Set default size\n");
     printf("  !steps <n>            Set sampling steps (0 = auto)\n");
-    if (iris_is_zimage(state.ctx)) {
-        printf("  !guidance <n>         Set guidance (ignored for Z-Image, fixed at 0.0)\n");
-    } else {
-        printf("  !guidance <n>         Set CFG guidance scale (0 = auto)\n");
-    }
+    printf("  !guidance <n>         Set CFG guidance scale (0 = auto)\n");
     printf("  !linear               Toggle linear timestep schedule\n");
     printf("  !power [alpha]        Toggle power schedule (default alpha: 2.0)\n");
     printf("  !sigmoid              Toggle Flux shifted sigmoid schedule\n");
@@ -761,9 +756,9 @@ static void cmd_guidance(char *arg) {
         return;
     }
 
-    if (iris_is_zimage(state.ctx)) {
+    if (iris_is_zimage(state.ctx) && iris_is_distilled(state.ctx)) {
         state.guidance = 0.0f;
-        printf("Guidance is fixed to 0.0 for Z-Image.\n");
+        printf("Guidance is fixed to 0.0 for Z-Image Turbo.\n");
         return;
     }
 
@@ -1123,7 +1118,7 @@ int iris_cli_run(iris_ctx *ctx, const char *model_dir) {
     state.height = CLI_DEFAULT_HEIGHT;
     /* Use model defaults for steps and guidance */
     state.steps = cli_default_steps(ctx);
-    state.guidance = 0.0f;  /* 0 = auto from model type */
+    state.guidance = iris_default_guidance(ctx);
     state.seed = -1;
     state.power_alpha = 2.0f;
 

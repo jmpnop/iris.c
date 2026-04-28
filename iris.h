@@ -141,6 +141,12 @@ int iris_is_distilled(iris_ctx *ctx);
 int iris_is_zimage(iris_ctx *ctx);
 
 /*
+ * Get model default step count and guidance scale.
+ */
+int iris_default_steps(iris_ctx *ctx);
+float iris_default_guidance(iris_ctx *ctx);
+
+/*
  * Force base model mode (overrides autodetection).
  * Call after iris_load_dir() if model_index.json is missing.
  */

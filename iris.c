@@ -254,10 +254,12 @@ iris_ctx *iris_load_dir(const char *model_dir) {
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
 
     /* Autodetect model type from model_index.json.
-     * Distilled model has "is_distilled": true, base model does not.
-     * Z-Image has "_class_name": "ZImagePipeline". */
+     * FLUX: "is_distilled": true → distilled (4-step), absent → base (50-step).
+     * Z-Image: field absent in both Turbo and base; default to distilled (Turbo),
+     * override with --base. */
     ctx->is_distilled = 1;  /* Default to distilled */
     ctx->is_zimage = 0;
+    int has_distilled_field = 0;
     snprintf(path, sizeof(path), "%s/model_index.json", model_dir);
     if (file_exists(path)) {
         FILE *f = fopen(path, "r");
@@ -266,17 +268,22 @@ iris_ctx *iris_load_dir(const char *model_dir) {
             size_t n = fread(buf, 1, sizeof(buf) - 1, f);
             buf[n] = '\0';
             fclose(f);
-            /* Check for Z-Image pipeline */
             if (strstr(buf, "ZImagePipeline") || strstr(buf, "Z-Image")) {
                 ctx->is_zimage = 1;
             }
-            /* If "is_distilled" is present and true, it's distilled.
-             * If absent, it's the base model. */
-            if (!strstr(buf, "\"is_distilled\": true") &&
-                !strstr(buf, "\"is_distilled\":true")) {
-                ctx->is_distilled = 0;
+            if (strstr(buf, "\"is_distilled\"")) {
+                has_distilled_field = 1;
+                if (!strstr(buf, "\"is_distilled\": true") &&
+                    !strstr(buf, "\"is_distilled\":true")) {
+                    ctx->is_distilled = 0;
+                }
             }
         }
+    }
+    /* Z-Image models don't carry is_distilled — default to Turbo (distilled).
+     * Use --base to select the non-distilled Z-Image variant. */
+    if (ctx->is_zimage && !has_distilled_field) {
+        ctx->is_distilled = 1;
     }
 
     /* Read transformer/config.json to determine model size and architecture. */
@@ -418,17 +425,23 @@ iris_ctx *iris_load_dir(const char *model_dir) {
     /* Determine model variant name based on architecture. */
     if (ctx->is_zimage) {
         int hidden_size = ctx->zi_dim;
-        const char *size_label = "6B";  /* Z-Image-Turbo is 6B */
+        const char *size_label = "6B";
         if (hidden_size != 3840) {
             size_label = (hidden_size > 3840) ? "large" : "small";
         }
         ctx->is_non_commercial = 0;  /* Z-Image is Apache 2.0 */
         ctx->num_heads = num_heads;
-        ctx->default_steps = 9;       /* 8 NFE = 9 scheduler steps */
-        ctx->default_guidance = 0.0f; /* No CFG for Z-Image-Turbo */
-        ctx->is_distilled = 1;        /* Treat as distilled (no CFG) */
-        snprintf(ctx->model_name, sizeof(ctx->model_name),
-                 "Z-Image-Turbo-%s", size_label);
+        if (ctx->is_distilled) {
+            ctx->default_steps = 9;       /* 8 NFE = 9 scheduler steps */
+            ctx->default_guidance = 0.0f; /* No CFG for distilled */
+            snprintf(ctx->model_name, sizeof(ctx->model_name),
+                     "Z-Image-Turbo-%s", size_label);
+        } else {
+            ctx->default_steps = 20;
+            ctx->default_guidance = 3.5f;
+            snprintf(ctx->model_name, sizeof(ctx->model_name),
+                     "Z-Image-%s", size_label);
+        }
     } else {
         int hidden_size = num_heads * 128;  /* head_dim is always 128 */
         const char *size_label = (hidden_size > 3072) ? "9B" : "4B";
@@ -511,14 +524,33 @@ int iris_is_zimage(iris_ctx *ctx) {
     return ctx ? ctx->is_zimage : 0;
 }
 
+int iris_default_steps(iris_ctx *ctx) {
+    return ctx ? ctx->default_steps : 4;
+}
+
+float iris_default_guidance(iris_ctx *ctx) {
+    return ctx ? ctx->default_guidance : 1.0f;
+}
+
 void iris_set_base_mode(iris_ctx *ctx) {
     if (!ctx) return;
     ctx->is_distilled = 0;
-    ctx->default_steps = 50;
-    ctx->default_guidance = 4.0f;
-    const char *size_label = ctx->is_non_commercial ? "9B" : "4B";
-    snprintf(ctx->model_name, sizeof(ctx->model_name),
-             "FLUX.2-klein-base-%s", size_label);
+    if (ctx->is_zimage) {
+        ctx->default_steps = 20;
+        ctx->default_guidance = 3.5f;
+        int hidden_size = ctx->zi_dim;
+        const char *size_label = "6B";
+        if (hidden_size != 3840)
+            size_label = (hidden_size > 3840) ? "large" : "small";
+        snprintf(ctx->model_name, sizeof(ctx->model_name),
+                 "Z-Image-%s", size_label);
+    } else {
+        ctx->default_steps = 50;
+        ctx->default_guidance = 4.0f;
+        const char *size_label = ctx->is_non_commercial ? "9B" : "4B";
+        snprintf(ctx->model_name, sizeof(ctx->model_name),
+                 "FLUX.2-klein-base-%s", size_label);
+    }
 }
 
 /* Free the Qwen3 text encoder (~4-8GB) to make room for the transformer.
