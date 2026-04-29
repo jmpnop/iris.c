@@ -237,7 +237,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --base            Force base model mode (undistilled, CFG enabled)\n\n");
     fprintf(stderr, "Reference images (img2img / multi-reference):\n");
     fprintf(stderr, "  -i, --input PATH      Reference image (can specify up to %d)\n", MAX_INPUT_IMAGES);
-    fprintf(stderr, "                        Multiple -i flags combine images via in-context conditioning\n\n");
+    fprintf(stderr, "                        Multiple -i flags combine images via in-context conditioning\n");
+    fprintf(stderr, "      --strength N      img2img strength 0.0-1.0 (default: 0.75, Z-Image only)\n");
+    fprintf(stderr, "                        1.0 = ignore reference, 0.0 = minimal changes\n\n");
     fprintf(stderr, "Output options:\n");
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
@@ -297,6 +299,7 @@ int main(int argc, char *argv[]) {
         {"debug-py",   no_argument,       0, 'D'},
         {"no-license-info", no_argument, 0, 258},
         {"blas-threads",required_argument, 0, 259},
+        {"strength",   required_argument, 0, 262},
         {0, 0, 0, 0}
     };
 
@@ -369,6 +372,7 @@ int main(int argc, char *argv[]) {
             case 258: no_license_info = 1; break;
             case 'D': debug_py = 1; break;
             case 259: blas_threads = atoi(optarg); break;
+            case 262: params.strength = atof(optarg); break;
             default:
                 print_usage(argv[0]);
                 return 1;

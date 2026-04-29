@@ -63,6 +63,7 @@ typedef struct {
     int64_t seed;
     int schedule;
     float power_alpha;
+    float strength;
     int image_count;
     int show_enabled;
     int show_steps_enabled;
@@ -355,6 +356,7 @@ static int generate_image(const char *prompt, const char *ref_image,
     params.guidance = state.guidance;
     params.schedule = state.schedule;
     params.power_alpha = state.power_alpha;
+    params.strength = state.strength;
 
     /* Determine seed */
     int64_t actual_seed;
@@ -369,10 +371,6 @@ static int generate_image(const char *prompt, const char *ref_image,
     /* Validate / preload reference before enabling progress callbacks. */
     iris_image *ref = NULL;
     if (ref_image) {
-        if (iris_is_zimage(state.ctx)) {
-            fprintf(stderr, "Error: img2img is not supported for Z-Image.\n");
-            return -1;
-        }
         ref = iris_image_load(ref_image);
         if (!ref) {
             fprintf(stderr, "Error: Cannot load '%s'\n", ref_image);
@@ -486,16 +484,12 @@ static int generate_image(const char *prompt, const char *ref_image,
 
 static int generate_multiref(const char *prompt, const char **ref_paths, int num_refs,
                              int explicit_width, int explicit_height) {
-    if (iris_is_zimage(state.ctx)) {
-        fprintf(stderr, "Error: multi-reference img2img is not supported for Z-Image.\n");
-        return -1;
-    }
-
     iris_params params = IRIS_PARAMS_DEFAULT;
     params.num_steps = state.steps;
     params.guidance = state.guidance;
     params.schedule = state.schedule;
     params.power_alpha = state.power_alpha;
+    params.strength = state.strength;
 
     /* Determine seed */
     int64_t actual_seed;
@@ -592,6 +586,7 @@ static void cmd_help(void) {
     printf("  !size <W>x<H>         Set default size\n");
     printf("  !steps <n>            Set sampling steps (0 = auto)\n");
     printf("  !guidance <n>         Set CFG guidance scale (0 = auto)\n");
+    printf("  !strength <n>         Set img2img strength 0.0-1.0 (default: 0.75)\n");
     printf("  !linear               Toggle linear timestep schedule\n");
     printf("  !power [alpha]        Toggle power schedule (default alpha: 2.0)\n");
     printf("  !sigmoid              Toggle Flux shifted sigmoid schedule\n");
@@ -773,6 +768,23 @@ static void cmd_guidance(char *arg) {
     } else {
         printf("Guidance: %.1f\n", state.guidance);
     }
+}
+
+static void cmd_strength(char *arg) {
+    arg = skip_spaces(arg);
+
+    if (!*arg) {
+        printf("Strength: %.2f\n", state.strength);
+        return;
+    }
+
+    float val = atof(arg);
+    if (val < 0.0f || val > 1.0f) {
+        fprintf(stderr, "Error: Strength must be 0.0-1.0.\n");
+        return;
+    }
+    state.strength = val;
+    printf("Strength: %.2f\n", state.strength);
 }
 
 static void cmd_explore(char *arg) {
@@ -959,6 +971,8 @@ static int process_command(char *line) {
         cmd_steps(cmd + 5);
     } else if (starts_with_ci(cmd, "guidance")) {
         cmd_guidance(cmd + 8);
+    } else if (starts_with_ci(cmd, "strength")) {
+        cmd_strength(cmd + 8);
     } else if (starts_with_ci(cmd, "linear")) {
         state.schedule = (state.schedule == IRIS_SCHEDULE_LINEAR)
                          ? IRIS_SCHEDULE_DEFAULT : IRIS_SCHEDULE_LINEAR;
@@ -1121,6 +1135,7 @@ int iris_cli_run(iris_ctx *ctx, const char *model_dir) {
     state.guidance = iris_default_guidance(ctx);
     state.seed = -1;
     state.power_alpha = 2.0f;
+    state.strength = 0.75f;
 
     /* Initialize embedding cache */
     emb_cache_init();

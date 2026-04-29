@@ -485,6 +485,271 @@ float *iris_sample_euler_zimage(void *transformer,
     return z_curr;
 }
 
+/*
+ * Euler sampler with Classifier-Free Guidance for Z-Image base models.
+ * Double-pass per step: unconditional (empty caption) then conditional,
+ * combined via  v = v_uncond + guidance * (v_cond - v_uncond).
+ */
+float *iris_sample_euler_zimage_cfg(void *transformer,
+                                    float *z, int batch, int channels, int h, int w,
+                                    int patch_size,
+                                    const float *cap_feats_cond, int cap_seq_cond,
+                                    const float *cap_feats_uncond, int cap_seq_uncond,
+                                    float guidance_scale,
+                                    const float *schedule, int num_steps,
+                                    void (*progress_callback)(int step, int total)) {
+    zi_transformer_t *tf = (zi_transformer_t *)transformer;
+    int latent_size = batch * channels * h * w;
+
+    float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    iris_copy(z_curr, z, latent_size);
+
+    iris_reset_timing();
+    double total_denoising_start = get_time_ms();
+    double step_times[IRIS_MAX_STEPS];
+    float *step_latent = NULL;
+    int step_h = h;
+    int step_w = w;
+
+    if (iris_step_image_callback && iris_step_image_vae && num_steps > 1 &&
+        patch_size > 1) {
+        if (h % patch_size == 0 && w % patch_size == 0) {
+            int step_ch = channels * patch_size * patch_size;
+            step_h = h / patch_size;
+            step_w = w / patch_size;
+            int step_latent_size = batch * step_ch * step_h * step_w;
+            step_latent = (float *)malloc(step_latent_size * sizeof(float));
+        } else if (iris_verbose) {
+            fprintf(stderr, "Warning: disabling zImage step previews (invalid patch size)\n");
+        }
+    }
+
+    for (int step = 0; step < num_steps; step++) {
+        float sigma = schedule[step];
+        float sigma_next = schedule[step + 1];
+        float dt = sigma_next - sigma;  /* Negative for denoising */
+        float timestep = 1.0f - sigma;
+
+        double step_start = get_time_ms();
+
+        if (iris_step_callback)
+            iris_step_callback(step + 1, num_steps);
+
+        /* Unconditional prediction (empty caption) */
+        float *v_uncond = iris_transformer_forward_zimage(tf, z_curr, h, w,
+                                                    timestep,
+                                                    cap_feats_uncond, cap_seq_uncond);
+
+        /* Conditional prediction (real caption) */
+        float *v_cond = iris_transformer_forward_zimage(tf, z_curr, h, w,
+                                                    timestep,
+                                                    cap_feats_cond, cap_seq_cond);
+
+        /* CFG combine: v = v_uncond + guidance * (v_cond - v_uncond)
+         * Then Euler step: z_next = z + dt * (-v) */
+        for (int i = 0; i < latent_size; i++) {
+            float v = v_uncond[i] + guidance_scale * (v_cond[i] - v_uncond[i]);
+            z_curr[i] += dt * (-v);
+        }
+
+        free(v_uncond);
+        free(v_cond);
+
+        step_times[step] = get_time_ms() - step_start;
+
+        if (progress_callback)
+            progress_callback(step + 1, num_steps);
+
+        /* Step image callback */
+        if (iris_step_image_callback && iris_step_image_vae && step + 1 < num_steps) {
+            const float *decode_latent = z_curr;
+            int decode_h = h;
+            int decode_w = w;
+
+            if (patch_size > 1) {
+                if (!step_latent) continue;
+                iris_patchify(step_latent, z_curr, batch, channels, h, w, patch_size);
+                decode_latent = step_latent;
+                decode_h = step_h;
+                decode_w = step_w;
+            }
+
+            iris_image *img = iris_vae_decode((iris_vae_t *)iris_step_image_vae,
+                                              decode_latent, 1, decode_h, decode_w);
+            if (img) {
+                iris_step_image_callback(step + 1, num_steps, img);
+                iris_image_free(img);
+            }
+        }
+    }
+
+    if (iris_verbose) {
+        double total_denoising = get_time_ms() - total_denoising_start;
+        fprintf(stderr, "\nDenoising timing breakdown (Z-Image CFG, guidance=%.1f):\n", guidance_scale);
+        for (int step = 0; step < num_steps; step++) {
+            fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        }
+        fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
+        if (iris_timing_zi_total > 0.0) {
+            fprintf(stderr, "  Transformer breakdown (Z-Image GPU):\n");
+            fprintf(stderr, "    Embeddings+RoPE: %.1f ms (%.1f%%)\n",
+                    iris_timing_zi_embeddings,
+                    100.0 * iris_timing_zi_embeddings / iris_timing_zi_total);
+            fprintf(stderr, "    Noise refiner:   %.1f ms (%.1f%%)\n",
+                    iris_timing_zi_noise_refiner,
+                    100.0 * iris_timing_zi_noise_refiner / iris_timing_zi_total);
+            fprintf(stderr, "    Context refiner: %.1f ms (%.1f%%)\n",
+                    iris_timing_zi_context_refiner,
+                    100.0 * iris_timing_zi_context_refiner / iris_timing_zi_total);
+            fprintf(stderr, "    Main blocks:     %.1f ms (%.1f%%)\n",
+                    iris_timing_zi_main_blocks,
+                    100.0 * iris_timing_zi_main_blocks / iris_timing_zi_total);
+            fprintf(stderr, "    Final layer:     %.1f ms (%.1f%%)\n",
+                    iris_timing_zi_final,
+                    100.0 * iris_timing_zi_final / iris_timing_zi_total);
+            fprintf(stderr, "    Total:           %.1f ms\n", iris_timing_zi_total);
+        }
+    }
+
+    free(step_latent);
+    return z_curr;
+}
+
+/* Euler sampler for Z-Image img2img (noise-blending approach). The reference
+ * image is VAE-encoded to latents, then blended with Gaussian noise at the
+ * starting sigma: z_init = noise * sigma_start + latent * (1 - sigma_start).
+ * Denoising begins from a truncated schedule (skipping early high-noise steps),
+ * so the model refines the reference guided by the prompt rather than
+ * generating from scratch. strength=1.0 is equivalent to txt2img (full noise),
+ * strength=0.0 would return the encoded image unchanged. */
+float *iris_sample_euler_zimage_img2img(void *transformer,
+                                         float *z, int batch, int channels, int h, int w,
+                                         int patch_size,
+                                         const float *ref_latent,
+                                         const float *cap_feats, int cap_seq,
+                                         const float *schedule, int num_steps,
+                                         int start_step,
+                                         void (*progress_callback)(int step, int total)) {
+    zi_transformer_t *tf = (zi_transformer_t *)transformer;
+    int latent_size = batch * channels * h * w;
+
+    float *z_curr = (float *)malloc(latent_size * sizeof(float));
+
+    /* Blend noise with reference latent at the starting sigma:
+     * z_init = noise * sigma + ref_latent * (1 - sigma) */
+    float sigma_start = schedule[start_step];
+    for (int i = 0; i < latent_size; i++) {
+        z_curr[i] = z[i] * sigma_start + ref_latent[i] * (1.0f - sigma_start);
+    }
+
+    int effective_steps = num_steps - start_step;
+
+    iris_reset_timing();
+    double total_denoising_start = get_time_ms();
+    double step_times[IRIS_MAX_STEPS];
+    float *step_latent = NULL;
+    int step_h = h;
+    int step_w = w;
+
+    if (iris_step_image_callback && iris_step_image_vae && effective_steps > 1 &&
+        patch_size > 1) {
+        if (h % patch_size == 0 && w % patch_size == 0) {
+            int step_ch = channels * patch_size * patch_size;
+            step_h = h / patch_size;
+            step_w = w / patch_size;
+            int step_latent_size = batch * step_ch * step_h * step_w;
+            step_latent = (float *)malloc(step_latent_size * sizeof(float));
+        } else if (iris_verbose) {
+            fprintf(stderr, "Warning: disabling zImage step previews (invalid patch size)\n");
+        }
+    }
+
+    for (int step = start_step; step < num_steps; step++) {
+        float sigma = schedule[step];
+        float sigma_next = schedule[step + 1];
+        float dt = sigma_next - sigma;  /* Negative for denoising */
+
+        float timestep = 1.0f - sigma;
+
+        int display_step = step - start_step + 1;
+        double step_start = get_time_ms();
+
+        if (iris_step_callback)
+            iris_step_callback(display_step, effective_steps);
+
+        /* Run Z-Image transformer */
+        float *model_out = iris_transformer_forward_zimage(tf, z_curr, h, w,
+                                                    timestep,
+                                                    cap_feats, cap_seq);
+
+        /* Euler step: z_next = z + dt * (-model_output) */
+        for (int i = 0; i < latent_size; i++) {
+            z_curr[i] += dt * (-model_out[i]);
+        }
+
+        free(model_out);
+
+        step_times[step - start_step] = get_time_ms() - step_start;
+
+        if (progress_callback)
+            progress_callback(display_step, effective_steps);
+
+        /* Step image callback */
+        if (iris_step_image_callback && iris_step_image_vae && step + 1 < num_steps) {
+            const float *decode_latent = z_curr;
+            int decode_h = h;
+            int decode_w = w;
+
+            if (patch_size > 1) {
+                if (!step_latent) continue;
+                iris_patchify(step_latent, z_curr, batch, channels, h, w, patch_size);
+                decode_latent = step_latent;
+                decode_h = step_h;
+                decode_w = step_w;
+            }
+
+            iris_image *img = iris_vae_decode((iris_vae_t *)iris_step_image_vae,
+                                              decode_latent, 1, decode_h, decode_w);
+            if (img) {
+                iris_step_image_callback(step + 1, num_steps, img);
+                iris_image_free(img);
+            }
+        }
+    }
+
+    if (iris_verbose) {
+        double total_denoising = get_time_ms() - total_denoising_start;
+        fprintf(stderr, "\nDenoising timing breakdown (Z-Image img2img, start=%d/%d):\n",
+                start_step, num_steps);
+        for (int step = 0; step < effective_steps; step++) {
+            fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        }
+        fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
+        if (iris_timing_zi_total > 0.0) {
+            fprintf(stderr, "  Transformer breakdown (Z-Image GPU):\n");
+            fprintf(stderr, "    Embeddings+RoPE: %.1f ms (%.1f%%)\n",
+                    iris_timing_zi_embeddings,
+                    100.0 * iris_timing_zi_embeddings / iris_timing_zi_total);
+            fprintf(stderr, "    Noise refiner:   %.1f ms (%.1f%%)\n",
+                    iris_timing_zi_noise_refiner,
+                    100.0 * iris_timing_zi_noise_refiner / iris_timing_zi_total);
+            fprintf(stderr, "    Context refiner: %.1f ms (%.1f%%)\n",
+                    iris_timing_zi_context_refiner,
+                    100.0 * iris_timing_zi_context_refiner / iris_timing_zi_total);
+            fprintf(stderr, "    Main blocks:     %.1f ms (%.1f%%)\n",
+                    iris_timing_zi_main_blocks,
+                    100.0 * iris_timing_zi_main_blocks / iris_timing_zi_total);
+            fprintf(stderr, "    Final layer:     %.1f ms (%.1f%%)\n",
+                    iris_timing_zi_final,
+                    100.0 * iris_timing_zi_final / iris_timing_zi_total);
+            fprintf(stderr, "    Total:           %.1f ms\n", iris_timing_zi_total);
+        }
+    }
+
+    free(step_latent);
+    return z_curr;
+}
+
 /* Euler sampler for single-reference img2img. The reference image is
  * VAE-encoded and concatenated with the noised target as extra tokens.
  * A RoPE T offset (default 10) distinguishes reference from target in

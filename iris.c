@@ -129,6 +129,22 @@ extern float *iris_sample_euler_zimage(void *transformer,
                                         const float *cap_feats, int cap_seq,
                                         const float *schedule, int num_steps,
                                         void (*progress_callback)(int step, int total));
+extern float *iris_sample_euler_zimage_cfg(void *transformer,
+                                        float *z, int batch, int channels, int h, int w,
+                                        int patch_size,
+                                        const float *cap_feats_cond, int cap_seq_cond,
+                                        const float *cap_feats_uncond, int cap_seq_uncond,
+                                        float guidance_scale,
+                                        const float *schedule, int num_steps,
+                                        void (*progress_callback)(int step, int total));
+extern float *iris_sample_euler_zimage_img2img(void *transformer,
+                                        float *z, int batch, int channels, int h, int w,
+                                        int patch_size,
+                                        const float *ref_latent,
+                                        const float *cap_feats, int cap_seq,
+                                        const float *schedule, int num_steps,
+                                        int start_step,
+                                        void (*progress_callback)(int step, int total));
 
 /* Return schedule for Flux models based on params.
  * Default is shifted sigmoid; overrides: linear, power, flowmatch. */
@@ -686,10 +702,17 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
  * noise at pre-patchification dimensions [16, H/8, W/8] and the transformer
  * operates there. After denoising (8 NFE from 9 scheduler steps, where the
  * last step is a no-op because sigma_min=0), the output is patchified to
- * [64, H/16, W/16] for VAE decode. */
+ * [64, H/16, W/16] for VAE decode.
+ *
+ * For base (non-distilled) models with CFG, pass text_emb_uncond/text_seq_uncond
+ * from an empty-prompt encoding. When text_emb_uncond is NULL, single-pass
+ * sampling is used (appropriate for distilled / Turbo models). */
 static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
                                                           const float *text_emb,
                                                           int text_seq,
+                                                          const float *text_emb_uncond,
+                                                          int text_seq_uncond,
+                                                          float guidance,
                                                           const iris_params *p_in) {
     if (!ctx || !text_emb || text_seq <= 0) {
         set_error("Invalid context or embeddings");
@@ -747,14 +770,28 @@ static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
     float *schedule = iris_selected_zimage_schedule(&p, image_seq_len);
 
     /* Sample using Z-Image Euler method.
-     * The transformer takes [in_ch, pre_h, pre_w] and returns same shape. */
-    float *denoised = iris_sample_euler_zimage(
-        ctx->zi_transformer, z, 1, in_ch, pre_h, pre_w,
-        ps,
-        text_emb, text_seq,
-        schedule, p.num_steps,
-        NULL
-    );
+     * The transformer takes [in_ch, pre_h, pre_w] and returns same shape.
+     * For base models with CFG, two transformer passes per step. */
+    float *denoised;
+    if (text_emb_uncond && guidance > 0.0f) {
+        denoised = iris_sample_euler_zimage_cfg(
+            ctx->zi_transformer, z, 1, in_ch, pre_h, pre_w,
+            ps,
+            text_emb, text_seq,
+            text_emb_uncond, text_seq_uncond,
+            guidance,
+            schedule, p.num_steps,
+            NULL
+        );
+    } else {
+        denoised = iris_sample_euler_zimage(
+            ctx->zi_transformer, z, 1, in_ch, pre_h, pre_w,
+            ps,
+            text_emb, text_seq,
+            schedule, p.num_steps,
+            NULL
+        );
+    }
 
     free(z);
     free(schedule);
@@ -794,8 +831,28 @@ static iris_image *iris_generate_zimage(iris_ctx *ctx, const char *prompt,
         return NULL;
     }
 
-    iris_image *img = iris_generate_zimage_with_embeddings(ctx, text_emb, text_seq, p_in);
+    /* For base (non-distilled) Z-Image, encode empty prompt for CFG.
+     * Must happen before iris_generate_zimage_with_embeddings releases
+     * the text encoder to free memory. */
+    float *text_emb_uncond = NULL;
+    int text_seq_uncond = 0;
+    float guidance = 0.0f;
+    if (!ctx->is_distilled) {
+        guidance = (p_in && p_in->guidance > 0) ? p_in->guidance
+                                                : ctx->default_guidance;
+        text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
+        if (!text_emb_uncond) {
+            free(text_emb);
+            set_error("Failed to encode empty prompt for CFG");
+            return NULL;
+        }
+    }
+
+    iris_image *img = iris_generate_zimage_with_embeddings(ctx, text_emb, text_seq,
+                                                           text_emb_uncond, text_seq_uncond,
+                                                           guidance, p_in);
     free(text_emb);
+    free(text_emb_uncond);
     return img;
 }
 
@@ -937,9 +994,9 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
 
 /* Generate from pre-computed text embeddings, skipping the Qwen3 encoding
  * step. Useful for the embedding cache (repeat prompts without re-encoding).
- * Only supports distilled models and Z-Image -- base model CFG requires two
- * separate embeddings (conditioned + empty prompt) which this API doesn't
- * provide, so it would produce incorrect results. */
+ * Only supports distilled models -- base model CFG requires two separate
+ * embeddings (conditioned + empty prompt) which this API doesn't provide,
+ * so it would produce incorrect results. */
 iris_image *iris_generate_with_embeddings(iris_ctx *ctx,
                                            const float *text_emb, int text_seq,
                                            const iris_params *params) {
@@ -949,7 +1006,13 @@ iris_image *iris_generate_with_embeddings(iris_ctx *ctx,
     }
 
     if (ctx->is_zimage) {
-        return iris_generate_zimage_with_embeddings(ctx, text_emb, text_seq, params);
+        if (!ctx->is_distilled) {
+            fprintf(stderr, "Warning: iris_generate_with_embeddings() does not "
+                            "support CFG. Use iris_generate() for Z-Image base models.\n");
+        }
+        /* Single-pass only: no uncond embeddings available from this API */
+        return iris_generate_zimage_with_embeddings(ctx, text_emb, text_seq,
+                                                     NULL, 0, 0.0f, params);
     }
 
     /* This API only supports the distilled (non-CFG) sampler since the
@@ -1198,13 +1261,179 @@ static int fit_refs_for_attention(int num_heads,
  * Image-to-Image Generation
  * ======================================================================== */
 
-/* Image-to-image generation via in-context conditioning. The reference image
- * is VAE-encoded into latent tokens with a RoPE T offset (T=10), while the
- * target starts from pure noise (T=0). Both are concatenated and fed to the
- * transformer, which attends to reference tokens via joint attention -- this
- * is fundamentally different from traditional img2img that adds noise to the
- * encoded image. References are dynamically resized if the resulting attention
- * matrix would exceed the 4GB MPS memory limit. */
+/* Z-Image img2img via noise blending. Unlike Flux's in-context conditioning
+ * (which concatenates reference tokens), Z-Image img2img encodes the reference
+ * to VAE latents, unpatchifies to pre-patchification space [in_ch, H/8, W/8],
+ * blends with Gaussian noise at a truncated schedule point
+ * (z = noise * sigma + latent * (1-sigma)), then denoises from there.
+ * The strength parameter controls schedule truncation: 1.0 = full denoise
+ * (txt2img equivalent), 0.0 = no change. Default 0.75. */
+static iris_image *iris_img2img_zimage(iris_ctx *ctx, const char *prompt,
+                                        const iris_image *input,
+                                        const iris_params *params) {
+    iris_params p;
+    if (params) {
+        p = *params;
+    } else {
+        p = (iris_params)IRIS_PARAMS_DEFAULT;
+    }
+
+    /* Use input image dimensions if not specified */
+    if (p.width <= 0) p.width = input->width;
+    if (p.height <= 0) p.height = input->height;
+
+    /* Clamp to VAE max dimensions, preserving aspect ratio */
+    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
+        float scale = (float)IRIS_VAE_MAX_DIM /
+                      (p.width > p.height ? p.width : p.height);
+        p.width = (int)(p.width * scale);
+        p.height = (int)(p.height * scale);
+    }
+
+    /* Ensure divisible by 16 */
+    p.width = (p.width / 16) * 16;
+    p.height = (p.height / 16) * 16;
+    if (p.width < 64) p.width = 64;
+    if (p.height < 64) p.height = 64;
+
+    /* Resolve steps */
+    if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
+
+    /* Resolve strength (clamp to [0, 1]) */
+    float strength = p.strength;
+    if (strength <= 0.0f) strength = 0.75f;  /* Default */
+    if (strength > 1.0f) strength = 1.0f;
+
+    /* Encode text (Z-Image mode) */
+    int text_seq;
+    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
+    if (!text_emb) {
+        set_error("Failed to encode prompt");
+        return NULL;
+    }
+
+    /* Release text encoder to free memory */
+    iris_release_text_encoder(ctx);
+
+    /* Load Z-Image transformer */
+    if (!iris_load_zimage_transformer_if_needed(ctx)) {
+        free(text_emb);
+        return NULL;
+    }
+
+    /* Resize input to target dimensions if needed */
+    iris_image *resized = NULL;
+    const iris_image *img_to_use = input;
+    if (input->width != p.width || input->height != p.height) {
+        resized = iris_image_resize(input, p.width, p.height);
+        if (!resized) {
+            free(text_emb);
+            set_error("Failed to resize input image");
+            return NULL;
+        }
+        img_to_use = resized;
+    }
+
+    /* VAE-encode the reference image.
+     * VAE encode returns post-patchification latent: [latent_ch, H/16, W/16]
+     * where latent_ch = vae_z_channels * ps * ps (e.g. 16 * 2 * 2 = 64). */
+    if (iris_phase_callback) iris_phase_callback("encoding reference image", 0);
+    float *img_tensor = iris_image_to_tensor(img_to_use);
+    if (resized) iris_image_free(resized);
+
+    int post_h, post_w;
+    float *img_latent_post = iris_vae_encode(ctx->vae, img_tensor, 1,
+                                              p.height, p.width, &post_h, &post_w);
+    free(img_tensor);
+    if (iris_phase_callback) iris_phase_callback("encoding reference image", 1);
+
+    if (!img_latent_post) {
+        free(text_emb);
+        set_error("Failed to encode reference image");
+        return NULL;
+    }
+
+    /* Unpatchify from post-patchification [latent_ch, H/16, W/16]
+     * to pre-patchification [in_ch, H/8, W/8] for the sampler. */
+    int ps = ctx->zi_patch_size;  /* 2 */
+    int in_ch = ctx->zi_in_channels;  /* 16 */
+    int pre_h = post_h * ps;  /* H/8 */
+    int pre_w = post_w * ps;  /* W/8 */
+
+    float *ref_latent = (float *)malloc(in_ch * pre_h * pre_w * sizeof(float));
+    iris_unpatchify(ref_latent, img_latent_post, 1, in_ch, pre_h, pre_w, ps);
+    free(img_latent_post);
+
+    /* Compute schedule */
+    int image_seq_len = post_h * post_w;
+    float *schedule = iris_selected_zimage_schedule(&p, image_seq_len);
+
+    /* Compute start step from strength:
+     * strength=1.0 -> start_step=0 (full denoise, like txt2img)
+     * strength=0.5 -> start_step=num_steps/2 (skip first half)
+     * strength=0.0 -> start_step=num_steps (no denoising) */
+    int start_step = (int)((1.0f - strength) * p.num_steps + 0.5f);
+    if (start_step < 0) start_step = 0;
+    if (start_step >= p.num_steps) start_step = p.num_steps - 1;
+
+    if (iris_verbose) {
+        fprintf(stderr, "Z-Image img2img: strength=%.2f, start_step=%d/%d, "
+                "sigma_start=%.4f\n",
+                strength, start_step, p.num_steps, schedule[start_step]);
+    }
+
+    /* Initialize noise at pre-patchification dimensions */
+    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
+    float *z = iris_init_noise(1, in_ch, pre_h, pre_w, seed);
+
+    /* Run img2img sampler (blends noise + ref_latent, then denoises) */
+    float *denoised = iris_sample_euler_zimage_img2img(
+        ctx->zi_transformer, z, 1, in_ch, pre_h, pre_w,
+        ps,
+        ref_latent,
+        text_emb, text_seq,
+        schedule, p.num_steps,
+        start_step,
+        NULL
+    );
+
+    free(z);
+    free(ref_latent);
+    free(schedule);
+    free(text_emb);
+
+    if (!denoised) {
+        set_error("Sampling failed");
+        return NULL;
+    }
+
+    /* Patchify for VAE decode: [in_ch, H/8, W/8] -> [latent_ch, H/16, W/16] */
+    int latent_ch = in_ch * ps * ps;
+    float *latent = (float *)malloc(latent_ch * post_h * post_w * sizeof(float));
+    iris_patchify(latent, denoised, 1, in_ch, pre_h, pre_w, ps);
+    free(denoised);
+
+    /* Decode */
+    iris_image *result = NULL;
+    if (ctx->vae) {
+        if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+        result = iris_vae_decode(ctx->vae, latent, 1, post_h, post_w);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 1);
+    }
+
+    free(latent);
+    return result;
+}
+
+/* Image-to-image generation. Routes to Z-Image (noise-blending) or Flux
+ * (in-context conditioning) pipeline based on model type.
+ *
+ * Flux: the reference image is VAE-encoded into latent tokens with a RoPE
+ * T offset (T=10), while the target starts from pure noise (T=0). Both are
+ * concatenated and fed to the transformer via joint attention.
+ *
+ * Z-Image: the reference is VAE-encoded to latents, blended with noise at a
+ * schedule point determined by strength, then denoised from there. */
 iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
                          const iris_image *input, const iris_params *params) {
     if (!ctx || !prompt || !input) {
@@ -1212,8 +1441,7 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
         return NULL;
     }
     if (ctx->is_zimage) {
-        set_error("img2img is not supported for Z-Image");
-        return NULL;
+        return iris_img2img_zimage(ctx, prompt, input, params);
     }
 
     iris_params p;
@@ -1420,19 +1648,20 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
         set_error("Invalid parameters");
         return NULL;
     }
-    if (ctx->is_zimage) {
-        set_error("multi-reference img2img is not supported for Z-Image");
-        return NULL;
-    }
-
     /* No references - text-to-image */
     if (!refs || num_refs == 0) {
         return iris_generate(ctx, prompt, params);
     }
 
-    /* Single reference - use optimized path */
+    /* Single reference - use optimized path (works for both Flux and Z-Image) */
     if (num_refs == 1) {
         return iris_img2img(ctx, prompt, refs[0], params);
+    }
+
+    /* Multi-reference (2+) is Flux-only (in-context conditioning with RoPE T offsets) */
+    if (ctx->is_zimage) {
+        set_error("Multi-reference img2img is not supported for Z-Image (use single reference)");
+        return NULL;
     }
 
     iris_params p;
