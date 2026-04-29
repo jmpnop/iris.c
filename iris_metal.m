@@ -1043,9 +1043,24 @@ static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size
         pthread_mutex_unlock(&g_f16_cache_mutex);
         return nil;
     }
+#if defined(__aarch64__) && defined(__ARM_FEATURE_BF16)
+    /* NEON path: BF16→F32→F16 using hardware conversion instructions.
+     * Processes 4 elements per iteration (~4x faster than scalar). */
+    size_t i = 0;
+    for (; i + 3 < num_elements; i += 4) {
+        bfloat16x4_t b = vld1_bf16((const bfloat16_t *)(weights + i));
+        float32x4_t f32 = vcvt_f32_bf16(b);
+        float16x4_t f16 = vcvt_f16_f32(f32);
+        vst1_f16((__fp16 *)(f16_data + i), f16);
+    }
+    for (; i < num_elements; i++) {
+        f16_data[i] = bf16_to_f16(weights[i]);
+    }
+#else
     for (size_t i = 0; i < num_elements; i++) {
         f16_data[i] = bf16_to_f16(weights[i]);
     }
+#endif
 
     size_t size = num_elements * sizeof(uint16_t);
 
@@ -1087,6 +1102,52 @@ void iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements) {
 void iris_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elements) {
     if (!g_initialized || !bf16_weights || num_elements == 0) return;
     (void)get_cached_bf16_buffer(bf16_weights, num_elements);
+}
+
+/*
+ * Register pre-converted F16 data as a Metal buffer with zero copy.
+ * The pointer must be page-aligned (16384 on Apple Silicon) and the
+ * total byte size must be page-aligned. Used with the F16 disk cache
+ * where weights are already in F16 format inside an mmap'd file.
+ * On Apple Silicon unified memory, the GPU reads the same physical
+ * pages the mmap provides — no data movement at all.
+ */
+void iris_metal_register_f16_nocopy(const uint16_t *f16_weights, size_t num_elements) {
+    if (!g_initialized || !f16_weights || num_elements == 0) return;
+
+    pthread_mutex_lock(&g_f16_cache_mutex);
+
+    /* Check if already registered */
+    for (int i = 0; i < g_f16_cache_count; i++) {
+        if (g_f16_cache[i].cpu_ptr == f16_weights) {
+            pthread_mutex_unlock(&g_f16_cache_mutex);
+            return;
+        }
+    }
+
+    size_t size = num_elements * sizeof(uint16_t);
+
+    @autoreleasepool {
+        id<MTLBuffer> buf = [g_device newBufferWithBytesNoCopy:(void *)f16_weights
+                                                        length:size
+                                                       options:MTLResourceStorageModeShared
+                                                   deallocator:nil];
+        if (!buf) {
+            /* Fallback: alignment failed, copy instead */
+            buf = [g_device newBufferWithBytes:f16_weights
+                                        length:size
+                                       options:MTLResourceStorageModeShared];
+        }
+
+        if (buf && g_f16_cache_count < F16_WEIGHT_CACHE_SIZE) {
+            g_f16_cache[g_f16_cache_count].cpu_ptr = f16_weights;
+            g_f16_cache[g_f16_cache_count].gpu_buffer = buf;
+            g_f16_cache[g_f16_cache_count].size = size;
+            g_f16_cache_count++;
+        }
+    }
+
+    pthread_mutex_unlock(&g_f16_cache_mutex);
 }
 
 /*

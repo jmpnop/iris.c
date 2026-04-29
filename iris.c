@@ -121,7 +121,8 @@ extern zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
                                                            int n_layers, int n_refiner,
                                                            int cap_feat_dim, int in_channels,
                                                            int patch_size, float rope_theta,
-                                                           const int *axes_dims);
+                                                           const int *axes_dims,
+                                                           int use_mmap);
 extern void iris_transformer_free_zimage(zi_transformer_t *tf);
 extern float *iris_sample_euler_zimage(void *transformer,
                                         float *z, int batch, int channels, int h, int w,
@@ -618,7 +619,7 @@ static int iris_load_zimage_transformer_if_needed(iris_ctx *ctx) {
         ctx->model_dir,
         ctx->zi_dim, ctx->zi_dim / 128, ctx->zi_n_layers, ctx->zi_n_refiner,
         ctx->zi_cap_feat_dim, ctx->zi_in_channels, ctx->zi_patch_size,
-        ctx->zi_rope_theta, ctx->zi_axes_dims);
+        ctx->zi_rope_theta, ctx->zi_axes_dims, ctx->use_mmap);
     if (iris_phase_callback) iris_phase_callback("Loading Z-Image transformer", 1);
 
     if (!ctx->zi_transformer) {

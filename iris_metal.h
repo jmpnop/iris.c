@@ -730,6 +730,13 @@ void iris_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
  */
 void iris_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elements);
 
+/*
+ * Register mmap'd F16 data as a zero-copy Metal buffer.
+ * Pointer and byte size must be page-aligned (16384 on Apple Silicon).
+ * Used with F16 disk cache — GPU reads directly from mmap'd pages.
+ */
+void iris_metal_register_f16_nocopy(const uint16_t *f16_weights, size_t num_elements);
+
 /* ========================================================================
  * Native BF16 Pipeline API
  *
