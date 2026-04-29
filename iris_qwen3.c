@@ -1824,9 +1824,10 @@ void qwen3_encoder_free(qwen3_encoder_t *enc) {
 }
 
 /* Main text encoding API. Tokenizes the prompt using Qwen3 chat template
- * (with <think> tags for Flux, without for Z-Image), pads to max sequence
- * length, runs the forward pass, and returns extracted embeddings. Also
- * returns the number of real (non-padding) tokens via out_num_tokens,
+ * (with <think> tags for Flux, without for Z-Image), runs the forward pass
+ * at actual token length (not padded to 512), then zero-pads the output to
+ * QWEN3_MAX_SEQ_LEN for Flux compatibility. Returns extracted embeddings.
+ * Also returns the number of real (non-padding) tokens via out_num_tokens,
  * which Z-Image needs for its unpadded attention over text tokens. */
 float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
                               int *out_num_tokens) {
@@ -1840,23 +1841,23 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
                                       QWEN3_MAX_SEQ_LEN, skip_think_tags);
     if (!tokens) return NULL;
 
-    /* Pad to max length */
-    int *attention_mask = malloc(QWEN3_MAX_SEQ_LEN * sizeof(int));
-    int *padded_tokens = qwen3_pad_tokens(tokens, num_tokens, QWEN3_MAX_SEQ_LEN, attention_mask);
-    free(tokens);
-
-    if (!padded_tokens) {
-        free(attention_mask);
-        return NULL;
-    }
-
     if (out_num_tokens) *out_num_tokens = num_tokens;
 
-    /* Forward pass */
-    float *embeddings = qwen3_forward(enc->model, padded_tokens, attention_mask, QWEN3_MAX_SEQ_LEN);
+    /* Forward pass at actual token length (no padding, no attention mask) */
+    float *embeddings = qwen3_forward(enc->model, tokens, NULL, num_tokens);
+    free(tokens);
 
-    free(padded_tokens);
-    free(attention_mask);
+    if (!embeddings) return NULL;
+
+    /* Flux expects [QWEN3_MAX_SEQ_LEN, text_dim] — zero-pad the output */
+    int text_dim = enc->model->text_dim;
+    if (num_tokens < QWEN3_MAX_SEQ_LEN) {
+        float *padded = (float *)calloc((size_t)QWEN3_MAX_SEQ_LEN * text_dim, sizeof(float));
+        if (!padded) { free(embeddings); return NULL; }
+        memcpy(padded, embeddings, (size_t)num_tokens * text_dim * sizeof(float));
+        free(embeddings);
+        embeddings = padded;
+    }
 
     return embeddings;
 }

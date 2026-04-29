@@ -85,6 +85,7 @@ int qwen3_get_id(qwen3_tokenizer_t *tok, const char *token);
  * Directory should contain model-00001-of-00002.safetensors, etc.
  */
 qwen3_model_t *qwen3_model_load(const char *model_dir);
+qwen3_model_t *qwen3_model_load_mmap(const char *model_dir);
 
 /*
  * Free model resources.

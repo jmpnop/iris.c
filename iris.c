@@ -578,8 +578,9 @@ void iris_set_base_mode(iris_ctx *ctx) {
 void iris_release_text_encoder(iris_ctx *ctx) {
     if (!ctx || !ctx->qwen3_encoder) return;
 
-    qwen3_encoder_free(ctx->qwen3_encoder);
-    ctx->qwen3_encoder = NULL;
+    /* Free model weights (~8GB) but keep tokenizer (~50MB) for fast reload */
+    qwen3_model_free(ctx->qwen3_encoder->model);
+    ctx->qwen3_encoder->model = NULL;
 
 #ifdef USE_METAL
     /* Reset all GPU state to ensure clean slate for transformer.
@@ -659,6 +660,20 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
         if (!ctx->qwen3_encoder) {
             fprintf(stderr, "Warning: Failed to load Qwen3 text encoder\n");
         }
+    } else if (ctx->qwen3_encoder && !ctx->qwen3_encoder->model && ctx->model_dir[0]) {
+        /* Tokenizer survived release — reload only model weights */
+        if (iris_phase_callback) iris_phase_callback("Loading Qwen3 encoder", 0);
+        char model_path[512];
+        snprintf(model_path, sizeof(model_path), "%s/text_encoder", ctx->model_dir);
+        if (ctx->use_mmap) {
+            ctx->qwen3_encoder->model = qwen3_model_load_mmap(model_path);
+        } else {
+            ctx->qwen3_encoder->model = qwen3_model_load(model_path);
+        }
+        if (iris_phase_callback) iris_phase_callback("Loading Qwen3 encoder", 1);
+        if (!ctx->qwen3_encoder->model) {
+            fprintf(stderr, "Warning: Failed to reload Qwen3 model weights\n");
+        }
     }
 
     if (!ctx->qwen3_encoder) {
@@ -692,6 +707,144 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
         *out_seq_len = QWEN3_MAX_SEQ_LEN;
     }
     return embeddings;
+}
+
+/* ========================================================================
+ * Empty-String Embedding Cache (CFG)
+ * ========================================================================
+ *
+ * Base (non-distilled) models need an empty-string text embedding for
+ * Classifier-Free Guidance. This embedding is deterministic -- the same
+ * model weights + empty prompt always produce the same output. Computing
+ * it costs ~4s on the text encoder, so we cache it to disk after the
+ * first generation and reload on subsequent ones.
+ *
+ * Cache format (little-endian):
+ *   4 bytes   magic   0x49524345 ("IRCE")
+ *   4 bytes   version (1)
+ *   4 bytes   text_dim
+ *   4 bytes   seq_len (QWEN3_MAX_SEQ_LEN, always 512)
+ *   4 bytes   real_tokens (out_seq_len for Z-Image, seq_len for Flux)
+ *   4 bytes   extraction_mode (0 = Flux, 1 = Z-Image)
+ *   seq_len * text_dim * 4 bytes   float32 embedding data
+ * ======================================================================== */
+
+#define IRIS_UNCOND_CACHE_MAGIC   0x49524345  /* "IRCE" */
+#define IRIS_UNCOND_CACHE_VERSION 1
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t text_dim;
+    uint32_t seq_len;
+    uint32_t real_tokens;
+    uint32_t extraction_mode;
+} iris_uncond_cache_header;
+
+/* Try to load the cached empty-string embedding from disk.
+ * Returns malloc'd float buffer on success, NULL on miss/mismatch. */
+static float *iris_load_uncond_cache(const char *model_dir, int text_dim,
+                                      int extraction_mode, int *out_seq_len) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.iris_empty_embedding", model_dir);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    iris_uncond_cache_header hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1) {
+        fclose(f);
+        return NULL;
+    }
+
+    /* Validate header */
+    if (hdr.magic != IRIS_UNCOND_CACHE_MAGIC ||
+        hdr.version != IRIS_UNCOND_CACHE_VERSION ||
+        (int)hdr.text_dim != text_dim ||
+        hdr.seq_len != QWEN3_MAX_SEQ_LEN ||
+        (int)hdr.extraction_mode != extraction_mode) {
+        fclose(f);
+        fprintf(stderr, "iris: uncond cache mismatch, will re-encode\n");
+        return NULL;
+    }
+
+    size_t data_size = (size_t)hdr.seq_len * hdr.text_dim;
+    float *buf = (float *)malloc(data_size * sizeof(float));
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+
+    if (fread(buf, sizeof(float), data_size, f) != data_size) {
+        fclose(f);
+        free(buf);
+        return NULL;
+    }
+
+    fclose(f);
+    *out_seq_len = (int)hdr.real_tokens;
+    fprintf(stderr, "iris: loaded cached empty-string embedding "
+            "(%u tokens, dim %u)\n", hdr.real_tokens, hdr.text_dim);
+    return buf;
+}
+
+/* Write the empty-string embedding to disk cache. */
+static void iris_save_uncond_cache(const char *model_dir, int text_dim,
+                                    int extraction_mode, int real_tokens,
+                                    const float *data) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.iris_empty_embedding", model_dir);
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "iris: warning: could not write uncond cache to %s\n", path);
+        return;
+    }
+
+    iris_uncond_cache_header hdr = {
+        .magic = IRIS_UNCOND_CACHE_MAGIC,
+        .version = IRIS_UNCOND_CACHE_VERSION,
+        .text_dim = (uint32_t)text_dim,
+        .seq_len = QWEN3_MAX_SEQ_LEN,
+        .real_tokens = (uint32_t)real_tokens,
+        .extraction_mode = (uint32_t)extraction_mode,
+    };
+
+    size_t data_size = (size_t)QWEN3_MAX_SEQ_LEN * text_dim;
+
+    if (fwrite(&hdr, sizeof(hdr), 1, f) != 1 ||
+        fwrite(data, sizeof(float), data_size, f) != data_size) {
+        fclose(f);
+        fprintf(stderr, "iris: warning: failed to write uncond cache\n");
+        /* Remove partial file */
+        remove(path);
+        return;
+    }
+
+    fclose(f);
+    fprintf(stderr, "iris: saved empty-string embedding cache "
+            "(%zu bytes)\n", sizeof(hdr) + data_size * sizeof(float));
+}
+
+/* Get the empty-string (unconditional) embedding for CFG sampling.
+ * Tries the disk cache first; falls back to live encoding and caches
+ * the result. Returns a malloc'd buffer the caller must free. */
+static float *iris_get_uncond_embedding(iris_ctx *ctx, int *out_seq_len) {
+    int extraction_mode = ctx->is_zimage ? 1 : 0;
+
+    /* Try disk cache */
+    float *cached = iris_load_uncond_cache(ctx->model_dir, ctx->text_dim,
+                                            extraction_mode, out_seq_len);
+    if (cached) return cached;
+
+    /* Cache miss -- encode the empty string */
+    float *emb = iris_encode_text(ctx, "", out_seq_len);
+    if (!emb) return NULL;
+
+    /* Save to cache for next time */
+    iris_save_uncond_cache(ctx->model_dir, ctx->text_dim,
+                           extraction_mode, *out_seq_len, emb);
+    return emb;
 }
 
 /* ========================================================================
@@ -841,7 +994,7 @@ static iris_image *iris_generate_zimage(iris_ctx *ctx, const char *prompt,
     if (!ctx->is_distilled) {
         guidance = (p_in && p_in->guidance > 0) ? p_in->guidance
                                                 : ctx->default_guidance;
-        text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
+        text_emb_uncond = iris_get_uncond_embedding(ctx, &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
             set_error("Failed to encode empty prompt for CFG");
@@ -914,7 +1067,7 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
     if (!ctx->is_distilled) {
-        text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
+        text_emb_uncond = iris_get_uncond_embedding(ctx, &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
             set_error("Failed to encode empty prompt for CFG");
@@ -1510,7 +1663,7 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
     if (!ctx->is_distilled) {
-        text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
+        text_emb_uncond = iris_get_uncond_embedding(ctx, &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
             if (resized) iris_image_free(resized);
@@ -1702,7 +1855,7 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
     if (!ctx->is_distilled) {
-        text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
+        text_emb_uncond = iris_get_uncond_embedding(ctx, &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
             set_error("Failed to encode empty prompt for CFG");

@@ -91,12 +91,31 @@ mps-build: $(SRCS:.c=.mps.o) $(CLI_SRCS:.c=.mps.o) iris_metal.o main.mps.o
 %.mps.o: %.c iris.h iris_kernels.h
 	$(CC) $(MPS_CFLAGS) -c -o $@ $<
 
-# Embed Metal shader source as C array (runtime compilation, no Metal toolchain needed)
+# Embed Metal shader source as C array (runtime compilation fallback)
 iris_shaders_source.h: iris_shaders.metal
 	xxd -i $< > $@
 
+# Pre-compiled metallib (2-8s faster startup, requires Metal toolchain)
+# If Metal toolchain is available, also embed the pre-compiled metallib.
+# Falls back to runtime compilation if metallib build fails.
+METAL_TOOLCHAIN_OK := $(shell xcrun metal --version 2>/dev/null && echo yes || echo no)
+
+ifeq ($(METAL_TOOLCHAIN_OK),yes)
+iris_shaders.air: iris_shaders.metal
+	xcrun metal -c -target air64-apple-macos14.0 -ffast-math -o $@ $<
+
+iris_shaders.metallib: iris_shaders.air
+	xcrun metallib -o $@ $<
+
+iris_shaders_metallib.h: iris_shaders.metallib
+	xxd -i $< > $@
+
+iris_metal.o: iris_metal.m iris_metal.h iris_shaders_source.h iris_shaders_metallib.h
+	$(CC) $(MPS_OBJCFLAGS) -DHAVE_METALLIB -c -o $@ $<
+else
 iris_metal.o: iris_metal.m iris_metal.h iris_shaders_source.h
 	$(CC) $(MPS_OBJCFLAGS) -c -o $@ $<
+endif
 
 else
 mps:
@@ -156,7 +175,7 @@ install: $(TARGET) $(LIB)
 
 clean:
 	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o main.o $(TARGET) $(LIB)
-	rm -f iris_shaders_source.h
+	rm -f iris_shaders_source.h iris_shaders.air iris_shaders.metallib iris_shaders_metallib.h
 
 info:
 	@echo "Platform: $(UNAME_S) $(UNAME_M)"

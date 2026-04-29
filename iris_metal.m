@@ -16,6 +16,9 @@
 #include "iris_metal.h"
 #include "iris_kernels.h"
 #include "iris_shaders_source.h"
+#ifdef HAVE_METALLIB
+#include "iris_shaders_metallib.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3196,38 +3199,58 @@ int iris_metal_init_shaders(void) {
     @autoreleasepool {
         NSError *error = nil;
 
-        /* Load shader source from embedded data */
-        NSString *shaderSource = [[NSString alloc]
-            initWithBytes:iris_shaders_metal
-            length:iris_shaders_metal_len
-            encoding:NSUTF8StringEncoding];
-        if (!shaderSource) {
-            fprintf(stderr, "Metal shaders: failed to decode embedded source\n");
-            return 0;
-        }
-
-        /* Compile shader library */
-        MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
-#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
-        if (@available(macOS 15.0, *)) {
-            options.mathMode = MTLMathModeFast;
+#ifdef HAVE_METALLIB
+        /* Try pre-compiled metallib first (skips 2-8s of JIT compilation) */
+        dispatch_data_t libData = dispatch_data_create(
+            iris_shaders_metallib,
+            iris_shaders_metallib_len,
+            NULL,
+            DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        g_shader_library = [g_device newLibraryWithData:libData error:&error];
+        if (g_shader_library) {
+            if (iris_verbose)
+                fprintf(stderr, "Metal shaders: loaded pre-compiled metallib\n");
         } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            options.fastMathEnabled = YES;
-#pragma clang diagnostic pop
+            fprintf(stderr, "Metal shaders: pre-compiled metallib failed (%s), "
+                    "falling back to runtime compilation\n",
+                    [[error localizedDescription] UTF8String]);
+            error = nil;
         }
-#else
-        options.fastMathEnabled = YES;
 #endif
 
-        g_shader_library = [g_device newLibraryWithSource:shaderSource
-                                                  options:options
-                                                    error:&error];
         if (!g_shader_library) {
-            fprintf(stderr, "Metal shaders: compilation failed: %s\n",
-                    [[error localizedDescription] UTF8String]);
-            return 0;
+            /* Runtime compilation fallback */
+            NSString *shaderSource = [[NSString alloc]
+                initWithBytes:iris_shaders_metal
+                length:iris_shaders_metal_len
+                encoding:NSUTF8StringEncoding];
+            if (!shaderSource) {
+                fprintf(stderr, "Metal shaders: failed to decode embedded source\n");
+                return 0;
+            }
+
+            MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+            if (@available(macOS 15.0, *)) {
+                options.mathMode = MTLMathModeFast;
+            } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                options.fastMathEnabled = YES;
+#pragma clang diagnostic pop
+            }
+#else
+            options.fastMathEnabled = YES;
+#endif
+
+            g_shader_library = [g_device newLibraryWithSource:shaderSource
+                                                      options:options
+                                                        error:&error];
+            if (!g_shader_library) {
+                fprintf(stderr, "Metal shaders: compilation failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+                return 0;
+            }
         }
 
         /* Create compute pipeline states for each kernel */
