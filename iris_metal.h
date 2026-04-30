@@ -358,6 +358,12 @@ void iris_gpu_qk_rms_norm(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
                           const float *q_weight, const float *k_weight,
                           int seq, int heads, int head_dim, float eps);
 
+/* Fused QK RMSNorm + RoPE: norm Q and K, then apply RoPE in one pass */
+int iris_gpu_qknorm_rope(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
+                          const float *q_weight, const float *k_weight,
+                          const float *cos_freq, const float *sin_freq,
+                          int seq, int heads, int head_dim, float eps);
+
 /* RoPE 2D on GPU: applies rotary position embeddings in-place (4-axis split-half, Flux style) */
 void iris_gpu_rope_2d(iris_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
                       int seq, int heads, int head_dim, int axis_dim);

@@ -3190,6 +3190,7 @@ int iris_gpu_attention_bf16(iris_gpu_tensor_t out,
 static id<MTLLibrary> g_shader_library = nil;
 static id<MTLComputePipelineState> g_rms_norm_pipeline = nil;
 static id<MTLComputePipelineState> g_qk_rms_norm_pipeline = nil;
+static id<MTLComputePipelineState> g_qknorm_rope_pipeline = nil;
 static id<MTLComputePipelineState> g_adaln_norm_pipeline = nil;
 static id<MTLComputePipelineState> g_silu_pipeline = nil;
 static id<MTLComputePipelineState> g_silu_mul_pipeline = nil;
@@ -3295,6 +3296,15 @@ int iris_metal_init_shaders(void) {
             g_qk_rms_norm_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
             if (!g_qk_rms_norm_pipeline) {
                 fprintf(stderr, "Metal shaders: qk_rms_norm pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"qknorm_rope"];
+        if (func) {
+            g_qknorm_rope_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_qknorm_rope_pipeline) {
+                fprintf(stderr, "Metal shaders: qknorm_rope pipeline failed: %s\n",
                         [[error localizedDescription] UTF8String]);
             }
         }
@@ -4042,6 +4052,57 @@ void iris_gpu_adaln_norm(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
         }
         /* ARC will release bufShift and bufScale after command completes */
     }
+}
+
+/* Fused QK RMSNorm + RoPE: norm both Q and K heads, then apply RoPE.
+ * Eliminates 2 intermediate read+write passes. Returns 1 on success. */
+int iris_gpu_qknorm_rope(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
+                          const float *q_weight, const float *k_weight,
+                          const float *cos_freq, const float *sin_freq,
+                          int seq, int heads, int head_dim, float eps) {
+    if (!g_shaders_initialized || !g_qknorm_rope_pipeline || !q || !k) return 0;
+
+    @autoreleasepool {
+        size_t weight_size = (size_t)head_dim * sizeof(float);
+        size_t freq_size = (size_t)seq * head_dim * sizeof(float);
+
+        id<MTLBuffer> bufQWeight = get_cached_weight_buffer(q_weight, weight_size);
+        id<MTLBuffer> bufKWeight = get_cached_weight_buffer(k_weight, weight_size);
+        id<MTLBuffer> bufCos = get_rope_buffer(cos_freq, freq_size);
+        id<MTLBuffer> bufSin = get_rope_buffer(sin_freq, freq_size);
+
+        if (!bufQWeight || !bufKWeight || !bufCos || !bufSin) return 0;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_qknorm_rope_pipeline];
+        [encoder setBuffer:q->buffer offset:0 atIndex:0];
+        [encoder setBuffer:k->buffer offset:0 atIndex:1];
+        [encoder setBuffer:bufQWeight offset:0 atIndex:2];
+        [encoder setBuffer:bufKWeight offset:0 atIndex:3];
+        [encoder setBuffer:bufCos offset:0 atIndex:4];
+        [encoder setBuffer:bufSin offset:0 atIndex:5];
+        [encoder setBytes:&heads length:sizeof(int) atIndex:6];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:8];
+
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+
+        [encoder endEncoding];
+
+        q->has_pending_work = 1;
+        k->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            q->has_pending_work = 0;
+            k->has_pending_work = 0;
+        }
+    }
+    return 1;
 }
 
 /* GPU tensor version of QK RMSNorm */

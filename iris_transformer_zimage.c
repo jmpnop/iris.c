@@ -978,15 +978,18 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                                         seq, dim, dim)) return 0;
         }
 
-        /* GPU: QK normalization */
-        iris_gpu_qk_rms_norm(scratch->q, scratch->k,
-                              block->attn_norm_q, block->attn_norm_k,
-                              seq, n_heads, head_dim, ZI_NORM_EPS);
-
-        /* GPU: RoPE (full head_dim, pre-assembled 3-axis table) */
-        iris_gpu_rope_single_pair_f32(scratch->q, scratch->k,
-                                      rope_cos, rope_sin,
-                                      seq, n_heads, head_dim);
+        /* GPU: fused QK normalization + RoPE */
+        if (!iris_gpu_qknorm_rope(scratch->q, scratch->k,
+                                   block->attn_norm_q, block->attn_norm_k,
+                                   rope_cos, rope_sin,
+                                   seq, n_heads, head_dim, ZI_NORM_EPS)) {
+            iris_gpu_qk_rms_norm(scratch->q, scratch->k,
+                                  block->attn_norm_q, block->attn_norm_k,
+                                  seq, n_heads, head_dim, ZI_NORM_EPS);
+            iris_gpu_rope_single_pair_f32(scratch->q, scratch->k,
+                                          rope_cos, rope_sin,
+                                          seq, n_heads, head_dim);
+        }
 
         /* GPU: Self-attention */
         float attn_scale = 1.0f / sqrtf((float)head_dim);
@@ -1103,15 +1106,18 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                                         seq, dim, dim)) return 0;
         }
 
-        /* GPU: QK normalization */
-        iris_gpu_qk_rms_norm(scratch->q, scratch->k,
-                              block->attn_norm_q, block->attn_norm_k,
-                              seq, n_heads, head_dim, ZI_NORM_EPS);
-
-        /* GPU: RoPE */
-        iris_gpu_rope_single_pair_f32(scratch->q, scratch->k,
-                                      rope_cos, rope_sin,
-                                      seq, n_heads, head_dim);
+        /* GPU: fused QK normalization + RoPE */
+        if (!iris_gpu_qknorm_rope(scratch->q, scratch->k,
+                                   block->attn_norm_q, block->attn_norm_k,
+                                   rope_cos, rope_sin,
+                                   seq, n_heads, head_dim, ZI_NORM_EPS)) {
+            iris_gpu_qk_rms_norm(scratch->q, scratch->k,
+                                  block->attn_norm_q, block->attn_norm_k,
+                                  seq, n_heads, head_dim, ZI_NORM_EPS);
+            iris_gpu_rope_single_pair_f32(scratch->q, scratch->k,
+                                          rope_cos, rope_sin,
+                                          seq, n_heads, head_dim);
+        }
 
         /* GPU: Self-attention */
         float attn_scale = 1.0f / sqrtf((float)head_dim);
