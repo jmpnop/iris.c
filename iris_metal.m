@@ -272,6 +272,7 @@ static id<MTLComputePipelineState> g_group_norm_f32_pipeline;
 static id<MTLComputePipelineState> g_swish_f32_pipeline;
 static id<MTLComputePipelineState> g_add_f32_pipeline;
 static id<MTLComputePipelineState> g_upsample_nearest_2x_f32_pipeline;
+static id<MTLComputePipelineState> g_transpose_2d_scale_f32_pipeline;
 static int g_shaders_initialized;
 
 /* ========================================================================
@@ -3626,6 +3627,10 @@ int iris_metal_init_shaders(void) {
         if (func) {
             g_upsample_nearest_2x_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
         }
+        func = [g_shader_library newFunctionWithName:@"transpose_2d_scale_f32"];
+        if (func) {
+            g_transpose_2d_scale_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
 
         g_shaders_initialized = 1;
         if (iris_verbose)
@@ -6712,6 +6717,41 @@ iris_gpu_tensor_t iris_gpu_upsample_nearest_2x_f32(iris_gpu_tensor_t x,
     }
 
     return out;
+}
+
+/* 2D transpose with scale: out[c*rows+r] = in[r*cols+c] * scale */
+void iris_gpu_transpose_2d_f32(iris_gpu_tensor_t in, iris_gpu_tensor_t out,
+                                int rows, int cols, float scale) {
+    if (!g_shaders_initialized || !g_transpose_2d_scale_f32_pipeline) return;
+    if (!in || !out || rows <= 0 || cols <= 0) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_transpose_2d_scale_f32_pipeline];
+        [encoder setBuffer:in->buffer offset:0 atIndex:0];
+        [encoder setBuffer:out->buffer offset:0 atIndex:1];
+        [encoder setBytes:&rows length:sizeof(int) atIndex:2];
+        [encoder setBytes:&cols length:sizeof(int) atIndex:3];
+        [encoder setBytes:&scale length:sizeof(float) atIndex:4];
+
+        NSUInteger tg = 16;
+        NSUInteger gx = ((NSUInteger)cols + tg - 1) / tg;
+        NSUInteger gy = ((NSUInteger)rows + tg - 1) / tg;
+        [encoder dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg, tg, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        in->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            in->has_pending_work = 0;
+        }
+    }
 }
 
 /* GPU blit copy for f32 tensors */

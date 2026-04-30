@@ -323,6 +323,86 @@ static int attnblock_forward(float *out, const float *x,
     return 0;
 }
 
+#ifdef USE_METAL
+/* GPU-accelerated VAE bottleneck attention. Keeps all data on GPU —
+ * no CPU↔GPU sync stalls. Returns new GPU tensor or NULL on failure
+ * (caller falls back to CPU path). Only supports batch=1. */
+static iris_gpu_tensor_t attnblock_forward_gpu(iris_gpu_tensor_t x,
+                                                const vae_attnblock_t *block,
+                                                int batch, int H, int W,
+                                                int num_groups, float eps) {
+    if (batch != 1) return NULL;
+    int ch = block->channels;
+    int spatial = H * W;
+    float scale = 1.0f / sqrtf((float)ch);
+
+    iris_gpu_tensor_t norm_out = iris_gpu_tensor_alloc((size_t)ch * spatial);
+    if (!norm_out) return NULL;
+    iris_gpu_group_norm_f32(norm_out, x, block->norm_weight, block->norm_bias,
+                            batch, ch, spatial, num_groups, eps);
+
+    iris_gpu_tensor_t q_conv = iris_gpu_conv2d_f32(norm_out, block->q_weight, block->q_bias,
+                                                    batch, ch, ch, H, W, 1, 1, 1, 0);
+    iris_gpu_tensor_t k_conv = iris_gpu_conv2d_f32(norm_out, block->k_weight, block->k_bias,
+                                                    batch, ch, ch, H, W, 1, 1, 1, 0);
+    iris_gpu_tensor_t v_conv = iris_gpu_conv2d_f32(norm_out, block->v_weight, block->v_bias,
+                                                    batch, ch, ch, H, W, 1, 1, 1, 0);
+    iris_gpu_tensor_free(norm_out);
+    if (!q_conv || !k_conv || !v_conv) goto fail_conv;
+
+    {
+        size_t sz = (size_t)spatial * ch;
+        iris_gpu_tensor_t q_t = iris_gpu_tensor_alloc(sz);
+        iris_gpu_tensor_t k_t = iris_gpu_tensor_alloc(sz);
+        iris_gpu_tensor_t v_t = iris_gpu_tensor_alloc(sz);
+        iris_gpu_tensor_t attn_out = iris_gpu_tensor_alloc(sz);
+        if (!q_t || !k_t || !v_t || !attn_out) {
+            iris_gpu_tensor_free(q_t); iris_gpu_tensor_free(k_t);
+            iris_gpu_tensor_free(v_t); iris_gpu_tensor_free(attn_out);
+            goto fail_conv;
+        }
+
+        iris_gpu_transpose_2d_f32(q_conv, q_t, ch, spatial, 1.0f);
+        iris_gpu_transpose_2d_f32(k_conv, k_t, ch, spatial, 1.0f);
+        iris_gpu_transpose_2d_f32(v_conv, v_t, ch, spatial, 1.0f);
+        iris_gpu_tensor_free(q_conv); q_conv = NULL;
+        iris_gpu_tensor_free(k_conv); k_conv = NULL;
+        iris_gpu_tensor_free(v_conv); v_conv = NULL;
+
+        int ok = iris_gpu_attention_flash(attn_out, q_t, k_t, v_t,
+                                           spatial, spatial, 1, ch, scale);
+        if (!ok) ok = iris_gpu_attention_fused(attn_out, q_t, k_t, v_t,
+                                                spatial, spatial, 1, ch, scale);
+        iris_gpu_tensor_free(q_t);
+        iris_gpu_tensor_free(k_t);
+        iris_gpu_tensor_free(v_t);
+        if (!ok) { iris_gpu_tensor_free(attn_out); return NULL; }
+
+        iris_gpu_tensor_t out_t = iris_gpu_tensor_alloc(sz);
+        if (!out_t) { iris_gpu_tensor_free(attn_out); return NULL; }
+        iris_gpu_transpose_2d_f32(attn_out, out_t, spatial, ch, 1.0f);
+        iris_gpu_tensor_free(attn_out);
+
+        iris_gpu_tensor_t proj = iris_gpu_conv2d_f32(out_t, block->out_weight, block->out_bias,
+                                                      batch, ch, ch, H, W, 1, 1, 1, 0);
+        iris_gpu_tensor_free(out_t);
+        if (!proj) return NULL;
+
+        iris_gpu_tensor_t result = iris_gpu_tensor_alloc((size_t)ch * spatial);
+        if (!result) { iris_gpu_tensor_free(proj); return NULL; }
+        iris_gpu_add_f32(result, x, proj, ch * spatial);
+        iris_gpu_tensor_free(proj);
+        return result;
+    }
+
+fail_conv:
+    iris_gpu_tensor_free(q_conv);
+    iris_gpu_tensor_free(k_conv);
+    iris_gpu_tensor_free(v_conv);
+    return NULL;
+}
+#endif
+
 /* ========================================================================
  * Encoder Forward Pass
  * ======================================================================== */
@@ -603,17 +683,20 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
     x = t;
     if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
 
-    /* Mid block attention: sync to CPU, run attention, upload back */
-    {
+    /* Mid block attention: try GPU path first, fall back to CPU */
+    t = attnblock_forward_gpu(x, &vae->dec_mid_attn, batch, cur_h, cur_w,
+                               vae->num_groups, vae->eps);
+    if (t) {
+        iris_gpu_tensor_free(x);
+        x = t;
+    } else {
         size_t attn_size = (size_t)batch * mid_ch * cur_h * cur_w;
         float *cpu_attn_in = cpu_work;
 
-        iris_gpu_batch_end();  /* Sync: execute everything queued so far */
+        iris_gpu_batch_end();
 
-        /* Download GPU tensor to CPU */
         iris_gpu_tensor_read(x, cpu_attn_in);
 
-        /* Run attention on CPU (uses existing attnblock_forward) */
         float *cpu_attn_out = cpu_x;
         if (attnblock_forward(cpu_attn_out, cpu_attn_in, &vae->dec_mid_attn,
                                vae->work3, batch, cur_h, cur_w,
@@ -621,15 +704,14 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
             iris_gpu_tensor_free(x);
             return NULL;
         }
-        if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
 
-        /* Upload result back to GPU */
         iris_gpu_tensor_free(x);
         x = iris_gpu_tensor_create(cpu_attn_out, attn_size);
         if (!x) return NULL;
 
-        iris_gpu_batch_begin();  /* Start new batch for remaining work */
+        iris_gpu_batch_begin();
     }
+    if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
 
     /* Mid block: resblock2 */
     t = resblock_forward_gpu(x, &vae->dec_mid_block2, batch, cur_h, cur_w, vae->num_groups, vae->eps);

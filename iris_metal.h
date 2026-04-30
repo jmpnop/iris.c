@@ -567,6 +567,11 @@ iris_gpu_tensor_t iris_gpu_conv2d_f32(iris_gpu_tensor_t x,
                                        int H, int W, int kH, int kW,
                                        int stride, int padding);
 
+/* 2D transpose with scale on f32 GPU tensors: out[c*rows+r] = in[r*cols+c] * scale
+ * Transposes [rows, cols] -> [cols, rows]. Use scale=1.0f for plain transpose. */
+void iris_gpu_transpose_2d_f32(iris_gpu_tensor_t in, iris_gpu_tensor_t out,
+                                int rows, int cols, float scale);
+
 /* GPU blit copy for f32 tensors */
 void iris_gpu_copy_f32(iris_gpu_tensor_t dst, iris_gpu_tensor_t src, size_t n);
 

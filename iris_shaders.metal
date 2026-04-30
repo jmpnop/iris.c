@@ -2434,3 +2434,20 @@ kernel void upsample_nearest_2x_f32(
 
     out[c * out_spatial + oy * out_w + ox] = x[c * in_h * in_w + iy * in_w + ix];
 }
+
+/* 2D matrix transpose with optional scale: [rows, cols] -> [cols, rows]
+ * out[c * rows + r] = in[r * cols + c] * scale
+ * Used by VAE attention to convert [C, HW] <-> [HW, C]. */
+kernel void transpose_2d_scale_f32(
+    device const float *in [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant int &rows [[buffer(2)]],
+    constant int &cols [[buffer(3)]],
+    constant float &scale [[buffer(4)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint c = pos.x;
+    uint r = pos.y;
+    if (r >= uint(rows) || c >= uint(cols)) return;
+    out[c * rows + r] = in[r * cols + c] * scale;
+}
