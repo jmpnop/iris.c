@@ -252,7 +252,6 @@ typedef struct iris_transformer_flux {
     uint16_t *final_proj_weight_bf16; /* [latent_channels, hidden] (bf16) */
 
     /* RoPE frequencies (precomputed) */
-    float *rope_freqs;              /* [max_seq, head_dim/2, 2] - legacy 1D */
     float *rope_cos;                /* [max_seq, axis_dim] - 2D cos frequencies */
     float *rope_sin;                /* [max_seq, axis_dim] - 2D sin frequencies */
     int max_seq_len;
@@ -794,19 +793,6 @@ static void warmup_mmap_bf16_buffers(iris_transformer_flux_t *tf) {
  * ======================================================================== */
 
 /* Precompute RoPE frequencies for given positions (1D version) */
-static void compute_rope_freqs(float *freqs, int max_seq, int dim, float theta) {
-    int half_dim = dim / 2;
-
-    for (int pos = 0; pos < max_seq; pos++) {
-        for (int d = 0; d < half_dim; d++) {
-            float freq = 1.0f / powf(theta, (float)(2 * d) / (float)dim);
-            float angle = (float)pos * freq;
-            freqs[pos * half_dim * 2 + d * 2] = cosf(angle);
-            freqs[pos * half_dim * 2 + d * 2 + 1] = sinf(angle);
-        }
-    }
-}
-
 /* Build 4-axis RoPE frequency tables for image tokens on a (patch_h x patch_w) grid.
  * Axes are T (temporal), H (height), W (width), L (sequence), each with axes_dim/2
  * frequency pairs. Image tokens use H and W for spatial position encoding so the
@@ -1377,7 +1363,7 @@ static int ensure_attn_scores(iris_transformer_flux_t *tf, int img_seq, int txt_
     int total_seq = img_seq + txt_seq;
     /* Need space for num_heads * max_seq * max_seq where max_seq = total_seq
      * This covers both self-attention and joint attention needs */
-    size_t needed = (size_t)tf->num_heads * total_seq * total_seq * sizeof(float);
+    size_t needed = (size_t)tf->num_heads * (size_t)total_seq * (size_t)total_seq * sizeof(float);
 
     if (tf->attn_scores_alloc < needed) {
         free(tf->attn_scores);
@@ -2400,6 +2386,7 @@ static int double_block_gpu_scratch_init(double_block_gpu_scratch_t *s,
     s->hidden = hidden;
     s->mlp_hidden = mlp_hidden;
     int total_seq = img_seq + txt_seq;
+    int ffn_seq = img_seq > txt_seq ? img_seq : txt_seq;
 
     s->img_norm     = iris_gpu_tensor_alloc((size_t)img_seq * hidden);
     s->txt_norm     = iris_gpu_tensor_alloc((size_t)txt_seq * hidden);
@@ -2415,9 +2402,9 @@ static int double_block_gpu_scratch_init(double_block_gpu_scratch_t *s,
     s->txt_attn_out = iris_gpu_tensor_alloc((size_t)txt_seq * hidden);
     s->img_proj     = iris_gpu_tensor_alloc((size_t)img_seq * hidden);
     s->txt_proj     = iris_gpu_tensor_alloc((size_t)txt_seq * hidden);
-    s->ffn_gate     = iris_gpu_tensor_alloc((size_t)img_seq * mlp_hidden);
-    s->ffn_up       = iris_gpu_tensor_alloc((size_t)img_seq * mlp_hidden);
-    s->ffn_out      = iris_gpu_tensor_alloc((size_t)img_seq * hidden);
+    s->ffn_gate     = iris_gpu_tensor_alloc((size_t)ffn_seq * mlp_hidden);
+    s->ffn_up       = iris_gpu_tensor_alloc((size_t)ffn_seq * mlp_hidden);
+    s->ffn_out      = iris_gpu_tensor_alloc((size_t)ffn_seq * hidden);
 
     if (!s->img_norm || !s->txt_norm || !s->img_q || !s->img_k || !s->img_v ||
         !s->txt_q || !s->txt_k || !s->txt_v || !s->cat_k || !s->cat_v ||
@@ -2751,6 +2738,7 @@ cleanup:
     /* === Cleanup GPU tensors === */
     iris_gpu_tensor_free(hidden_gpu);
     iris_gpu_tensor_free(norm_gpu);
+    iris_gpu_tensor_free(fused_gpu);
     iris_gpu_tensor_free(fused_result);
     iris_gpu_tensor_free(q_gpu);
     iris_gpu_tensor_free(k_gpu);
@@ -2930,13 +2918,22 @@ static int single_block_forward_gpu_chained(iris_gpu_tensor_t hidden_gpu,
         if (!iris_gpu_linear_bf16_into(fused_result, norm_gpu,
                                        block->qkv_mlp_weight_bf16,
                                        seq, h_size, fused_dim)) {
-            return 0;
+            return 0;  /* scratch tensors freed by caller */
         }
     } else {
         fused_result = iris_gpu_linear_bf16(norm_gpu,
                                             block->qkv_mlp_weight_bf16,
                                             seq, h_size, fused_dim);
         if (!fused_result) {
+            /* Cleanup own tensors before falling back */
+            iris_gpu_tensor_free(norm_gpu);
+            iris_gpu_tensor_free(q_gpu);
+            iris_gpu_tensor_free(k_gpu);
+            iris_gpu_tensor_free(v_gpu);
+            iris_gpu_tensor_free(gate_gpu);
+            iris_gpu_tensor_free(up_gpu);
+            iris_gpu_tensor_free(attn_out_gpu);
+            iris_gpu_tensor_free(concat_gpu);
             return 0;
         }
     }
@@ -2983,7 +2980,7 @@ static int single_block_forward_gpu_chained(iris_gpu_tensor_t hidden_gpu,
         if (!iris_gpu_linear_bf16_into(proj_out_gpu, concat_gpu,
                                        block->proj_mlp_weight_bf16,
                                        seq, h_size + mlp_hidden, h_size)) {
-            return 0;
+            return 0;  /* scratch tensors freed by caller */
         }
     } else {
         proj_out_gpu = iris_gpu_linear_bf16(concat_gpu, block->proj_mlp_weight_bf16,
@@ -3592,7 +3589,10 @@ static void single_block_forward(float *hidden, const single_block_t *block,
                                  const float *t_emb, const float *adaln_weight,
                                  const float *img_rope_cos, const float *img_rope_sin,
                                  const float *txt_rope_cos, const float *txt_rope_sin,
-                                 int seq, int img_offset, iris_transformer_flux_t *tf) {
+                                 int seq, int img_offset, iris_transformer_flux_t *tf,
+                                 const float *precomputed_shift,
+                                 const float *precomputed_scale,
+                                 const float *precomputed_gate) {
     /* seq = total_seq (txt + img)
      * img_offset = txt_seq (where image starts in the [txt, img] concatenation)
      */
@@ -3604,28 +3604,30 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     int img_seq = seq - img_offset;  /* Number of image tokens */
     float eps = 1e-6f;
 
-    /* Compute AdaLN parameters (3: shift, scale, gate)
-     * adaln_weight is [hidden*3, hidden], t_emb is [hidden]
-     * FLUX applies SiLU to t_emb before the modulation projection
-     */
-    int mod_size = h_size * 3;
+    /* AdaLN parameters (3: shift, scale, gate).
+     * When precomputed_shift is provided, skip SiLU + modulation matmul
+     * (they are the same for all 20 single blocks within a step). */
     double _t0 = prof_get_time();
 
-    /* Apply SiLU to t_emb for modulation - use pre-allocated buffer */
-    float *t_emb_silu = tf->t_emb_silu;
-    for (int i = 0; i < h_size; i++) {
-        float x = t_emb[i];
-        t_emb_silu[i] = x / (1.0f + expf(-x));
-    }
-
-    /* Use end of work2 for mod_params (3*hidden = 9216 floats)
-     * fused_out uses seq * fused_dim floats, place mod_params after */
+    float *shift, *scale, *gate;
     float *mod_params = tf->work2 + seq * fused_dim;
-    iris_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
 
-    float *shift = mod_params;
-    float *scale = mod_params + h_size;
-    float *gate = mod_params + h_size * 2;
+    if (precomputed_shift) {
+        shift = (float *)precomputed_shift;
+        scale = (float *)precomputed_scale;
+        gate  = (float *)precomputed_gate;
+    } else {
+        int mod_size = h_size * 3;
+        float *t_emb_silu = tf->t_emb_silu;
+        for (int i = 0; i < h_size; i++) {
+            float x = t_emb[i];
+            t_emb_silu[i] = x / (1.0f + expf(-x));
+        }
+        iris_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
+        shift = mod_params;
+        scale = mod_params + h_size;
+        gate = mod_params + h_size * 2;
+    }
 
     /* Norm */
     float *norm = tf->work1;
@@ -4122,6 +4124,18 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     /* Fall back to per-block GPU/CPU path if both bf16 and f32 chained paths failed */
     if (!bf16_path_ok && !gpu_chained_ok) {
 #endif
+        /* Pre-compute single-block modulation ONCE for the CPU fallback path.
+         * SiLU(t_emb) is already in tf->t_emb_silu from double-block setup. */
+        {
+            int fb_mod_size = hidden * 3;
+            int fb_fused_dim = hidden * 3 + tf->mlp_hidden * 2;
+            float *fb_mod_params = tf->work2 + total_seq * fb_fused_dim;
+            iris_linear_nobias(fb_mod_params, tf->t_emb_silu, tf->adaln_single_weight,
+                               1, hidden, fb_mod_size);
+            float *fb_shift = fb_mod_params;
+            float *fb_scale = fb_mod_params + hidden;
+            float *fb_gate  = fb_mod_params + hidden * 2;
+
         for (int i = 0; i < tf->num_single_layers; i++) {
             /* In mmap mode, load block weights on-demand and free after use */
             if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
@@ -4138,12 +4152,13 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
                                           total_seq, txt_seq, tf))
 #endif
             {
-                /* Fall back to CPU path */
+                /* Fall back to CPU path — pass pre-computed modulation */
                 single_block_forward(concat_hidden, &tf->single_blocks[i],
                                      t_emb, tf->adaln_single_weight,
                                      img_rope_cos, img_rope_sin,
                                      txt_rope_cos, txt_rope_sin,
-                                     total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
+                                     total_seq, txt_seq, tf,
+                                     fb_shift, fb_scale, fb_gate);
             }
             if (tf->use_mmap) free_single_block_weights(&tf->single_blocks[i]);
             if (iris_substep_callback)
@@ -4159,6 +4174,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
             }
 #endif
         }
+        }  /* end pre-computed modulation block */
 #ifdef USE_METAL
     }
 #endif
@@ -4386,6 +4402,18 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
     memcpy(concat_hidden + txt_seq * hidden, combined_hidden, combined_img_seq * hidden * sizeof(float));
     free(combined_hidden);
 
+    /* Pre-compute single-block modulation ONCE (same for all 20 blocks).
+     * t_emb_silu was already computed before the double blocks. */
+    {
+        int sb_mod_size = hidden * 3;
+        int sb_fused_dim = hidden * 3 + tf->mlp_hidden * 2;
+        float *sb_mod = tf->work2 + total_seq * sb_fused_dim;
+        iris_linear_nobias(sb_mod, tf->t_emb_silu, tf->adaln_single_weight,
+                           1, hidden, sb_mod_size);
+        float *sb_shift = sb_mod;
+        float *sb_scale = sb_mod + hidden;
+        float *sb_gate  = sb_mod + hidden * 2;
+
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
@@ -4396,7 +4424,8 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
                              t_emb, tf->adaln_single_weight,
                              combined_rope_cos, combined_rope_sin,
                              txt_rope_cos, txt_rope_sin,
-                             total_seq, txt_seq, tf);
+                             total_seq, txt_seq, tf,
+                             sb_shift, sb_scale, sb_gate);
         if (tf->use_mmap) {
             free_single_block_weights(&tf->single_blocks[i]);
             /* With direct mmap pointers for bf16, no need to clear caches. */
@@ -4404,18 +4433,15 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
     }
+    }  /* end pre-computed modulation block */
 
     /* Extract ONLY target image hidden states (first img_seq tokens after txt) */
     float *img_hidden = (float *)malloc(img_seq * hidden * sizeof(float));
     memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
     free(concat_hidden);
 
-    /* Final layer - only for target image tokens */
-    for (int i = 0; i < hidden; i++) {
-        float x = t_emb[i];
-        tf->t_emb_silu[i] = x / (1.0f + expf(-x));
-    }
-
+    /* Final layer - only for target image tokens.
+     * t_emb_silu was already computed before the double blocks — reuse it. */
     float *final_mod = tf->double_mod_img;
     iris_linear_nobias(final_mod, tf->t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
 
@@ -4629,6 +4655,18 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
     memcpy(concat_hidden + txt_seq * hidden, combined_hidden, combined_img_seq * hidden * sizeof(float));
     free(combined_hidden);
 
+    /* Pre-compute single-block modulation ONCE (same for all 20 blocks).
+     * t_emb_silu was already computed before the double blocks. */
+    {
+        int mr_mod_size = hidden * 3;
+        int mr_fused_dim = hidden * 3 + tf->mlp_hidden * 2;
+        float *mr_mod = tf->work2 + total_seq * mr_fused_dim;
+        iris_linear_nobias(mr_mod, tf->t_emb_silu, tf->adaln_single_weight,
+                           1, hidden, mr_mod_size);
+        float *mr_shift = mr_mod;
+        float *mr_scale = mr_mod + hidden;
+        float *mr_gate  = mr_mod + hidden * 2;
+
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
@@ -4639,25 +4677,22 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
                              t_emb, tf->adaln_single_weight,
                              combined_rope_cos, combined_rope_sin,
                              txt_rope_cos, txt_rope_sin,
-                             total_seq, txt_seq, tf);
+                             total_seq, txt_seq, tf,
+                             mr_shift, mr_scale, mr_gate);
         if (tf->use_mmap) {
             free_single_block_weights(&tf->single_blocks[i]);
         }
         if (iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
     }
+    }  /* end pre-computed modulation block */
 
     /* Extract ONLY target image hidden states */
     float *img_hidden = (float *)malloc(img_seq * hidden * sizeof(float));
     memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
     free(concat_hidden);
 
-    /* Final layer */
-    for (int i = 0; i < hidden; i++) {
-        float x = t_emb[i];
-        tf->t_emb_silu[i] = x / (1.0f + expf(-x));
-    }
-
+    /* Final layer — t_emb_silu was already computed before the double blocks. */
     float *final_mod = tf->double_mod_img;
     iris_linear_nobias(final_mod, tf->t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
 
@@ -4791,10 +4826,6 @@ iris_transformer_flux_t *iris_transformer_load_flux(FILE *f) {
     tf->final_norm_weight = read_floats(f, tf->hidden_size);
     tf->final_proj_weight = read_floats(f, tf->latent_channels * tf->hidden_size);
 
-    /* Precompute RoPE frequencies */
-    tf->rope_freqs = (float *)malloc(tf->max_seq_len * tf->head_dim * sizeof(float));
-    compute_rope_freqs(tf->rope_freqs, tf->max_seq_len, tf->head_dim, tf->rope_theta);
-
     /* Work buffers are dynamically allocated in forward() based on actual sequence
      * length. This avoids 8.4GB pre-allocation that was causing OOM on 16GB systems. */
     int hidden = tf->hidden_size;
@@ -4916,7 +4947,6 @@ void iris_transformer_free_flux(iris_transformer_flux_t *tf) {
     free(tf->final_norm_weight);
     free(tf->final_proj_weight);
     free(tf->final_proj_weight_bf16);
-    free(tf->rope_freqs);
     free(tf->img_hidden);
     free(tf->txt_hidden);
     free(tf->work1);
@@ -5275,12 +5305,6 @@ iris_transformer_flux_t *iris_transformer_load_safetensors_flux(const char *mode
     /* Close safetensors files (non-mmap: data already copied) */
     for (int i = 0; i < num_files; i++) safetensors_close(files[i]);
 
-    /* Precompute RoPE frequencies */
-    tf->rope_freqs = malloc(tf->max_seq_len * tf->head_dim * sizeof(float));
-    if (tf->rope_freqs) {
-        compute_rope_freqs(tf->rope_freqs, tf->max_seq_len, tf->head_dim, tf->rope_theta);
-    }
-
     /* Work buffers are dynamically allocated in forward() based on actual sequence
      * length. This avoids the 8.4GB pre-allocation that was causing OOM on 16GB systems. */
     int hidden = tf->hidden_size;
@@ -5412,12 +5436,6 @@ iris_transformer_flux_t *iris_transformer_load_safetensors_mmap_flux(const char 
     tf->final_proj_weight = get_sf_tensor_tf(files, num_files, "proj_out.weight");
     if (tf->use_bf16) {
         tf->final_proj_weight_bf16 = get_sf_tensor_bf16(files, num_files, "proj_out.weight");
-    }
-
-    /* Precompute RoPE frequencies */
-    tf->rope_freqs = malloc(tf->max_seq_len * tf->head_dim * sizeof(float));
-    if (tf->rope_freqs) {
-        compute_rope_freqs(tf->rope_freqs, tf->max_seq_len, tf->head_dim, tf->rope_theta);
     }
 
     /* Work buffers - dynamically allocated in forward() */

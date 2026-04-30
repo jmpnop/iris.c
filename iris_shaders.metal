@@ -49,7 +49,7 @@ kernel void rms_norm(
 
     // Parallel reduction for sum
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threads) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -187,36 +187,46 @@ kernel void adaln_norm(
     uint threads [[threads_per_threadgroup]]
 ) {
     threadgroup float shared_sum[256];
-    threadgroup float shared_sum_sq[256];
 
     device const float *x_row = x + row * hidden;
     device float *out_row = out + row * hidden;
 
-    // Compute partial sums for mean and variance
+    // First pass: compute mean
     float local_sum = 0.0f;
-    float local_sum_sq = 0.0f;
     for (int i = tid; i < hidden; i += threads) {
-        float val = x_row[i];
-        local_sum += val;
-        local_sum_sq += val * val;
+        local_sum += x_row[i];
     }
     shared_sum[tid] = local_sum;
-    shared_sum_sq[tid] = local_sum_sq;
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Parallel reduction
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threads) {
             shared_sum[tid] += shared_sum[tid + stride];
-            shared_sum_sq[tid] += shared_sum_sq[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Compute mean and std_inv
     float mean = shared_sum[0] / float(hidden);
-    float var = shared_sum_sq[0] / float(hidden) - mean * mean;
+
+    // Second pass: variance via Welford (numerically stable)
+    float var_sum = 0.0f;
+    for (int i = tid; i < hidden; i += threads) {
+        float diff = x_row[i] - mean;
+        var_sum += diff * diff;
+    }
+    shared_sum[tid] = var_sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float var = shared_sum[0] / float(hidden);
     float std_inv = rsqrt(var + eps);
 
     // Apply LayerNorm + AdaLN modulation
@@ -237,7 +247,7 @@ kernel void silu(
 ) {
     if (gid < uint(n)) {
         float val = x[gid];
-        x[gid] = val / (1.0f + exp(-val));
+        x[gid] = val / (1.0f + metal::fast::exp(-val));
     }
 }
 
@@ -250,7 +260,7 @@ kernel void silu_mul(
 ) {
     if (gid < uint(n)) {
         float g = gate[gid];
-        float silu_g = g / (1.0f + exp(-g));
+        float silu_g = g / (1.0f + metal::fast::exp(-g));
         gate[gid] = silu_g * up[gid];
     }
 }
@@ -270,7 +280,7 @@ kernel void split_silu_mul(
     int fused_stride = n * 2;
     float g = fused[row * fused_stride + col];
     float u = fused[row * fused_stride + n + col];
-    out[gid] = (g / (1.0f + exp(-g))) * u;
+    out[gid] = (g / (1.0f + metal::fast::exp(-g))) * u;
 }
 
 /* ========================================================================
@@ -305,7 +315,7 @@ kernel void norm_gated_add(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride)
+        if (tid < stride && tid + stride < threads)
             shared_sum[tid] += shared_sum[tid + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -342,7 +352,7 @@ kernel void norm_add(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride)
+        if (tid < stride && tid + stride < threads)
             shared_sum[tid] += shared_sum[tid + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -476,7 +486,7 @@ kernel void softmax(
 
     // Reduce to find global max
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threads) {
             shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -486,7 +496,7 @@ kernel void softmax(
     // Compute exp and sum
     float local_sum = 0.0f;
     for (int i = tid; i < cols; i += threads) {
-        float e = exp(row_ptr[i] - max_val);
+        float e = metal::fast::exp(row_ptr[i] - max_val);
         row_ptr[i] = e;  // Store exp temporarily
         local_sum += e;
     }
@@ -496,7 +506,7 @@ kernel void softmax(
 
     // Reduce to find total sum
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threads) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -504,7 +514,7 @@ kernel void softmax(
     float sum = shared_sum[0];
 
     // Normalize
-    float inv_sum = 1.0f / sum;
+    float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
     for (int i = tid; i < cols; i += threads) {
         row_ptr[i] *= inv_sum;
     }
@@ -730,7 +740,7 @@ kernel void attention_fused(
     // ========== Phase 3: Compute exp(score - max) and sum ==========
     float local_sum = 0.0f;
     for (int key_idx = tid; key_idx < seq_k; key_idx += threads) {
-        float e = exp(shared_scores[key_idx] - max_val);
+        float e = metal::fast::exp(shared_scores[key_idx] - max_val);
         shared_scores[key_idx] = e;
         local_sum += e;
     }
@@ -745,7 +755,7 @@ kernel void attention_fused(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float inv_sum = 1.0f / shared_sum[0];
+    float inv_sum = (shared_sum[0] > 0.0f) ? (1.0f / shared_sum[0]) : 0.0f;
 
     // ========== Phase 5: Normalize scores ==========
     for (int key_idx = tid; key_idx < seq_k; key_idx += threads) {
@@ -818,7 +828,9 @@ kernel void attention_flash(
 
     float running_max = -INFINITY;
     float running_sum = 0.0f;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    /* Max accumulator slots: ceil(head_dim / threads).
+     * 8 supports head_dim up to 2048 with threads=256. */
+    float acc[8] = {0};
 
     int num_tiles = (seq_k + FLASH_TILE_K - 1) / FLASH_TILE_K;
 
@@ -852,11 +864,12 @@ kernel void attention_flash(
         float tile_max = shared_max[0];
 
         float new_max = max(running_max, tile_max);
-        float correction = (running_max > -INFINITY) ? exp(running_max - new_max) : 0.0f;
+        float correction = (running_max > -INFINITY) ? metal::fast::exp(running_max - new_max) : 0.0f;
 
         running_sum *= correction;
         int dim_idx = 0;
         for (int d = (int)tid; d < head_dim; d += (int)threads) {
+            if (dim_idx >= 8) break;
             acc[dim_idx] *= correction;
             dim_idx++;
         }
@@ -864,7 +877,7 @@ kernel void attention_flash(
 
         float local_tile_sum = 0.0f;
         for (int k = (int)tid; k < tile_len; k += (int)threads) {
-            float e = exp(shared_scores[k] - new_max);
+            float e = metal::fast::exp(shared_scores[k] - new_max);
             shared_scores[k] = e;
             local_tile_sum += e;
         }
@@ -884,6 +897,7 @@ kernel void attention_flash(
 
         dim_idx = 0;
         for (int d = (int)tid; d < head_dim; d += (int)threads) {
+            if (dim_idx >= 8) break;
             float v_acc = 0.0f;
             for (int k = 0; k < tile_len; k++) {
                 int key_idx = tile_start + k;
@@ -899,6 +913,7 @@ kernel void attention_flash(
     float inv_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
     int dim_idx = 0;
     for (int d = (int)tid; d < head_dim; d += (int)threads) {
+        if (dim_idx >= 8) break;
         out_row[d] = acc[dim_idx] * inv_sum;
         dim_idx++;
     }
@@ -1008,7 +1023,7 @@ kernel void causal_attention_fused(
     for (int key_idx = tid; key_idx < seq; key_idx += threads) {
         float score = shared_scores[key_idx];
         if (score > -1e30f) {  // Not masked
-            float e = exp(score - max_val);
+            float e = metal::fast::exp(score - max_val);
             shared_scores[key_idx] = e;
             local_sum += e;
         } else {
@@ -1027,7 +1042,7 @@ kernel void causal_attention_fused(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float sum = shared_sum[0];
-    float inv_sum = 1.0f / sum;
+    float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
 
     // ========== Phase 5: Normalize scores ==========
     for (int key_idx = tid; key_idx < seq; key_idx += threads) {
@@ -1218,7 +1233,7 @@ kernel void softmax_half(
 
     // Reduce to find global max
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threads) {
             shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1228,7 +1243,7 @@ kernel void softmax_half(
     // Compute exp(x - max) and sum
     float local_sum = 0.0f;
     for (int i = tid; i < N; i += threads) {
-        float exp_val = exp(float(row_data[i]) - max_val);
+        float exp_val = metal::fast::exp(float(row_data[i]) - max_val);
         row_data[i] = half(exp_val);  // Store temporarily
         local_sum += exp_val;
     }
@@ -1237,13 +1252,13 @@ kernel void softmax_half(
 
     // Reduce sum
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threads) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float sum = shared_sum[0];
-    float inv_sum = 1.0f / sum;
+    float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
 
     // Normalize
     for (int i = tid; i < N; i += threads) {
@@ -1302,7 +1317,7 @@ kernel void rms_norm_bf16(
 
     // Parallel reduction
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threads) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1414,33 +1429,46 @@ kernel void adaln_norm_bf16(
     uint threads [[threads_per_threadgroup]]
 ) {
     threadgroup float shared_sum[256];
-    threadgroup float shared_sum_sq[256];
 
     device const ushort *x_row = x + row * hidden;
     device ushort *out_row = out + row * hidden;
 
+    // First pass: compute mean
     float local_sum = 0.0f;
-    float local_sum_sq = 0.0f;
     for (int i = tid; i < hidden; i += threads) {
-        float val = bf16_to_f32(x_row[i]);
-        local_sum += val;
-        local_sum_sq += val * val;
+        local_sum += bf16_to_f32(x_row[i]);
     }
     shared_sum[tid] = local_sum;
-    shared_sum_sq[tid] = local_sum_sq;
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threads) {
             shared_sum[tid] += shared_sum[tid + stride];
-            shared_sum_sq[tid] += shared_sum_sq[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     float mean = shared_sum[0] / float(hidden);
-    float var = shared_sum_sq[0] / float(hidden) - mean * mean;
+
+    // Second pass: variance via Welford (numerically stable)
+    float var_sum = 0.0f;
+    for (int i = tid; i < hidden; i += threads) {
+        float diff = bf16_to_f32(x_row[i]) - mean;
+        var_sum += diff * diff;
+    }
+    shared_sum[tid] = var_sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float var = shared_sum[0] / float(hidden);
     float std_inv = rsqrt(var + eps);
 
     for (int i = tid; i < hidden; i += threads) {
@@ -1460,7 +1488,7 @@ kernel void silu_bf16(
 ) {
     if (gid < uint(n)) {
         float val = bf16_to_f32(x[gid]);
-        x[gid] = f32_to_bf16(val / (1.0f + exp(-val)));
+        x[gid] = f32_to_bf16(val / (1.0f + metal::fast::exp(-val)));
     }
 }
 
@@ -1473,7 +1501,7 @@ kernel void silu_mul_bf16(
 ) {
     if (gid < uint(n)) {
         float g = bf16_to_f32(gate[gid]);
-        float silu_g = g / (1.0f + exp(-g));
+        float silu_g = g / (1.0f + metal::fast::exp(-g));
         float u = bf16_to_f32(up[gid]);
         gate[gid] = f32_to_bf16(silu_g * u);
     }
@@ -1695,7 +1723,7 @@ kernel void softmax_bf16(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threads) {
             shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1705,7 +1733,7 @@ kernel void softmax_bf16(
     // Compute exp and sum in f32
     float local_sum = 0.0f;
     for (int i = tid; i < N; i += threads) {
-        float exp_val = exp(bf16_to_f32(row_data[i]) - max_val);
+        float exp_val = metal::fast::exp(bf16_to_f32(row_data[i]) - max_val);
         row_data[i] = f32_to_bf16(exp_val);
         local_sum += exp_val;
     }
@@ -1713,12 +1741,12 @@ kernel void softmax_bf16(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threads) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float inv_sum = 1.0f / shared_sum[0];
+    float inv_sum = (shared_sum[0] > 0.0f) ? (1.0f / shared_sum[0]) : 0.0f;
 
     // Normalize and store as bf16
     for (int i = tid; i < N; i += threads) {
@@ -2061,7 +2089,7 @@ kernel void attention_fused_bf16(
     // ========== Phase 3: Compute exp(score - max) and sum ==========
     float local_sum = 0.0f;
     for (int key_idx = tid; key_idx < seq_k; key_idx += threads) {
-        float e = exp(shared_scores[key_idx] - max_val);
+        float e = metal::fast::exp(shared_scores[key_idx] - max_val);
         shared_scores[key_idx] = e;
         local_sum += e;
     }
@@ -2076,7 +2104,7 @@ kernel void attention_fused_bf16(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float inv_sum = 1.0f / shared_sum[0];
+    float inv_sum = (shared_sum[0] > 0.0f) ? (1.0f / shared_sum[0]) : 0.0f;
 
     // ========== Phase 5: Normalize scores ==========
     for (int key_idx = tid; key_idx < seq_k; key_idx += threads) {
@@ -2201,7 +2229,7 @@ kernel void causal_attention_fused_bf16(
     for (int key_idx = tid; key_idx < seq; key_idx += threads) {
         float score = shared_scores[key_idx];
         if (score > -1e30f) {
-            float e = exp(score - max_val);
+            float e = metal::fast::exp(score - max_val);
             shared_scores[key_idx] = e;
             local_sum += e;
         } else {
@@ -2219,7 +2247,7 @@ kernel void causal_attention_fused_bf16(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float inv_sum = 1.0f / shared_sum[0];
+    float inv_sum = (shared_sum[0] > 0.0f) ? (1.0f / shared_sum[0]) : 0.0f;
 
     // ========== Phase 5: Normalize scores ==========
     for (int key_idx = tid; key_idx < seq; key_idx += threads) {
@@ -2330,7 +2358,6 @@ kernel void group_norm_f32(
     uint threads [[threads_per_threadgroup]]
 ) {
     threadgroup float shared_sum[256];
-    threadgroup float shared_sum2[256];
 
     /* group_id encodes (batch, group) */
     int num_groups = channels / channels_per_group;
@@ -2344,32 +2371,46 @@ kernel void group_norm_f32(
     device const float *x_batch = x + batch_idx * channels * spatial;
     device float *out_batch = out + batch_idx * channels * spatial;
 
-    /* Compute partial sums for mean and variance */
+    /* First pass: compute mean */
     float local_sum = 0.0f;
-    float local_sum2 = 0.0f;
     for (int i = tid; i < group_size; i += threads) {
         int c = c_start + i / spatial;
         int s = i % spatial;
-        float val = x_batch[c * spatial + s];
-        local_sum += val;
-        local_sum2 += val * val;
+        local_sum += x_batch[c * spatial + s];
     }
     shared_sum[tid] = local_sum;
-    shared_sum2[tid] = local_sum2;
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    /* Parallel reduction */
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threads) {
             shared_sum[tid] += shared_sum[tid + stride];
-            shared_sum2[tid] += shared_sum2[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     float mean = shared_sum[0] / float(group_size);
-    float var = shared_sum2[0] / float(group_size) - mean * mean;
+
+    /* Second pass: variance via Welford (numerically stable) */
+    float var_local = 0.0f;
+    for (int i = tid; i < group_size; i += threads) {
+        int c = c_start + i / spatial;
+        int s = i % spatial;
+        float diff = x_batch[c * spatial + s] - mean;
+        var_local += diff * diff;
+    }
+    shared_sum[tid] = var_local;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float var = shared_sum[0] / float(group_size);
     float inv_std = rsqrt(var + eps);
 
     /* Apply normalization with gamma/beta per channel */
@@ -2397,7 +2438,6 @@ kernel void group_norm_swish_f32(
     uint threads [[threads_per_threadgroup]]
 ) {
     threadgroup float shared_sum[256];
-    threadgroup float shared_sum2[256];
 
     int num_groups = channels / channels_per_group;
     int batch_idx = group_id / num_groups;
@@ -2409,30 +2449,46 @@ kernel void group_norm_swish_f32(
     device const float *x_batch = x + batch_idx * channels * spatial;
     device float *out_batch = out + batch_idx * channels * spatial;
 
+    /* First pass: compute mean */
     float local_sum = 0.0f;
-    float local_sum2 = 0.0f;
     for (int i = tid; i < group_size; i += threads) {
         int c = c_start + i / spatial;
         int s = i % spatial;
-        float val = x_batch[c * spatial + s];
-        local_sum += val;
-        local_sum2 += val * val;
+        local_sum += x_batch[c * spatial + s];
     }
     shared_sum[tid] = local_sum;
-    shared_sum2[tid] = local_sum2;
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint stride = threads / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threads) {
             shared_sum[tid] += shared_sum[tid + stride];
-            shared_sum2[tid] += shared_sum2[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     float mean = shared_sum[0] / float(group_size);
-    float var = shared_sum2[0] / float(group_size) - mean * mean;
+
+    /* Second pass: variance via Welford (numerically stable) */
+    float var_local = 0.0f;
+    for (int i = tid; i < group_size; i += threads) {
+        int c = c_start + i / spatial;
+        int s = i % spatial;
+        float diff = x_batch[c * spatial + s] - mean;
+        var_local += diff * diff;
+    }
+    shared_sum[tid] = var_local;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float var = shared_sum[0] / float(group_size);
     float inv_std = rsqrt(var + eps);
 
     for (int i = tid; i < group_size; i += threads) {
@@ -2440,7 +2496,7 @@ kernel void group_norm_swish_f32(
         int s = i % spatial;
         int idx = c * spatial + s;
         float normed = gamma[c] * ((x_batch[idx] - mean) * inv_std) + beta[c];
-        out_batch[idx] = normed / (1.0f + exp(-normed));
+        out_batch[idx] = normed / (1.0f + metal::fast::exp(-normed));
     }
 }
 
@@ -2453,7 +2509,7 @@ kernel void swish_f32(
 ) {
     if (gid < uint(n)) {
         float v = x[gid];
-        out[gid] = v / (1.0f + exp(-v));
+        out[gid] = v / (1.0f + metal::fast::exp(-v));
     }
 }
 

@@ -60,6 +60,7 @@ void iris_reset_timing(void) {
  */
 float *iris_schedule_linear(int num_steps) {
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    if (!schedule) return NULL;
     for (int i = 0; i <= num_steps; i++) {
         schedule[i] = 1.0f - (float)i / (float)num_steps;
     }
@@ -73,6 +74,7 @@ float *iris_schedule_linear(int num_steps) {
  */
 float *iris_schedule_power(int num_steps, float alpha) {
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    if (!schedule) return NULL;
     for (int i = 0; i <= num_steps; i++) {
         float t = (float)i / (float)num_steps;
         schedule[i] = 1.0f - powf(t, alpha);
@@ -86,6 +88,7 @@ float *iris_schedule_power(int num_steps, float alpha) {
  */
 float *iris_schedule_sigmoid(int num_steps, float shift) {
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    if (!schedule) return NULL;
 
     for (int i = 0; i <= num_steps; i++) {
         float t = (float)i / (float)num_steps;
@@ -107,6 +110,7 @@ float *iris_schedule_sigmoid(int num_steps, float shift) {
  */
 float *iris_schedule_resolution(int num_steps, int height, int width) {
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    if (!schedule) return NULL;
 
     /* Compute shift based on resolution */
     int pixels = height * width;
@@ -166,6 +170,7 @@ static float generalized_time_snr_shift(float t, float mu, float sigma) {
 
 float *iris_schedule_flux(int num_steps, int image_seq_len) {
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    if (!schedule) return NULL;
     float mu = compute_empirical_mu(image_seq_len, num_steps);
 
     for (int i = 0; i <= num_steps; i++) {
@@ -196,6 +201,7 @@ float *iris_schedule_flux(int num_steps, int image_seq_len) {
 float *iris_schedule_zimage(int num_steps, int image_seq_len) {
     (void)image_seq_len;  /* Not used for static shift */
     float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    if (!schedule) return NULL;
     const float shift = 3.0f;
     const float sigma_max = 1.0f;
     const float sigma_train_min = 1.0f / 1000.0f;  /* num_train_timesteps=1000 */
@@ -283,6 +289,7 @@ float *iris_sample_euler_flux(void *transformer, void *text_encoder,
                          const float *schedule, int num_steps,
                          void (*progress_callback)(int step, int total)) {
     (void)text_encoder;  /* Reserved for future use */
+    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
     iris_transformer_flux_t *tf = (iris_transformer_flux_t *)transformer;
     int latent_size = batch * channels * h * w;
 
@@ -372,6 +379,7 @@ float *iris_sample_euler_zimage(void *transformer,
                                  const float *cap_feats, int cap_seq,
                                  const float *schedule, int num_steps,
                                  void (*progress_callback)(int step, int total)) {
+    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
     zi_transformer_t *tf = (zi_transformer_t *)transformer;
     int latent_size = batch * channels * h * w;
 
@@ -498,6 +506,7 @@ float *iris_sample_euler_zimage_cfg(void *transformer,
                                     float guidance_scale,
                                     const float *schedule, int num_steps,
                                     void (*progress_callback)(int step, int total)) {
+    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
     zi_transformer_t *tf = (zi_transformer_t *)transformer;
     int latent_size = batch * channels * h * w;
 
@@ -630,6 +639,7 @@ float *iris_sample_euler_zimage_img2img(void *transformer,
                                          const float *schedule, int num_steps,
                                          int start_step,
                                          void (*progress_callback)(int step, int total)) {
+    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
     zi_transformer_t *tf = (zi_transformer_t *)transformer;
     int latent_size = batch * channels * h * w;
 
@@ -763,6 +773,7 @@ float *iris_sample_euler_refs_flux(void *transformer, void *text_encoder,
                                    const float *schedule, int num_steps,
                                    void (*progress_callback)(int step, int total)) {
     (void)text_encoder;  /* Reserved for future use */
+    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
     iris_transformer_flux_t *tf = (iris_transformer_flux_t *)transformer;
     int latent_size = batch * channels * h * w;
 
@@ -841,6 +852,7 @@ float *iris_sample_euler_multirefs_flux(void *transformer, void *text_encoder,
                                          const float *schedule, int num_steps,
                                          void (*progress_callback)(int step, int total)) {
     (void)text_encoder;
+    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
     iris_transformer_flux_t *tf = (iris_transformer_flux_t *)transformer;
     int latent_size = batch * channels * h * w;
 
@@ -921,6 +933,7 @@ float *iris_sample_euler_cfg_flux(void *transformer, void *text_encoder,
                               const float *schedule, int num_steps,
                               void (*progress_callback)(int step, int total)) {
     (void)text_encoder;
+    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
     iris_transformer_flux_t *tf = (iris_transformer_flux_t *)transformer;
     int latent_size = batch * channels * h * w;
 
@@ -1001,6 +1014,7 @@ float *iris_sample_euler_cfg_refs_flux(void *transformer, void *text_encoder,
                                         const float *schedule, int num_steps,
                                         void (*progress_callback)(int step, int total)) {
     (void)text_encoder;
+    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
     iris_transformer_flux_t *tf = (iris_transformer_flux_t *)transformer;
     int latent_size = batch * channels * h * w;
 
@@ -1082,6 +1096,7 @@ float *iris_sample_euler_cfg_multirefs_flux(void *transformer, void *text_encode
                                               const float *schedule, int num_steps,
                                               void (*progress_callback)(int step, int total)) {
     (void)text_encoder;
+    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
     iris_transformer_flux_t *tf = (iris_transformer_flux_t *)transformer;
     int latent_size = batch * channels * h * w;
 

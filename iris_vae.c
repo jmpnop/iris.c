@@ -133,7 +133,11 @@ static void vae_conv2d(float *out, const float *in,
                        int kH, int kW, int stride, int padding) {
 #ifdef USE_METAL
     if (!iris_metal_available()) {
-        iris_metal_init();
+        static int metal_init_done = 0;
+        if (!metal_init_done) {
+            iris_metal_init();
+            metal_init_done = 1;
+        }
     }
     if (iris_metal_available() &&
         iris_metal_conv2d(out, in, weight, bias,
@@ -447,7 +451,7 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
             vae_resblock_t *block = &vae->enc_down_blocks[block_idx++];
             resblock_forward(work, x, block, vae->work3,
                              batch, cur_h, cur_w, vae->num_groups, vae->eps);
-            iris_copy(x, work, batch * ch_out * cur_h * cur_w);
+            { float *tmp = x; x = work; work = tmp; }
             if (iris_vae_progress_callback)
                 iris_vae_progress_callback(progress++, total_blocks);
         }
@@ -467,7 +471,7 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
                        batch, ch_out, ch_out, padded_h, padded_w, 3, 3, 2, 0);
             cur_h = new_h;
             cur_w = new_w;
-            iris_copy(x, work, batch * ch_out * cur_h * cur_w);
+            { float *tmp = x; x = work; work = tmp; }
         }
     }
 
@@ -486,7 +490,7 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
         iris_vae_progress_callback(progress++, total_blocks);
     resblock_forward(work, x, &vae->enc_mid_block2, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    iris_copy(x, work, batch * mid_ch * cur_h * cur_w);
+    { float *tmp = x; x = work; work = tmp; }
     if (iris_vae_progress_callback)
         iris_vae_progress_callback(progress++, total_blocks);
 
@@ -504,7 +508,7 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
     if (vae->quant_conv_weight) {
         vae_conv2d(work, x, vae->quant_conv_weight, vae->quant_conv_bias,
                    batch, z_ch, z_ch, cur_h, cur_w, 1, 1, 1, 0);
-        iris_copy(x, work, batch * z_ch * cur_h * cur_w);
+        { float *tmp = x; x = work; work = tmp; }
     }
 
     /* Take mean only (first 32 channels) */
@@ -514,6 +518,7 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
     int z_spatial = latent_h * latent_w;
 
     float *mean = (float *)malloc(batch * vae->z_channels * z_spatial * sizeof(float));
+    if (!mean) return NULL;
     for (int b = 0; b < batch; b++) {
         memcpy(mean + b * vae->z_channels * z_spatial,
                x + b * z_ch * z_spatial,
@@ -525,6 +530,7 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
     int patch_w = latent_w / 2;
     int lat_ch = vae->latent_channels;
     float *latent = (float *)malloc(batch * lat_ch * patch_h * patch_w * sizeof(float));
+    if (!latent) { free(mean); return NULL; }
     iris_patchify(latent, mean, batch, vae->z_channels, latent_h, latent_w, 2);
     free(mean);
 
@@ -863,7 +869,7 @@ iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
     int unpatch_h = latent_h * 2;
     int unpatch_w = latent_w * 2;
     iris_unpatchify(work, x, batch, vae->z_channels, latent_h, latent_w, 2);
-    iris_copy(x, work, batch * vae->z_channels * unpatch_h * unpatch_w);
+    { float *tmp = x; x = work; work = tmp; }
 
     int cur_h = unpatch_h, cur_w = unpatch_w;
 
@@ -871,14 +877,14 @@ iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
     if (vae->post_quant_conv_weight) {
         vae_conv2d(work, x, vae->post_quant_conv_weight, vae->post_quant_conv_bias,
                     batch, vae->z_channels, vae->z_channels, cur_h, cur_w, 1, 1, 1, 0);
-        iris_copy(x, work, batch * vae->z_channels * cur_h * cur_w);
+        { float *tmp = x; x = work; work = tmp; }
     }
 
     /* Conv in: 32 -> 512 */
     int mid_ch = vae->base_channels * ch_mult[3];  /* 512 */
     vae_conv2d(work, x, vae->dec_conv_in_weight, vae->dec_conv_in_bias,
                 batch, vae->z_channels, mid_ch, cur_h, cur_w, 3, 3, 1, 1);
-    iris_copy(x, work, batch * mid_ch * cur_h * cur_w);
+    { float *tmp = x; x = work; work = tmp; }
 
     /* Mid block: resblock -> attn -> resblock */
     int progress = 0;
@@ -896,7 +902,7 @@ iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
         iris_vae_progress_callback(progress++, total_blocks);
     resblock_forward(work, x, &vae->dec_mid_block2, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    iris_copy(x, work, batch * mid_ch * cur_h * cur_w);
+    { float *tmp = x; x = work; work = tmp; }
     if (iris_vae_progress_callback)
         iris_vae_progress_callback(progress++, total_blocks);
 
@@ -912,7 +918,7 @@ iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
             vae_resblock_t *block = &vae->dec_up_blocks[block_idx++];
             resblock_forward(work, x, block, vae->work3,
                              batch, cur_h, cur_w, vae->num_groups, vae->eps);
-            iris_copy(x, work, batch * ch_out * cur_h * cur_w);
+            { float *tmp = x; x = work; work = tmp; }
             if (iris_vae_progress_callback)
                 iris_vae_progress_callback(progress++, total_blocks);
         }
@@ -1007,12 +1013,16 @@ static int load_resblock(FILE *f, vae_resblock_t *block) {
     if (in_ch != out_ch) {
         block->skip_weight = read_floats(f, out_ch * in_ch);
         block->skip_bias = read_floats(f, out_ch);
+        if (!block->skip_weight || !block->skip_bias) return 0;
     } else {
         block->skip_weight = NULL;
         block->skip_bias = NULL;
     }
 
-    return block->norm1_weight && block->conv1_weight && block->conv2_weight;
+    return (block->norm1_weight && block->norm1_bias &&
+            block->conv1_weight && block->conv1_bias &&
+            block->norm2_weight && block->norm2_bias &&
+            block->conv2_weight && block->conv2_bias) ? 1 : 0;
 }
 
 static int load_attnblock(FILE *f, vae_attnblock_t *block) {
@@ -1031,7 +1041,11 @@ static int load_attnblock(FILE *f, vae_attnblock_t *block) {
     block->out_weight = read_floats(f, ch * ch);
     block->out_bias = read_floats(f, ch);
 
-    return block->norm_weight && block->q_weight && block->out_weight;
+    return (block->norm_weight && block->norm_bias &&
+            block->q_weight && block->q_bias &&
+            block->k_weight && block->k_bias &&
+            block->v_weight && block->v_bias &&
+            block->out_weight && block->out_bias) ? 1 : 0;
 }
 
 static void free_resblock(vae_resblock_t *block) {
@@ -1316,13 +1330,17 @@ static int load_resblock_sf(safetensors_file_t *sf, vae_resblock_t *block,
         block->skip_weight = get_sf_tensor(sf, name);
         snprintf(name, sizeof(name), "%s.conv_shortcut.bias", prefix);
         block->skip_bias = get_sf_tensor(sf, name);
+        if (!block->skip_weight || !block->skip_bias) return -1;
     } else {
         block->skip_weight = NULL;
         block->skip_bias = NULL;
     }
 
-    /* Check required tensors */
-    if (!block->norm1_weight || !block->conv1_weight || !block->conv2_weight) {
+    /* Check all required tensors */
+    if (!block->norm1_weight || !block->norm1_bias ||
+        !block->conv1_weight || !block->conv1_bias ||
+        !block->norm2_weight || !block->norm2_bias ||
+        !block->conv2_weight || !block->conv2_bias) {
         return -1;
     }
     return 0;
@@ -1359,8 +1377,12 @@ static int load_attnblock_sf(safetensors_file_t *sf, vae_attnblock_t *block,
     snprintf(name, sizeof(name), "%s.to_out.0.bias", prefix);
     block->out_bias = get_sf_tensor(sf, name);
 
-    /* Check required tensors */
-    if (!block->norm_weight || !block->q_weight || !block->out_weight) {
+    /* Check all required tensors */
+    if (!block->norm_weight || !block->norm_bias ||
+        !block->q_weight || !block->q_bias ||
+        !block->k_weight || !block->k_bias ||
+        !block->v_weight || !block->v_bias ||
+        !block->out_weight || !block->out_bias) {
         return -1;
     }
     return 0;
@@ -1414,7 +1436,7 @@ iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
         for (int r = 0; r < vae->num_res_blocks; r++) {
             int in_ch = (r == 0 && level > 0) ? prev_ch : ch;
             snprintf(name, sizeof(name), "encoder.down_blocks.%d.resnets.%d", level, r);
-            load_resblock_sf(sf, &vae->enc_down_blocks[block_idx++], name, in_ch, ch);
+            if (load_resblock_sf(sf, &vae->enc_down_blocks[block_idx++], name, in_ch, ch) != 0) goto error;
         }
     }
 
@@ -1431,9 +1453,9 @@ iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
 
     /* Encoder mid block */
     int mid_ch = vae->base_channels * ch_mult[3];  /* 512 */
-    load_resblock_sf(sf, &vae->enc_mid_block1, "encoder.mid_block.resnets.0", mid_ch, mid_ch);
-    load_attnblock_sf(sf, &vae->enc_mid_attn, "encoder.mid_block.attentions.0", mid_ch);
-    load_resblock_sf(sf, &vae->enc_mid_block2, "encoder.mid_block.resnets.1", mid_ch, mid_ch);
+    if (load_resblock_sf(sf, &vae->enc_mid_block1, "encoder.mid_block.resnets.0", mid_ch, mid_ch) != 0) goto error;
+    if (load_attnblock_sf(sf, &vae->enc_mid_attn, "encoder.mid_block.attentions.0", mid_ch) != 0) goto error;
+    if (load_resblock_sf(sf, &vae->enc_mid_block2, "encoder.mid_block.resnets.1", mid_ch, mid_ch) != 0) goto error;
 
     /* Encoder output */
     vae->enc_norm_out_weight = get_sf_tensor(sf, "encoder.conv_norm_out.weight");
@@ -1452,9 +1474,9 @@ iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
     vae->dec_conv_in_bias = get_sf_tensor(sf, "decoder.conv_in.bias");
 
     /* Decoder mid block */
-    load_resblock_sf(sf, &vae->dec_mid_block1, "decoder.mid_block.resnets.0", mid_ch, mid_ch);
-    load_attnblock_sf(sf, &vae->dec_mid_attn, "decoder.mid_block.attentions.0", mid_ch);
-    load_resblock_sf(sf, &vae->dec_mid_block2, "decoder.mid_block.resnets.1", mid_ch, mid_ch);
+    if (load_resblock_sf(sf, &vae->dec_mid_block1, "decoder.mid_block.resnets.0", mid_ch, mid_ch) != 0) goto error;
+    if (load_attnblock_sf(sf, &vae->dec_mid_attn, "decoder.mid_block.attentions.0", mid_ch) != 0) goto error;
+    if (load_resblock_sf(sf, &vae->dec_mid_block2, "decoder.mid_block.resnets.1", mid_ch, mid_ch) != 0) goto error;
 
     /* Decoder up blocks (reverse order) */
     int num_up_blocks = 4 * (vae->num_res_blocks + 1);
@@ -1469,7 +1491,7 @@ iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
             int in_ch = (r == 0) ? prev_ch : ch;
             int up_idx = 3 - level;
             snprintf(name, sizeof(name), "decoder.up_blocks.%d.resnets.%d", up_idx, r);
-            load_resblock_sf(sf, &vae->dec_up_blocks[block_idx++], name, in_ch, ch);
+            if (load_resblock_sf(sf, &vae->dec_up_blocks[block_idx++], name, in_ch, ch) != 0) goto error;
         }
     }
 
@@ -1532,12 +1554,13 @@ iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
     vae->work2 = malloc(vae->work_size);
     vae->work3 = malloc(vae->work_size);
 
-    if (!vae->work1 || !vae->work2 || !vae->work3) {
-        iris_vae_free(vae);
-        return NULL;
-    }
+    if (!vae->work1 || !vae->work2 || !vae->work3) goto error;
 
     return vae;
+
+error:
+    iris_vae_free(vae);
+    return NULL;
 }
 
 /* Backward-compatible wrapper: loads with Flux defaults (z_channels=32, no scaling) */

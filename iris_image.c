@@ -15,18 +15,26 @@
 #include <string.h>
 #include <math.h>
 
+/* strcasecmp for portability */
+#ifdef _WIN32
+#define strcasecmp _stricmp
+#endif
+
 /* ========================================================================
  * Image Creation and Management
  * ======================================================================== */
 
 iris_image *iris_image_create(int width, int height, int channels) {
+    if (width <= 0 || height <= 0 || channels <= 0 ||
+        width > 65536 || height > 65536) return NULL;
+
     iris_image *img = (iris_image *)malloc(sizeof(iris_image));
     if (!img) return NULL;
 
     img->width = width;
     img->height = height;
     img->channels = channels;
-    img->data = (uint8_t *)calloc(width * height * channels, sizeof(uint8_t));
+    img->data = (uint8_t *)calloc((size_t)width * (size_t)height * (size_t)channels, sizeof(uint8_t));
 
     if (!img->data) {
         free(img);
@@ -49,7 +57,7 @@ iris_image *iris_image_clone(const iris_image *img) {
     iris_image *clone = iris_image_create(img->width, img->height, img->channels);
     if (!clone) return NULL;
 
-    memcpy(clone->data, img->data, img->width * img->height * img->channels);
+    memcpy(clone->data, img->data, (size_t)img->width * (size_t)img->height * (size_t)img->channels);
     return clone;
 }
 
@@ -85,7 +93,7 @@ static iris_image *load_ppm(FILE *f) {
     iris_image *img = iris_image_create(width, height, channels);
     if (!img) return NULL;
 
-    size_t size = width * height * channels;
+    size_t size = (size_t)width * (size_t)height * (size_t)channels;
     if (fread(img->data, 1, size, f) != size) {
         iris_image_free(img);
         return NULL;
@@ -111,7 +119,7 @@ static int save_ppm(const iris_image *img, FILE *f) {
             }
         }
     } else {
-        size_t size = img->width * img->height * img->channels;
+        size_t size = (size_t)img->width * (size_t)img->height * (size_t)img->channels;
         if (fwrite(img->data, 1, size, f) != size) {
             return -1;
         }
@@ -745,7 +753,16 @@ static iris_image *load_png(FILE *f) {
             fseek(f, 4, SEEK_CUR);  /* Skip CRC */
         } else if (strcmp(chunk_type, "IDAT") == 0) {
             /* Accumulate IDAT chunks */
-            idat_data = (uint8_t *)realloc(idat_data, idat_len + chunk_len);
+            if (chunk_len > 100 * 1024 * 1024) {
+                free(idat_data);
+                return NULL;
+            }
+            uint8_t *tmp = (uint8_t *)realloc(idat_data, idat_len + chunk_len);
+            if (!tmp) {
+                free(idat_data);
+                return NULL;
+            }
+            idat_data = tmp;
             if (fread(idat_data + idat_len, 1, chunk_len, f) != chunk_len) {
                 free(idat_data);
                 return NULL;
@@ -1029,7 +1046,3 @@ iris_image *iris_image_convert(const iris_image *img, int new_channels) {
     return converted;
 }
 
-/* strcasecmp for portability */
-#ifdef _WIN32
-#define strcasecmp _stricmp
-#endif

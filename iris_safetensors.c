@@ -26,6 +26,7 @@ static int parse_string(const char **p, char *out, size_t max_len) {
     while (**p && **p != '"' && i < max_len - 1) {
         if (**p == '\\') {
             (*p)++;
+            if (!**p) break;
             if (**p == 'n') out[i++] = '\n';
             else if (**p == 't') out[i++] = '\t';
             else if (**p == 'r') out[i++] = '\r';

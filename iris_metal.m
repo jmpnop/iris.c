@@ -19,6 +19,7 @@
 #ifdef HAVE_METALLIB
 #include "iris_shaders_metallib.h"
 #endif
+#include <Accelerate/Accelerate.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,6 +65,7 @@ typedef struct {
 
 static sdpa_graph_cache_t g_sdpa_graph_cache[MAX_SDPA_GRAPH_CACHE];
 static int g_sdpa_graph_count = 0;
+static int g_sdpa_graph_next = 0;
 static pthread_mutex_t g_sdpa_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Cache for MPSGraph-based bf16 linear graphs */
@@ -83,6 +85,7 @@ typedef struct {
 
 static linear_graph_cache_t g_linear_graph_cache[MAX_LINEAR_GRAPH_CACHE];
 static int g_linear_graph_count = 0;
+static int g_linear_graph_next = 0;
 static pthread_mutex_t g_linear_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Cache for MPSGraph bf16 matmul graphs (no fp32 casts).
@@ -90,6 +93,7 @@ static pthread_mutex_t g_linear_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
  * fp32-cast graphs above. */
 static linear_graph_cache_t g_linear_graph_cache_bf16[MAX_LINEAR_GRAPH_CACHE];
 static int g_linear_graph_bf16_count = 0;
+static int g_linear_graph_bf16_next = 0;
 static pthread_mutex_t g_linear_graph_bf16_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_linear_graph_bf16_disabled = 0;
 static int g_linear_graph_bf16_seen_success = 0;
@@ -442,14 +446,7 @@ static void pool_release_buffer(id<MTLBuffer> buffer) {
     pool_release_buffer_immediate(buffer);
 }
 
-/* Release all buffers back to pool (call at end of batch) */
-static void pool_release_all(void) {
-    pthread_mutex_lock(&g_pool_mutex);
-    for (int i = 0; i < g_pool_count; i++) {
-        g_activation_pool[i].in_use = 0;
-    }
-    pthread_mutex_unlock(&g_pool_mutex);
-}
+
 
 /* Flush deferred pool releases after command buffer completion. */
 static void pool_flush_deferred(void) {
@@ -679,10 +676,15 @@ void iris_metal_end_batch(void) {
         }
         g_in_batch = 0;
         g_pending_count = 0;
-        g_batch_input_count = 0;  /* Clear input cache */
 
-        /* Release all pooled buffers back to pool */
-        pool_release_all();
+        /* Release only the batch input cache buffers back to the pool.
+         * pool_release_all() was too aggressive — it marks every buffer
+         * in the pool as not-in-use, including those held by persistent
+         * tensors that outlive the batch. */
+        for (int i = 0; i < g_batch_input_count; i++) {
+            pool_release_buffer_immediate(g_batch_inputs[i].gpu_buffer);
+        }
+        g_batch_input_count = 0;
     }
 }
 
@@ -823,9 +825,24 @@ static void iris_metal_sgemm_impl(int transpose_a, int transpose_b,
                     pool_release_buffer(bufferA);
                 }
             } else {
-                /* Too many pending outputs - fall back to immediate sync */
-                [cmdBuffer commit];
-                [cmdBuffer waitUntilCompleted];
+                /* Overflow: create a one-shot command buffer so we don't
+                 * corrupt the shared g_batch_cmd that other ops depend on. */
+                id<MTLCommandBuffer> oneshot = [g_queue commandBuffer];
+                MPSMatrixMultiplication *matmul2 = [[MPSMatrixMultiplication alloc]
+                    initWithDevice:g_device
+                       transposeLeft:transpose_a ? YES : NO
+                      transposeRight:transpose_b ? YES : NO
+                          resultRows:M
+                       resultColumns:N
+                     interiorColumns:K
+                               alpha:alpha
+                                beta:beta];
+                [matmul2 encodeToCommandBuffer:oneshot
+                                   leftMatrix:matrixA
+                                  rightMatrix:matrixB
+                                 resultMatrix:matrixC];
+                [oneshot commit];
+                [oneshot waitUntilCompleted];
                 memcpy(C, [bufferC contents], sizeC);
                 if (!bufferA_from_cache) {
                     pool_release_buffer(bufferA);
@@ -1313,8 +1330,24 @@ void iris_metal_sgemm_bf16(int transpose_a, int transpose_b,
                     pool_release_buffer(bufferA);
                 }
             } else {
-                [cmdBuffer commit];
-                [cmdBuffer waitUntilCompleted];
+                /* Overflow: create a one-shot command buffer so we don't
+                 * corrupt the shared g_batch_cmd that other ops depend on. */
+                id<MTLCommandBuffer> oneshot = [g_queue commandBuffer];
+                MPSMatrixMultiplication *matmul2 = [[MPSMatrixMultiplication alloc]
+                    initWithDevice:g_device
+                       transposeLeft:transpose_a ? YES : NO
+                      transposeRight:transpose_b ? YES : NO
+                          resultRows:M
+                       resultColumns:N
+                     interiorColumns:K
+                               alpha:alpha
+                                beta:beta];
+                [matmul2 encodeToCommandBuffer:oneshot
+                                   leftMatrix:matrixA
+                                  rightMatrix:matrixB
+                                 resultMatrix:matrixC];
+                [oneshot commit];
+                [oneshot waitUntilCompleted];
                 memcpy(C, [bufferC contents], sizeC);
                 if (!bufferA_from_cache) {
                     pool_release_buffer(bufferA);
@@ -2709,15 +2742,14 @@ iris_gpu_tensor_t iris_gpu_linear(iris_gpu_tensor_t x,
 
         /* Add bias if present */
         if (b != NULL) {
-            /* For now, sync and add bias on CPU (can optimize later with compute shader) */
+            /* Sync GPU matmul, then vectorized bias add via Accelerate */
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
 
             float *out_data = (float *)[out->buffer contents];
             for (int i = 0; i < seq_len; i++) {
-                for (int j = 0; j < out_dim; j++) {
-                    out_data[i * out_dim + j] += b[j];
-                }
+                vDSP_vadd(&out_data[i * out_dim], 1, b, 1,
+                           &out_data[i * out_dim], 1, (vDSP_Length)out_dim);
             }
             out->has_pending_work = 0;
         } else {
@@ -4999,6 +5031,9 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
     int slot = 0;
     if (g_sdpa_graph_count < MAX_SDPA_GRAPH_CACHE) {
         slot = g_sdpa_graph_count++;
+    } else {
+        slot = g_sdpa_graph_next % MAX_SDPA_GRAPH_CACHE;
+        g_sdpa_graph_next++;
     }
 
     sdpa_graph_cache_t *entry = &g_sdpa_graph_cache[slot];
@@ -5095,6 +5130,9 @@ static linear_graph_cache_t *get_linear_graph_cache(int seq_len, int in_dim, int
     int slot = 0;
     if (g_linear_graph_count < MAX_LINEAR_GRAPH_CACHE) {
         slot = g_linear_graph_count++;
+    } else {
+        slot = g_linear_graph_next % MAX_LINEAR_GRAPH_CACHE;
+        g_linear_graph_next++;
     }
 
     linear_graph_cache_t *entry = &g_linear_graph_cache[slot];
@@ -5151,6 +5189,9 @@ static linear_graph_cache_t *get_linear_graph_cache_bf16(int seq_len, int in_dim
     int slot = 0;
     if (g_linear_graph_bf16_count < MAX_LINEAR_GRAPH_CACHE) {
         slot = g_linear_graph_bf16_count++;
+    } else {
+        slot = g_linear_graph_bf16_next % MAX_LINEAR_GRAPH_CACHE;
+        g_linear_graph_bf16_next++;
     }
 
     linear_graph_cache_t *entry = &g_linear_graph_cache_bf16[slot];

@@ -99,6 +99,7 @@ typedef struct {
     uint16_t *ffn_w3_bf16;          /* [ffn_dim, dim] */
     uint16_t *ffn_w13_weight_bf16;  /* [2*ffn_dim, dim] fused [w1;w3] */
     int bf16_from_mmap;             /* 1 if individual bf16 ptrs are mmap (don't free) */
+    int bf16_fused_from_cache;      /* 1 if fused qkv/w13 ptrs are from cache mmap */
 #endif
 } zi_block_t;
 
@@ -535,6 +536,7 @@ static void zi_timestep_embed(zi_transformer_t *tf, float *out, float t) {
     /* MLP: Linear(256 -> mid) + SiLU + Linear(mid -> adaln_dim) */
     int mid = tf->t_emb_mid_size;
     float *hidden = (float *)malloc(mid * sizeof(float));
+    if (!hidden) return;
 
     /* Linear 0 */
     iris_matmul_t(hidden, sin_emb, tf->t_emb_mlp0_weight, 1, 256, mid);
@@ -769,7 +771,8 @@ static void zi_block_forward(float *x, const zi_block_t *block,
 
     if (block->adaln_weight) {
         /* Modulated block: extract scale_msa, gate_msa, scale_mlp, gate_mlp */
-        float mod[4 * dim];
+        float *mod = (float *)malloc(4 * (size_t)dim * sizeof(float));
+        if (!mod) return;
         iris_matmul_t(mod, t_emb, block->adaln_weight, 1, tf->adaln_dim, 4 * dim);
         for (int i = 0; i < 4 * dim; i++) mod[i] += block->adaln_bias[i];
 
@@ -815,6 +818,7 @@ static void zi_block_forward(float *x, const zi_block_t *block,
             for (int i = 0; i < dim; i++)
                 x[s * dim + i] += gate_mlp[i] * norm_out[s * dim + i];
 
+        free(mod);
     } else {
         /* Unmodulated block (context_refiner): no scale/gate */
 
@@ -1243,12 +1247,12 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     zi_timestep_embed(tf, t_emb, timestep);
 
     /* === CPU: Patchify image === */
-    float *img_patches = (float *)malloc(img_seq * patch_feat * sizeof(float));
+    float *img_patches = (float *)malloc((size_t)img_seq * patch_feat * sizeof(float));
     if (!img_patches) return NULL;
     zi_patchify(img_patches, latent, in_ch, latent_h, latent_w, ps);
 
     /* === CPU: Caption RMSNorm === */
-    float *cap_normed = (float *)malloc(cap_seq_len * tf->cap_feat_dim * sizeof(float));
+    float *cap_normed = (float *)malloc((size_t)cap_seq_len * tf->cap_feat_dim * sizeof(float));
     if (!cap_normed) {
         free(img_patches);
         return NULL;
@@ -1417,7 +1421,7 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     }
 
     /* === Concatenate: unified = [img, cap] === */
-    iris_gpu_tensor_t unified_gpu = iris_gpu_tensor_alloc(unified_seq * dim);
+    iris_gpu_tensor_t unified_gpu = iris_gpu_tensor_alloc((size_t)unified_seq * dim);
     if (!unified_gpu) {
         iris_gpu_batch_end();
         zi_gpu_scratch_free(&scratch);
@@ -1489,7 +1493,8 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     iris_gpu_copy_region_f32(img_hidden_gpu, 0, unified_gpu, 0, (size_t)img_seq * dim);
     iris_gpu_adaln_norm(final_norm_gpu, img_hidden_gpu,
                         final_shift, final_scale_param, img_seq, dim, 1e-6f);
-    final_out_gpu = iris_gpu_linear(final_norm_gpu, tf->final_layer.linear_weight, NULL,
+    final_out_gpu = iris_gpu_linear(final_norm_gpu, tf->final_layer.linear_weight,
+                                    tf->final_layer.linear_bias,
                                     img_seq, dim, out_ch);
     if (!final_out_gpu) {
         iris_gpu_batch_end();
@@ -1513,7 +1518,7 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     free(final_shift);
     free(final_scale_param);
 
-    /* Read back final projected patches and add bias on CPU. */
+    /* Read back final projected patches (bias already applied on GPU). */
     float *final_out = (float *)malloc((size_t)img_seq * out_ch * sizeof(float));
     if (!final_out) {
         iris_gpu_tensor_free(final_out_gpu);
@@ -1523,11 +1528,6 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     float *final_out_data = iris_gpu_tensor_data(final_out_gpu);
     memcpy(final_out, final_out_data, (size_t)img_seq * out_ch * sizeof(float));
     iris_gpu_tensor_free(final_out_gpu);
-    for (int s = 0; s < img_seq; s++) {
-        for (int i = 0; i < out_ch; i++) {
-            final_out[s * out_ch + i] += tf->final_layer.linear_bias[i];
-        }
-    }
     if (iris_substep_callback)
         iris_substep_callback(IRIS_SUBSTEP_FINAL_LAYER, 0, 1);
     free(final_scale);
@@ -1586,7 +1586,8 @@ static void zi_final_forward(float *out, const float *x, const zi_final_t *fl,
     }
 
     /* LayerNorm (no affine) -> scale */
-    float *normed = (float *)malloc(seq * dim * sizeof(float));
+    float *normed = (float *)malloc((size_t)seq * dim * sizeof(float));
+    if (!normed) { free(scale); return; }
     for (int s = 0; s < seq; s++) {
         const float *xr = x + s * dim;
         float *nr = normed + s * dim;
@@ -1733,9 +1734,9 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         free(tf->work_qkv);
         free(tf->work_attn);
         free(tf->work_ffn);
-        tf->work_x = (float *)malloc(unified_seq * dim * sizeof(float));
-        tf->work_tmp = (float *)malloc(unified_seq * dim * 4 * sizeof(float));
-        tf->work_qkv = (float *)malloc(unified_seq * dim * 3 * sizeof(float));
+        tf->work_x = (float *)malloc((size_t)unified_seq * dim * sizeof(float));
+        tf->work_tmp = (float *)malloc((size_t)unified_seq * dim * 4 * sizeof(float));
+        tf->work_qkv = (float *)malloc((size_t)unified_seq * dim * 3 * sizeof(float));
         tf->work_attn = (float *)malloc((size_t)unified_seq * unified_seq * sizeof(float));
         tf->work_ffn = (float *)malloc((size_t)unified_seq * tf->ffn_dim * 2 * sizeof(float));
         if (!tf->work_x || !tf->work_tmp || !tf->work_qkv || !tf->work_attn || !tf->work_ffn) {
@@ -1757,7 +1758,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
     zi_timestep_embed(tf, t_emb, timestep);
 
     /* 2. Patchify image -> [img_seq, patch_feat] */
-    float *img_patches = (float *)malloc(img_padded * patch_feat * sizeof(float));
+    float *img_patches = (float *)malloc((size_t)img_padded * patch_feat * sizeof(float));
     if (!img_patches) return NULL;
     zi_patchify(img_patches, latent, in_ch, latent_h, latent_w, ps);
 
@@ -1768,7 +1769,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
                patch_feat * sizeof(float));
 
     /* Embed image: [img_padded, patch_feat] -> [img_padded, dim] */
-    float *img_emb = (float *)malloc(img_padded * dim * sizeof(float));
+    float *img_emb = (float *)malloc((size_t)img_padded * dim * sizeof(float));
     if (!img_emb) {
         free(img_patches);
         return NULL;
@@ -1784,8 +1785,8 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         memcpy(img_emb + s * dim, tf->x_pad_token, dim * sizeof(float));
 
     /* 3. Caption embedding: RMSNorm -> Linear */
-    float *cap_emb = (float *)malloc(cap_padded * dim * sizeof(float));
-    float *cap_normed = (float *)malloc(cap_padded * tf->cap_feat_dim * sizeof(float));
+    float *cap_emb = (float *)malloc((size_t)cap_padded * dim * sizeof(float));
+    float *cap_normed = (float *)malloc((size_t)cap_padded * tf->cap_feat_dim * sizeof(float));
     if (!cap_emb || !cap_normed) {
         free(img_emb);
         free(cap_emb);
@@ -1794,7 +1795,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
     }
 
     /* Pad caption features (repeat last token) */
-    float *cap_padded_feats = (float *)malloc(cap_padded * tf->cap_feat_dim * sizeof(float));
+    float *cap_padded_feats = (float *)malloc((size_t)cap_padded * tf->cap_feat_dim * sizeof(float));
     if (!cap_padded_feats) {
         free(img_emb);
         free(cap_emb);
@@ -1942,12 +1943,12 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
     free(unified_mask);
 
     /* 9. Final layer: extract image tokens only, then project */
-    float *img_out = (float *)malloc(img_seq * dim * sizeof(float));
+    float *img_out = (float *)malloc((size_t)img_seq * dim * sizeof(float));
     if (!img_out) return NULL;
-    memcpy(img_out, unified, img_seq * dim * sizeof(float));
+    memcpy(img_out, unified, (size_t)img_seq * dim * sizeof(float));
 
     int out_ch = ps * ps * in_ch;  /* 64 */
-    float *final_out = (float *)malloc(img_seq * out_ch * sizeof(float));
+    float *final_out = (float *)malloc((size_t)img_seq * out_ch * sizeof(float));
     if (!final_out) {
         free(img_out);
         return NULL;
@@ -2073,6 +2074,7 @@ static int zi_load_block(zi_block_t *block, safetensors_file_t **files,
 
 #ifdef USE_METAL
     block->bf16_from_mmap = 0;
+    block->bf16_fused_from_cache = 0;
 #endif
 
     /* For GPU mmap with F32 weights, use direct mmap pointers for large tensors
@@ -2261,9 +2263,16 @@ static void zi_free_block(zi_block_t *block, int free_f32_weights) {
         free(block->ffn_w1_bf16);
         free(block->ffn_w2_bf16);
         free(block->ffn_w3_bf16);
+    }
+    /* Fused weights are heap-allocated by zi_concat3_bf16 / zi_concat_bf16
+     * even when bf16_from_mmap=1 (mmap'd BF16 safetensors path).
+     * Only skip free if they point into a cache mmap region. */
+    if (!block->bf16_fused_from_cache) {
         free(block->attn_qkv_weight_bf16);
         free(block->ffn_w13_weight_bf16);
     }
+    block->attn_qkv_weight_bf16 = NULL;
+    block->ffn_w13_weight_bf16 = NULL;
 #endif
 }
 
@@ -2381,6 +2390,7 @@ static void zi_cache_load_block(zi_block_t *block, void *cache_base,
 
 #ifdef USE_METAL
     block->bf16_from_mmap = 1;
+    block->bf16_fused_from_cache = 1;
 #endif
 }
 
@@ -2517,6 +2527,7 @@ static void zi_f16_cache_load_block(zi_block_t *block, void *cache_base,
     block->ffn_w1_bf16 = NULL;
     block->ffn_w3_bf16 = NULL;
     block->bf16_from_mmap = 1;
+    block->bf16_fused_from_cache = 1;
 }
 
 static inline void zi_bf16_to_f16_bulk(uint16_t *out, const uint16_t *in, size_t n) {
