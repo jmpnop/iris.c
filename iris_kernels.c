@@ -686,7 +686,7 @@ void iris_attention(float *out, const float *Q, const float *K, const float *V,
                     int batch, int heads, int seq_q, int seq_k, int head_dim,
                     float scale) {
     /* Allocate attention scores */
-    float *scores = (float *)malloc(seq_q * seq_k * sizeof(float));
+    float *scores = (float *)malloc((size_t)seq_q * (size_t)seq_k * sizeof(float));
     if (!scores) return;
 
     for (int b = 0; b < batch; b++) {
@@ -821,6 +821,12 @@ static void flash_attention_head_tiled(float *out,
     /* Per-query running statistics: max_score[seq_q], sum_exp[seq_q] */
     float *max_scores = (float *)malloc(seq_q * sizeof(float));
     float *sum_exps = (float *)malloc(seq_q * sizeof(float));
+    if (!max_scores || !sum_exps) {
+        free(max_scores);
+        free(sum_exps);
+        memset(out, 0, (size_t)seq_q * head_dim * sizeof(float));
+        return;
+    }
 
     /* Initialize */
     for (int i = 0; i < seq_q; i++) {
@@ -1037,7 +1043,9 @@ void iris_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, flo
     int half_dim = dim / 2;
 
     /* Precompute inverse frequencies (depend only on d, not position) */
-    float *inv_freq = (float *)alloca(half_dim * sizeof(float));
+    float freqs_buf[64];
+    float *inv_freq = (half_dim <= 64) ? freqs_buf : (float *)malloc(half_dim * sizeof(float));
+    if (!inv_freq) return;
     for (int d = 0; d < half_dim; d++)
         inv_freq[d] = 1.0f / powf(theta, (float)(2 * d) / (float)dim);
 
@@ -1049,6 +1057,8 @@ void iris_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, flo
             freqs[s * half_dim * 2 + d * 2 + 1] = sinf(angle);
         }
     }
+
+    if (inv_freq != freqs_buf) free(inv_freq);
 }
 
 /* ========================================================================
@@ -1144,5 +1154,5 @@ void iris_unpatchify(float *out, const float *in,
  * ======================================================================== */
 
 void iris_copy(float *dst, const float *src, int n) {
-    memcpy(dst, src, n * sizeof(float));
+    memcpy(dst, src, (size_t)n * sizeof(float));
 }

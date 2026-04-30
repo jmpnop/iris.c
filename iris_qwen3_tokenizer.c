@@ -95,18 +95,19 @@ static void init_byte_encoder(void) {
         unicode_to_byte[i] = i;
     }
 
-    /* Map remaining bytes to 256+ range */
-    int offset = 256;
-    for (int i = 0; i < 256; i++) {
-        if (byte_to_unicode[i] == 0 && i != 33) {  /* 33 maps to itself */
+    /* Map remaining bytes to 256+ range.
+     * Handle byte 0 first (it reads as 0 from the zeroed static array,
+     * so the generic loop would double-assign offset 256). */
+    byte_to_unicode[0] = 256;
+    unicode_to_byte[256] = 0;
+    int offset = 257;
+    for (int i = 1; i < 256; i++) {
+        if (byte_to_unicode[i] == 0) {
             byte_to_unicode[i] = offset;
             unicode_to_byte[offset] = i;
             offset++;
         }
     }
-    /* Fix: byte 0 should also be mapped */
-    byte_to_unicode[0] = 256;
-    unicode_to_byte[256] = 0;
 
     byte_encoder_initialized = 1;
 }
@@ -218,23 +219,38 @@ static char *parse_json_string(const char **pp) {
                 case '\\': result[i++] = '\\'; break;
                 case '"': result[i++] = '"'; break;
                 case 'u': {
-                    /* Parse \uXXXX */
+                    /* Parse \uXXXX (with surrogate pair support) */
                     if (p[1] && p[2] && p[3] && p[4]) {
                         char hex[5] = {p[1], p[2], p[3], p[4], 0};
                         int cp = (int)strtol(hex, NULL, 16);
                         p += 4;
+                        /* Check for UTF-16 surrogate pair: high surrogate 0xD800-0xDBFF */
+                        if (cp >= 0xD800 && cp <= 0xDBFF) {
+                            if (p[1] == '\\' && p[2] == 'u' &&
+                                p[3] && p[4] && p[5] && p[6]) {
+                                char hex2[5] = {p[3], p[4], p[5], p[6], 0};
+                                int lo = (int)strtol(hex2, NULL, 16);
+                                if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                                    cp = 0x10000 + (cp - 0xD800) * 0x400 + (lo - 0xDC00);
+                                    p += 6;  /* skip \uXXXX of low surrogate */
+                                }
+                            }
+                        }
                         /* Encode as UTF-8 */
                         if (cp < 0x80) {
                             result[i++] = (char)cp;
                         } else if (cp < 0x800) {
                             result[i++] = (char)(0xC0 | (cp >> 6));
                             result[i++] = (char)(0x80 | (cp & 0x3F));
-                            len++;  /* Need more space */
-                        } else {
+                        } else if (cp < 0x10000) {
                             result[i++] = (char)(0xE0 | (cp >> 12));
                             result[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
                             result[i++] = (char)(0x80 | (cp & 0x3F));
-                            len += 2;
+                        } else {
+                            result[i++] = (char)(0xF0 | (cp >> 18));
+                            result[i++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                            result[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            result[i++] = (char)(0x80 | (cp & 0x3F));
                         }
                     }
                     break;
@@ -336,9 +352,15 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
         fclose(f);
         return NULL;
     }
-    fread(json, 1, size, f);
-    json[size] = '\0';
+    size_t nread = fread(json, 1, size, f);
     fclose(f);
+    if ((long)nread != size) {
+        fprintf(stderr, "qwen3_tokenizer_load: short read (%zu of %ld bytes)\n",
+                nread, size);
+        free(json);
+        return NULL;
+    }
+    json[size] = '\0';
 
     qwen3_tokenizer_t *tok = calloc(1, sizeof(qwen3_tokenizer_t));
     if (!tok) {
@@ -598,10 +620,28 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
 error:
     free(json);
     if (tok) {
-        free(tok->vocab_hash);
-        free(tok->vocab);
-        free(tok->merges);
-        free(tok->merge_ranks);
+        if (tok->vocab) {
+            for (int i = 0; i < tok->vocab_size + 1000; i++)
+                free(tok->vocab[i]);
+            free(tok->vocab);
+        }
+        if (tok->vocab_hash) {
+            for (int i = 0; i < tok->hash_size; i++)
+                free(tok->vocab_hash[i].token);
+            free(tok->vocab_hash);
+        }
+        if (tok->merges) {
+            for (int i = 0; i < tok->num_merges; i++) {
+                free(tok->merges[i].left);
+                free(tok->merges[i].right);
+            }
+            free(tok->merges);
+        }
+        if (tok->merge_ranks) {
+            for (int i = 0; i < tok->hash_size; i++)
+                free(tok->merge_ranks[i].key);
+            free(tok->merge_ranks);
+        }
         free(tok);
     }
     return NULL;
@@ -812,8 +852,10 @@ static char **pretokenize(const char *text, int *num_chunks) {
             char lower = tolower(p[1]);
             if (lower == 's' || lower == 't' || lower == 'm' || lower == 'd') {
                 p += 2;
-            } else if ((lower == 'r' || lower == 'v' || lower == 'l') && p[2] &&
-                       (tolower(p[2]) == 'e' || tolower(p[2]) == 'l')) {
+            } else if (p[2] &&
+                       (((p[1]=='r' || p[1]=='R') && (p[2]=='e' || p[2]=='E')) ||
+                        ((p[1]=='v' || p[1]=='V') && (p[2]=='e' || p[2]=='E')) ||
+                        ((p[1]=='l' || p[1]=='L') && (p[2]=='l' || p[2]=='L')))) {
                 p += 3;
             } else {
                 p++;
@@ -877,7 +919,15 @@ static char **pretokenize(const char *text, int *num_chunks) {
 
             if (count >= capacity) {
                 capacity *= 2;
-                chunks = realloc(chunks, capacity * sizeof(char *));
+                void *tmp = realloc(chunks, capacity * sizeof(char *));
+                if (!tmp) {
+                    free(chunk);
+                    for (int ci = 0; ci < count; ci++) free(chunks[ci]);
+                    free(chunks);
+                    *num_chunks = 0;
+                    return NULL;
+                }
+                chunks = tmp;
             }
             chunks[count++] = chunk;
         }
@@ -922,7 +972,17 @@ int *qwen3_tokenize(qwen3_tokenizer_t *tok, const char *text,
             if (id >= 0) {
                 if (total >= capacity) {
                     capacity *= 2;
-                    tokens = realloc(tokens, capacity * sizeof(int));
+                    void *tmp = realloc(tokens, capacity * sizeof(int));
+                    if (!tmp) {
+                        free(tokens);
+                        free_token_list(bpe_tokens);
+                        free(byte_text);
+                        for (int ci = c; ci < num_chunks; ci++) free(chunks[ci]);
+                        free(chunks);
+                        *num_tokens = 0;
+                        return NULL;
+                    }
+                    tokens = tmp;
                 }
                 tokens[total++] = id;
             }
@@ -951,6 +1011,16 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     int *tokens = malloc(capacity * sizeof(int));
     int total = 0;
 
+    /* Checked realloc: on failure, free tokens and return NULL */
+#define GROW_TOKENS() do { \
+        if (total >= capacity) { \
+            capacity *= 2; \
+            void *_tmp = realloc(tokens, capacity * sizeof(int)); \
+            if (!_tmp) { free(tokens); *num_tokens = 0; return NULL; } \
+            tokens = _tmp; \
+        } \
+    } while (0)
+
     /* Add special tokens and text */
     /* <|im_start|> */
     tokens[total++] = QWEN3_IM_START_ID;
@@ -959,10 +1029,7 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     int n;
     int *user_tokens = qwen3_tokenize(tok, "user\n", &n, max_len - total);
     for (int i = 0; i < n && total < max_len; i++) {
-        if (total >= capacity) {
-            capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
-        }
+        GROW_TOKENS();
         tokens[total++] = user_tokens[i];
     }
     free(user_tokens);
@@ -970,48 +1037,33 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     /* prompt */
     int *prompt_tokens = qwen3_tokenize(tok, prompt, &n, max_len - total);
     for (int i = 0; i < n && total < max_len; i++) {
-        if (total >= capacity) {
-            capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
-        }
+        GROW_TOKENS();
         tokens[total++] = prompt_tokens[i];
     }
     free(prompt_tokens);
 
     /* <|im_end|>\n */
     if (total < max_len) {
-        if (total >= capacity) {
-            capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
-        }
+        GROW_TOKENS();
         tokens[total++] = QWEN3_IM_END_ID;
     }
     int *newline_tokens = qwen3_tokenize(tok, "\n", &n, max_len - total);
     for (int i = 0; i < n && total < max_len; i++) {
-        if (total >= capacity) {
-            capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
-        }
+        GROW_TOKENS();
         tokens[total++] = newline_tokens[i];
     }
     free(newline_tokens);
 
     /* <|im_start|> */
     if (total < max_len) {
-        if (total >= capacity) {
-            capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
-        }
+        GROW_TOKENS();
         tokens[total++] = QWEN3_IM_START_ID;
     }
 
     /* "assistant\n" */
     int *asst_tokens = qwen3_tokenize(tok, "assistant\n", &n, max_len - total);
     for (int i = 0; i < n && total < max_len; i++) {
-        if (total >= capacity) {
-            capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(int));
-        }
+        GROW_TOKENS();
         tokens[total++] = asst_tokens[i];
     }
     free(asst_tokens);
@@ -1019,40 +1071,30 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
     /* <think>\n\n</think>\n\n — only for Flux, not Z-Image. */
     if (!skip_think_tags) {
         if (total < max_len) {
-            if (total >= capacity) {
-                capacity *= 2;
-                tokens = realloc(tokens, capacity * sizeof(int));
-            }
+            GROW_TOKENS();
             tokens[total++] = QWEN3_THINK_START_ID;
         }
         int *think_newlines = qwen3_tokenize(tok, "\n\n", &n, max_len - total);
         for (int i = 0; i < n && total < max_len; i++) {
-            if (total >= capacity) {
-                capacity *= 2;
-                tokens = realloc(tokens, capacity * sizeof(int));
-            }
+            GROW_TOKENS();
             tokens[total++] = think_newlines[i];
         }
         free(think_newlines);
 
         if (total < max_len) {
-            if (total >= capacity) {
-                capacity *= 2;
-                tokens = realloc(tokens, capacity * sizeof(int));
-            }
+            GROW_TOKENS();
             tokens[total++] = QWEN3_THINK_END_ID;
         }
 
         think_newlines = qwen3_tokenize(tok, "\n\n", &n, max_len - total);
         for (int i = 0; i < n && total < max_len; i++) {
-            if (total >= capacity) {
-                capacity *= 2;
-                tokens = realloc(tokens, capacity * sizeof(int));
-            }
+            GROW_TOKENS();
             tokens[total++] = think_newlines[i];
         }
         free(think_newlines);
     }
+
+#undef GROW_TOKENS
 
     *num_tokens = total;
     return tokens;

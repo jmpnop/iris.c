@@ -255,6 +255,28 @@ static id<MTLComputePipelineState> g_softmax_pipeline;
 static id<MTLComputePipelineState> g_bmm_half_qkt_pipeline;
 static id<MTLComputePipelineState> g_bmm_half_sv_pipeline;
 static id<MTLComputePipelineState> g_softmax_half_pipeline;
+/* F32 compute pipelines (forward declarations — definitions at shader init) */
+static id<MTLLibrary> g_shader_library;
+static id<MTLComputePipelineState> g_rms_norm_pipeline;
+static id<MTLComputePipelineState> g_qk_rms_norm_pipeline;
+static id<MTLComputePipelineState> g_qknorm_rope_pipeline;
+static id<MTLComputePipelineState> g_adaln_norm_pipeline;
+static id<MTLComputePipelineState> g_silu_pipeline;
+static id<MTLComputePipelineState> g_silu_mul_pipeline;
+static id<MTLComputePipelineState> g_rope_2d_pipeline;
+static id<MTLComputePipelineState> g_rope_unified_pipeline;
+static id<MTLComputePipelineState> g_causal_attention_pipeline;
+static id<MTLComputePipelineState> g_causal_attention_bf16_pipeline;
+static id<MTLComputePipelineState> g_rope_bf16_pipeline;
+static id<MTLComputePipelineState> g_head_rms_norm_bf16_pipeline;
+static id<MTLComputePipelineState> g_attention_fused_pipeline;
+static id<MTLComputePipelineState> g_attention_flash_pipeline;
+static id<MTLComputePipelineState> g_gated_add_pipeline;
+static id<MTLComputePipelineState> g_norm_gated_add_pipeline;
+static id<MTLComputePipelineState> g_norm_add_pipeline;
+static id<MTLComputePipelineState> g_split_qkv_mlp_pipeline;
+static id<MTLComputePipelineState> g_split_silu_mul_pipeline;
+static id<MTLComputePipelineState> g_concat_attn_mlp_pipeline;
 /* BF16 native pipelines (forward declarations) */
 static id<MTLComputePipelineState> g_rms_norm_bf16_pipeline;
 static id<MTLComputePipelineState> g_qk_rms_norm_bf16_pipeline;
@@ -557,6 +579,96 @@ void iris_metal_cleanup(void) {
         g_mps_matmul_count = 0;
         memset(g_mps_matmul_cache, 0, sizeof(g_mps_matmul_cache));
         pthread_mutex_unlock(&g_mps_matmul_mutex);
+
+        /* Clear SDPA graph cache */
+        pthread_mutex_lock(&g_sdpa_graph_mutex);
+        memset(g_sdpa_graph_cache, 0, sizeof(g_sdpa_graph_cache));
+        g_sdpa_graph_count = 0;
+        g_sdpa_graph_next = 0;
+        pthread_mutex_unlock(&g_sdpa_graph_mutex);
+
+        /* Clear linear graph caches */
+        pthread_mutex_lock(&g_linear_graph_mutex);
+        memset(g_linear_graph_cache, 0, sizeof(g_linear_graph_cache));
+        g_linear_graph_count = 0;
+        g_linear_graph_next = 0;
+        pthread_mutex_unlock(&g_linear_graph_mutex);
+
+        pthread_mutex_lock(&g_linear_graph_bf16_mutex);
+        memset(g_linear_graph_cache_bf16, 0, sizeof(g_linear_graph_cache_bf16));
+        g_linear_graph_bf16_count = 0;
+        g_linear_graph_bf16_next = 0;
+        pthread_mutex_unlock(&g_linear_graph_bf16_mutex);
+
+        /* Clear conv2d graph caches */
+        pthread_mutex_lock(&g_conv_graph_mutex);
+        memset(g_conv_graph_cache, 0, sizeof(g_conv_graph_cache));
+        g_conv_graph_count = 0;
+        g_conv_graph_next = 0;
+        pthread_mutex_unlock(&g_conv_graph_mutex);
+
+        pthread_mutex_lock(&g_conv_bf16_graph_mutex);
+        memset(g_conv_bf16_graph_cache, 0, sizeof(g_conv_bf16_graph_cache));
+        g_conv_bf16_graph_count = 0;
+        g_conv_bf16_graph_next = 0;
+        pthread_mutex_unlock(&g_conv_bf16_graph_mutex);
+
+        /* Nil all shader pipeline states and library */
+        g_shaders_initialized = 0;
+        g_shader_library = nil;
+        g_rms_norm_pipeline = nil;
+        g_qk_rms_norm_pipeline = nil;
+        g_qknorm_rope_pipeline = nil;
+        g_adaln_norm_pipeline = nil;
+        g_silu_pipeline = nil;
+        g_silu_mul_pipeline = nil;
+        g_softmax_pipeline = nil;
+        g_rope_2d_pipeline = nil;
+        g_rope_unified_pipeline = nil;
+        g_causal_attention_pipeline = nil;
+        g_causal_attention_bf16_pipeline = nil;
+        g_rope_bf16_pipeline = nil;
+        g_head_rms_norm_bf16_pipeline = nil;
+        g_attention_fused_pipeline = nil;
+        g_attention_flash_pipeline = nil;
+        g_gated_add_pipeline = nil;
+        g_norm_gated_add_pipeline = nil;
+        g_norm_add_pipeline = nil;
+        g_split_qkv_mlp_pipeline = nil;
+        g_split_silu_mul_pipeline = nil;
+        g_concat_attn_mlp_pipeline = nil;
+        g_bmm_half_qkt_pipeline = nil;
+        g_bmm_half_sv_pipeline = nil;
+        g_softmax_half_pipeline = nil;
+        g_rms_norm_bf16_pipeline = nil;
+        g_qk_rms_norm_bf16_pipeline = nil;
+        g_adaln_norm_bf16_pipeline = nil;
+        g_silu_bf16_pipeline = nil;
+        g_silu_mul_bf16_pipeline = nil;
+        g_add_bf16_pipeline = nil;
+        g_gated_add_bf16_pipeline = nil;
+        g_rope_unified_bf16_pipeline = nil;
+        g_rope_2d_bf16_pipeline = nil;
+        g_bmm_bf16_qkt_pipeline = nil;
+        g_bmm_bf16_sv_pipeline = nil;
+        g_softmax_bf16_pipeline = nil;
+        g_f32_to_bf16_pipeline = nil;
+        g_bf16_to_f32_pipeline = nil;
+        g_linear_bf16_pipeline = nil;
+        g_split_qkv_mlp_bf16_pipeline = nil;
+        g_concat_attn_mlp_bf16_pipeline = nil;
+        g_concat_seq_bf16_pipeline = nil;
+        g_slice_seq_bf16_pipeline = nil;
+        g_transpose_to_heads_bf16_pipeline = nil;
+        g_transpose_from_heads_bf16_pipeline = nil;
+        g_attention_fused_bf16_pipeline = nil;
+        g_group_norm_f32_pipeline = nil;
+        g_swish_f32_pipeline = nil;
+        g_group_norm_swish_f32_pipeline = nil;
+        g_add_f32_pipeline = nil;
+        g_upsample_nearest_2x_f32_pipeline = nil;
+        g_transpose_2d_scale_f32_pipeline = nil;
+
         g_queue = nil;
         g_device = nil;
         g_initialized = 0;
@@ -2478,8 +2590,8 @@ void iris_bf16_rope_unified(id<MTLBuffer> x,
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
         [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
 
-        [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
         [encoder endEncoding];
 
         [cmdBuffer commit];
@@ -2851,9 +2963,10 @@ iris_gpu_tensor_t iris_gpu_linear(iris_gpu_tensor_t x,
 
         /* Add bias if present */
         if (b != NULL) {
-            /* Sync GPU matmul, then vectorized bias add via Accelerate */
-            [cmdBuffer commit];
-            [cmdBuffer waitUntilCompleted];
+            /* Sync GPU matmul via iris_gpu_sync() to properly handle batch state,
+             * then vectorized bias add via Accelerate on shared memory */
+            out->has_pending_work = 1;
+            iris_gpu_sync();
 
             float *out_data = (float *)[out->buffer contents];
             for (int i = 0; i < seq_len; i++) {
@@ -3329,33 +3442,7 @@ int iris_gpu_attention_bf16(iris_gpu_tensor_t out,
  * Custom Metal compute shaders for element-wise operations.
  * ======================================================================== */
 
-/* Compute pipeline states */
-static id<MTLLibrary> g_shader_library = nil;
-static id<MTLComputePipelineState> g_rms_norm_pipeline = nil;
-static id<MTLComputePipelineState> g_qk_rms_norm_pipeline = nil;
-static id<MTLComputePipelineState> g_qknorm_rope_pipeline = nil;
-static id<MTLComputePipelineState> g_adaln_norm_pipeline = nil;
-static id<MTLComputePipelineState> g_silu_pipeline = nil;
-static id<MTLComputePipelineState> g_silu_mul_pipeline = nil;
-static id<MTLComputePipelineState> g_softmax_pipeline = nil;
-static id<MTLComputePipelineState> g_rope_2d_pipeline = nil;
-static id<MTLComputePipelineState> g_rope_unified_pipeline = nil;
-static id<MTLComputePipelineState> g_causal_attention_pipeline = nil;
-static id<MTLComputePipelineState> g_causal_attention_bf16_pipeline = nil;
-static id<MTLComputePipelineState> g_rope_bf16_pipeline = nil;
-static id<MTLComputePipelineState> g_head_rms_norm_bf16_pipeline = nil;
-static id<MTLComputePipelineState> g_attention_fused_pipeline = nil;
-static id<MTLComputePipelineState> g_attention_flash_pipeline = nil;
-static id<MTLComputePipelineState> g_gated_add_pipeline = nil;
-static id<MTLComputePipelineState> g_norm_gated_add_pipeline = nil;
-static id<MTLComputePipelineState> g_norm_add_pipeline = nil;
-static id<MTLComputePipelineState> g_split_qkv_mlp_pipeline = nil;
-static id<MTLComputePipelineState> g_split_silu_mul_pipeline = nil;
-static id<MTLComputePipelineState> g_concat_attn_mlp_pipeline = nil;
-static id<MTLComputePipelineState> g_bmm_half_qkt_pipeline = nil;
-static id<MTLComputePipelineState> g_bmm_half_sv_pipeline = nil;
-static id<MTLComputePipelineState> g_softmax_half_pipeline = nil;
-/* Note: BF16 pipelines are forward-declared at top of file */
+/* Compute pipeline states — all forward-declared at top of file */
 
 int iris_metal_shaders_available(void) {
     return g_shaders_initialized;
@@ -3889,14 +3976,26 @@ void iris_metal_qk_rms_norm(float *q, float *k,
 
         [encoder endEncoding];
 
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
-
-        memcpy(q, [bufQ contents], data_size);
-        memcpy(k, [bufK contents], data_size);
-
-        pool_release_buffer(bufQ);
-        pool_release_buffer(bufK);
+        if (!g_in_batch) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            memcpy(q, [bufQ contents], data_size);
+            memcpy(k, [bufK contents], data_size);
+            pool_release_buffer(bufQ);
+            pool_release_buffer(bufK);
+        } else {
+            /* In batch mode, defer the copy-back to end_batch */
+            if (g_pending_count + 1 < MAX_BATCH_OUTPUTS) {
+                g_pending_outputs[g_pending_count].buffer = bufQ;
+                g_pending_outputs[g_pending_count].cpu_ptr = q;
+                g_pending_outputs[g_pending_count].size = data_size;
+                g_pending_count++;
+                g_pending_outputs[g_pending_count].buffer = bufK;
+                g_pending_outputs[g_pending_count].cpu_ptr = k;
+                g_pending_outputs[g_pending_count].size = data_size;
+                g_pending_count++;
+            }
+        }
     }
 }
 
@@ -4916,10 +5015,12 @@ int iris_gpu_attention_fused(iris_gpu_tensor_t out,
     if (!g_shaders_initialized || !g_attention_fused_pipeline) return 0;
     if (!out || !Q || !K || !V) return 0;
 
-    /* Dynamic threadgroup memory: shared_scores[seq_k] + static shared_max/sum.
-     * 32KB threadgroup memory allows up to ~7680 seq_k. */
+    /* Dynamic threadgroup memory: shared_scores[seq_k] + static arrays.
+     * Static: shared_max[256] + shared_sum[256] + shared_q[128] + shared_v[8*128]
+     * = (256 + 256 + 128 + 1024) floats = 6656 bytes.
+     * 32KB threadgroup memory allows up to ~6528 seq_k. */
     NSUInteger scores_size = (NSUInteger)seq_k * sizeof(float);
-    NSUInteger static_size = 256 * sizeof(float) * 2; /* shared_max + shared_sum */
+    NSUInteger static_size = (256 + 256 + 128 + 8 * 128) * sizeof(float); /* shared_max + shared_sum + shared_q + shared_v */
     if (scores_size + static_size > 32768) return 0;  /* Hard limit: 32KB threadgroup */
 
     @autoreleasepool {
@@ -5549,12 +5650,14 @@ int iris_gpu_attention_custom_bf16(iris_gpu_tensor_t out,
     if (bf16_scores_size + bf16_static_size > 32768) return 0;
 
     @autoreleasepool {
-        size_t out_elements = (size_t)seq_q * num_heads * head_dim;
+        size_t q_elements = (size_t)seq_q * num_heads * head_dim;
+        size_t kv_elements = (size_t)seq_k * num_heads * head_dim;
+        size_t out_elements = q_elements;
 
-        /* Convert f32 inputs to bf16 on GPU */
-        iris_gpu_tensor_t q_bf16 = iris_gpu_tensor_f32_to_bf16(Q);
-        iris_gpu_tensor_t k_bf16 = iris_gpu_tensor_f32_to_bf16(K);
-        iris_gpu_tensor_t v_bf16 = iris_gpu_tensor_f32_to_bf16(V);
+        /* Pre-allocate all bf16 tensors */
+        iris_gpu_tensor_t q_bf16 = iris_gpu_tensor_alloc_f16(q_elements);
+        iris_gpu_tensor_t k_bf16 = iris_gpu_tensor_alloc_f16(kv_elements);
+        iris_gpu_tensor_t v_bf16 = iris_gpu_tensor_alloc_f16(kv_elements);
         iris_gpu_tensor_t out_bf16 = iris_gpu_tensor_alloc_f16(out_elements);
 
         if (!q_bf16 || !k_bf16 || !v_bf16 || !out_bf16) {
@@ -5565,48 +5668,102 @@ int iris_gpu_attention_custom_bf16(iris_gpu_tensor_t out,
             return 0;
         }
 
-        /* Ensure conversions have completed */
-        iris_gpu_sync();
-
-        /* Dispatch custom kernel (skip MPSGraph SDPA entirely) */
+        /* Encode f32->bf16 conversions + attention + bf16->f32 conversion
+         * into a single command buffer to avoid multiple syncs. */
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
 
-        if (bf16_debug_enabled()) {
-            fprintf(stderr, "[ATTN] Using custom BF16 kernel (no SDPA) seq_q=%d seq_k=%d heads=%d head_dim=%d\n",
-                    seq_q, seq_k, num_heads, head_dim);
+        /* Encode f32 -> bf16 conversions for Q, K, V */
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+            int nq = (int)q_elements;
+            [enc setComputePipelineState:g_f32_to_bf16_pipeline];
+            [enc setBuffer:Q->buffer offset:0 atIndex:0];
+            [enc setBuffer:q_bf16->buffer offset:0 atIndex:1];
+            [enc setBytes:&nq length:sizeof(int) atIndex:2];
+            NSUInteger threads = 256;
+            [enc dispatchThreadgroups:MTLSizeMake((nq + threads - 1) / threads, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            [enc endEncoding];
+        }
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+            int nkv = (int)kv_elements;
+            [enc setComputePipelineState:g_f32_to_bf16_pipeline];
+            [enc setBuffer:K->buffer offset:0 atIndex:0];
+            [enc setBuffer:k_bf16->buffer offset:0 atIndex:1];
+            [enc setBytes:&nkv length:sizeof(int) atIndex:2];
+            NSUInteger threads = 256;
+            [enc dispatchThreadgroups:MTLSizeMake((nkv + threads - 1) / threads, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            [enc endEncoding];
+        }
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+            int nkv = (int)kv_elements;
+            [enc setComputePipelineState:g_f32_to_bf16_pipeline];
+            [enc setBuffer:V->buffer offset:0 atIndex:0];
+            [enc setBuffer:v_bf16->buffer offset:0 atIndex:1];
+            [enc setBytes:&nkv length:sizeof(int) atIndex:2];
+            NSUInteger threads = 256;
+            [enc dispatchThreadgroups:MTLSizeMake((nkv + threads - 1) / threads, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            [enc endEncoding];
         }
 
-        [encoder setComputePipelineState:g_attention_fused_bf16_pipeline];
-        [encoder setBuffer:q_bf16->buffer offset:0 atIndex:0];
-        [encoder setBuffer:k_bf16->buffer offset:0 atIndex:1];
-        [encoder setBuffer:v_bf16->buffer offset:0 atIndex:2];
-        [encoder setBuffer:out_bf16->buffer offset:0 atIndex:3];
-        [encoder setBytes:&seq_q length:sizeof(int) atIndex:4];
-        [encoder setBytes:&seq_k length:sizeof(int) atIndex:5];
-        [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
-        [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
-        [encoder setBytes:&scale length:sizeof(float) atIndex:8];
-        [encoder setThreadgroupMemoryLength:bf16_scores_size atIndex:0];
+        /* Encode attention kernel */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
 
-        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
-        [encoder dispatchThreadgroups:MTLSizeMake(seq_q, num_heads, 1)
-                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+            if (bf16_debug_enabled()) {
+                fprintf(stderr, "[ATTN] Using custom BF16 kernel (no SDPA) seq_q=%d seq_k=%d heads=%d head_dim=%d\n",
+                        seq_q, seq_k, num_heads, head_dim);
+            }
 
-        [encoder endEncoding];
+            [encoder setComputePipelineState:g_attention_fused_bf16_pipeline];
+            [encoder setBuffer:q_bf16->buffer offset:0 atIndex:0];
+            [encoder setBuffer:k_bf16->buffer offset:0 atIndex:1];
+            [encoder setBuffer:v_bf16->buffer offset:0 atIndex:2];
+            [encoder setBuffer:out_bf16->buffer offset:0 atIndex:3];
+            [encoder setBytes:&seq_q length:sizeof(int) atIndex:4];
+            [encoder setBytes:&seq_k length:sizeof(int) atIndex:5];
+            [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
+            [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
+            [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+            [encoder setThreadgroupMemoryLength:bf16_scores_size atIndex:0];
+
+            NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+            [encoder dispatchThreadgroups:MTLSizeMake(seq_q, num_heads, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+            [encoder endEncoding];
+        }
+
+        /* Encode bf16 -> f32 conversion for output */
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+            int nout = (int)out_elements;
+            [enc setComputePipelineState:g_bf16_to_f32_pipeline];
+            [enc setBuffer:out_bf16->buffer offset:0 atIndex:0];
+            [enc setBuffer:out->buffer offset:0 atIndex:1];
+            [enc setBytes:&nout length:sizeof(int) atIndex:2];
+            NSUInteger threads = 256;
+            [enc dispatchThreadgroups:MTLSizeMake((nout + threads - 1) / threads, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            [enc endEncoding];
+        }
+
+        /* Single sync for the entire pipeline */
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
 
-        /* Convert bf16 output back to f32 */
-        int ok = iris_gpu_convert_bf16_to_f32_into(out, out_bf16);
-        if (ok) iris_gpu_sync();
+        out->has_pending_work = 0;
 
         iris_gpu_tensor_free(q_bf16);
         iris_gpu_tensor_free(k_bf16);
         iris_gpu_tensor_free(v_bf16);
         iris_gpu_tensor_free(out_bf16);
 
-        return ok;
+        return 1;
     }
 }
 
@@ -5709,8 +5866,8 @@ int iris_gpu_head_rms_norm_bf16(iris_gpu_tensor_t x, iris_gpu_tensor_t weight_bf
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:3];
         [encoder setBytes:&eps length:sizeof(float) atIndex:4];
 
-        [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
         [encoder endEncoding];
 
         x->has_pending_work = 1;
@@ -5864,8 +6021,8 @@ void iris_gpu_gated_add_bf16(iris_gpu_tensor_t out, iris_gpu_tensor_t gate_bf16,
         [encoder setBytes:&seq length:sizeof(int) atIndex:3];
         [encoder setBytes:&hidden length:sizeof(int) atIndex:4];
 
-        [encoder dispatchThreadgroups:MTLSizeMake(seq, hidden, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder dispatchThreads:MTLSizeMake(seq, hidden, 1)
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, seq), MIN(32, hidden), 1)];
         [encoder endEncoding];
 
         out->has_pending_work = 1;
@@ -5915,8 +6072,8 @@ void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
             [encoder setBytes:&heads length:sizeof(int) atIndex:7];
             [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
             [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
-            [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
-                    threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+               threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
             [encoder endEncoding];
         }
 
@@ -5934,8 +6091,8 @@ void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
             [encoder setBytes:&heads length:sizeof(int) atIndex:7];
             [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
             [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
-            [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
-                    threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+               threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
             [encoder endEncoding];
         }
 
@@ -5975,8 +6132,8 @@ void iris_gpu_rope_2d_bf16(iris_gpu_tensor_t x,
         [encoder setBytes:&heads length:sizeof(int) atIndex:4];
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
         [encoder setBytes:&axis_dim length:sizeof(int) atIndex:6];
-        [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
         [encoder endEncoding];
 
         x->has_pending_work = 1;
@@ -6096,8 +6253,8 @@ void iris_gpu_rope_text_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
 
         /* Dispatch: one thread per (pos, head) - max of q_heads and kv_heads */
         int max_heads = num_q_heads > num_kv_heads ? num_q_heads : num_kv_heads;
-        [encoder dispatchThreadgroups:MTLSizeMake(seq, max_heads, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder dispatchThreads:MTLSizeMake(seq, max_heads, 1)
+           threadsPerThreadgroup:MTLSizeMake(1, MIN(max_heads, 64), 1)];
         [encoder endEncoding];
 
         q->has_pending_work = 1;
@@ -6133,8 +6290,8 @@ void iris_gpu_concat_seq_bf16(iris_gpu_tensor_t out,
         [encoder setBytes:&hidden length:sizeof(int) atIndex:5];
 
         int total_seq = seq_a + seq_b;
-        [encoder dispatchThreadgroups:MTLSizeMake(total_seq, hidden, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder dispatchThreads:MTLSizeMake(total_seq, hidden, 1)
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, total_seq), MIN(32, hidden), 1)];
         [encoder endEncoding];
 
         out->has_pending_work = 1;
@@ -6169,8 +6326,8 @@ void iris_gpu_slice_seq_bf16(iris_gpu_tensor_t out,
         [encoder setBytes:&hidden length:sizeof(int) atIndex:3];
         [encoder setBytes:&start length:sizeof(int) atIndex:4];
 
-        [encoder dispatchThreadgroups:MTLSizeMake(seq_out, hidden, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder dispatchThreads:MTLSizeMake(seq_out, hidden, 1)
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, seq_out), MIN(32, hidden), 1)];
         [encoder endEncoding];
 
         out->has_pending_work = 1;
@@ -6803,9 +6960,11 @@ int iris_metal_attention_fused(float *out,
         return 0;  /* Shader not available, fall back to CPU */
     }
 
-    /* Dynamic threadgroup memory: shared_scores[seq_k] + static shared_max/sum */
+    /* Dynamic threadgroup memory: shared_scores[seq_k] + static arrays.
+     * Static: shared_max[256] + shared_sum[256] + shared_q[128] + shared_v[8*128]
+     * = (256 + 256 + 128 + 1024) floats = 6656 bytes. */
     NSUInteger raw_scores_size = (NSUInteger)seq_k * sizeof(float);
-    NSUInteger raw_static_size = 256 * sizeof(float) * 2; /* shared_max + shared_sum */
+    NSUInteger raw_static_size = (256 + 256 + 128 + 8 * 128) * sizeof(float); /* shared_max + shared_sum + shared_q + shared_v */
     if (raw_scores_size + raw_static_size > 32768) {
         return 0;  /* Exceeds 32KB threadgroup memory limit */
     }

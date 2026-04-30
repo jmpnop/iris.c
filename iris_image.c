@@ -245,6 +245,7 @@ static void write_png_chunk(FILE *f, const char *type, const uint8_t *data, size
 
     /* CRC (over type + data) */
     uint8_t *crc_data = (uint8_t *)malloc(4 + len);
+    if (!crc_data) return;
     memcpy(crc_data, type, 4);
     if (len > 0 && data) {
         memcpy(crc_data + 4, data, len);
@@ -773,7 +774,7 @@ static iris_image *load_png(FILE *f) {
             break;
         } else {
             /* Skip unknown chunk */
-            fseek(f, chunk_len + 4, SEEK_CUR);
+            fseek(f, (long)chunk_len + 4, SEEK_CUR);
         }
     }
 
@@ -807,7 +808,7 @@ static iris_image *load_png(FILE *f) {
     }
 
     /* Decompress */
-    size_t raw_len = height * (1 + width * channels);
+    size_t raw_len = (size_t)height * (1 + (size_t)width * channels);
     uint8_t *raw = inflate_zlib(idat_data, idat_len, raw_len);
     free(idat_data);
 

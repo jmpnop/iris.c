@@ -1078,6 +1078,12 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
  * fully GPU-resident path first, falls back to mixed CPU/GPU or pure CPU. */
 float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
                      const int *attention_mask, int seq_len) {
+    if (seq_len > QWEN3_MAX_SEQ_LEN) {
+        fprintf(stderr, "qwen3_forward: seq_len %d exceeds max %d\n",
+                seq_len, QWEN3_MAX_SEQ_LEN);
+        return NULL;
+    }
+
     int hidden = model->hidden_size;
     int zimage = model->extraction_mode;
     int last_layer = zimage ? (model->num_layers - 2) : QWEN3_OUTPUT_LAYER_3;

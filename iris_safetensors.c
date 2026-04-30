@@ -51,6 +51,7 @@ static int64_t parse_int(const char **p) {
     int neg = 0;
     if (**p == '-') { neg = 1; (*p)++; }
     while (**p >= '0' && **p <= '9') {
+        if (val > INT64_MAX / 10) break;  /* Prevent overflow */
         val = val * 10 + (**p - '0');
         (*p)++;
     }

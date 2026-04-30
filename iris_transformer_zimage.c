@@ -547,7 +547,10 @@ static void zi_timestep_embed(zi_transformer_t *tf, float *out, float t) {
     /* MLP: Linear(256 -> mid) + SiLU + Linear(mid -> adaln_dim) */
     int mid = tf->t_emb_mid_size;
     float *hidden = (float *)malloc(mid * sizeof(float));
-    if (!hidden) return;
+    if (!hidden) {
+        memset(out, 0, tf->adaln_dim * sizeof(float));
+        return;
+    }
 
     /* Linear 0 */
     iris_matmul_t(hidden, sin_emb, tf->t_emb_mlp0_weight, 1, 256, mid);
@@ -581,10 +584,15 @@ static void zi_precompute_rope(zi_transformer_t *tf) {
         tf->rope_cos[ax] = (float *)malloc(max_pos * half_d * sizeof(float));
         tf->rope_sin[ax] = (float *)malloc(max_pos * half_d * sizeof(float));
 
+        /* Hoist powf: precompute inverse frequencies once per axis */
+        float inv_freq[64];  /* max half_d = 48/2 = 24 */
+        for (int i = 0; i < half_d; i++) {
+            inv_freq[i] = 1.0f / powf(tf->rope_theta, (float)(2 * i) / (float)d);
+        }
+
         for (int pos = 0; pos < max_pos; pos++) {
             for (int i = 0; i < half_d; i++) {
-                float freq = 1.0f / powf(tf->rope_theta, (float)(2 * i) / (float)d);
-                float angle = (float)pos * freq;
+                float angle = (float)pos * inv_freq[i];
                 tf->rope_cos[ax][pos * half_d + i] = cosf(angle);
                 tf->rope_sin[ax][pos * half_d + i] = sinf(angle);
             }

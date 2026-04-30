@@ -92,11 +92,13 @@ static void vocab_hash_insert(vocab_entry_t *table, int hash_size,
 static int vocab_hash_lookup(const vocab_entry_t *table, int hash_size,
                              const char *token) {
     unsigned int h = hash_string(token) % hash_size;
+    int probes = 0;
     while (table[h].token != NULL) {
         if (strcmp(table[h].token, token) == 0) {
             return table[h].id;
         }
         h = (h + 1) % hash_size;
+        if (++probes >= hash_size) return -1;
     }
     return -1;
 }
@@ -161,6 +163,10 @@ static int is_punctuation(int cp) {
 static char **pretokenize(const char *text, int *num_tokens) {
     int capacity = 64;
     char **tokens = malloc(capacity * sizeof(char *));
+    if (!tokens) {
+        *num_tokens = 0;
+        return NULL;
+    }
     int count = 0;
 
     const char *p = text;
@@ -191,7 +197,15 @@ static char **pretokenize(const char *text, int *num_tokens) {
 
         if (count >= capacity) {
             capacity *= 2;
-            tokens = realloc(tokens, capacity * sizeof(char *));
+            void *tmp = realloc(tokens, capacity * sizeof(char *));
+            if (!tmp) {
+                free(token);
+                for (int i = 0; i < count; i++) free(tokens[i]);
+                free(tokens);
+                *num_tokens = 0;
+                return NULL;
+            }
+            tokens = tmp;
         }
         tokens[count++] = token;
     }
@@ -216,6 +230,10 @@ static int *bpe_tokenize_word(iris_tokenizer *tok, const char *word,
     /* Start with character-level tokens.
      * Allocate for worst case: every byte becomes a token (byte fallback). */
     int *tokens = malloc(len * sizeof(int));
+    if (!tokens) {
+        *num_tokens = 0;
+        return NULL;
+    }
     int n = 0;
 
     const char *p = word;
@@ -410,10 +428,20 @@ int *iris_tokenize(iris_tokenizer *tok, const char *text,
     /* Pre-tokenize */
     int num_words;
     char **words = pretokenize(text, &num_words);
+    if (!words) {
+        *num_tokens = 0;
+        return NULL;
+    }
 
     /* Collect all tokens */
     int capacity = 128;
     int *all_tokens = malloc(capacity * sizeof(int));
+    if (!all_tokens) {
+        for (int i = 0; i < num_words; i++) free(words[i]);
+        free(words);
+        *num_tokens = 0;
+        return NULL;
+    }
     int total = 0;
 
     /* Add BOS if configured */
@@ -430,7 +458,17 @@ int *iris_tokenize(iris_tokenizer *tok, const char *text,
         for (int i = 0; i < n && total < max_len - (tok->add_eos ? 1 : 0); i++) {
             if (total >= capacity) {
                 capacity *= 2;
-                all_tokens = realloc(all_tokens, capacity * sizeof(int));
+                void *tmp = realloc(all_tokens, capacity * sizeof(int));
+                if (!tmp) {
+                    free(all_tokens);
+                    free(word_tokens);
+                    free(words[w]);
+                    for (int j = w + 1; j < num_words; j++) free(words[j]);
+                    free(words);
+                    *num_tokens = 0;
+                    return NULL;
+                }
+                all_tokens = tmp;
             }
             all_tokens[total++] = word_tokens[i];
         }
@@ -446,7 +484,13 @@ int *iris_tokenize(iris_tokenizer *tok, const char *text,
     if (tok->add_eos && tok->eos_id >= 0 && total < max_len) {
         if (total >= capacity) {
             capacity *= 2;
-            all_tokens = realloc(all_tokens, capacity * sizeof(int));
+            void *tmp = realloc(all_tokens, capacity * sizeof(int));
+            if (!tmp) {
+                free(all_tokens);
+                *num_tokens = 0;
+                return NULL;
+            }
+            all_tokens = tmp;
         }
         all_tokens[total++] = tok->eos_id;
     }

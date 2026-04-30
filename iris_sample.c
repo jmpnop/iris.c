@@ -295,6 +295,7 @@ float *iris_sample_euler_flux(void *transformer, void *text_encoder,
 
     /* Working buffers */
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     float *v_cond = NULL;
 
     iris_copy(z_curr, z, latent_size);
@@ -384,6 +385,7 @@ float *iris_sample_euler_zimage(void *transformer,
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     iris_reset_timing();
@@ -511,6 +513,7 @@ float *iris_sample_euler_zimage_cfg(void *transformer,
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     iris_reset_timing();
@@ -644,6 +647,7 @@ float *iris_sample_euler_zimage_img2img(void *transformer,
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
 
     /* Blend noise with reference latent at the starting sigma:
      * z_init = noise * sigma + ref_latent * (1 - sigma) */
@@ -779,6 +783,7 @@ float *iris_sample_euler_refs_flux(void *transformer, void *text_encoder,
 
     /* Working buffer */
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     /* Reset timing counters */
@@ -857,6 +862,7 @@ float *iris_sample_euler_multirefs_flux(void *transformer, void *text_encoder,
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     iris_reset_timing();
@@ -938,6 +944,7 @@ float *iris_sample_euler_cfg_flux(void *transformer, void *text_encoder,
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     iris_reset_timing();
@@ -1019,6 +1026,7 @@ float *iris_sample_euler_cfg_refs_flux(void *transformer, void *text_encoder,
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     iris_reset_timing();
@@ -1101,6 +1109,7 @@ float *iris_sample_euler_cfg_multirefs_flux(void *transformer, void *text_encode
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     iris_reset_timing();
@@ -1177,11 +1186,18 @@ float *iris_sample_euler_ancestral(void *transformer,
                                    const float *schedule, int num_steps,
                                    float eta,
                                    void (*progress_callback)(int step, int total)) {
+    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
+    if (num_steps < 1) return NULL;
     iris_transformer_flux_t *tf = (iris_transformer_flux_t *)transformer;
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
     float *noise = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr || !noise) {
+        free(z_curr);
+        free(noise);
+        return NULL;
+    }
 
     iris_copy(z_curr, z, latent_size);
 
@@ -1240,11 +1256,18 @@ float *iris_sample_heun(void *transformer,
                         const float *text_emb, int text_seq,
                         const float *schedule, int num_steps,
                         void (*progress_callback)(int step, int total)) {
+    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
+    if (num_steps < 1) return NULL;
     iris_transformer_flux_t *tf = (iris_transformer_flux_t *)transformer;
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
     float *z_pred = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr || !z_pred) {
+        free(z_curr);
+        free(z_pred);
+        return NULL;
+    }
 
     iris_copy(z_curr, z, latent_size);
 
@@ -1311,8 +1334,9 @@ float *iris_sample_heun(void *transformer,
 #define NOISE_MAX_LATENT_DIM 112  /* 1792/16 = 112 */
 
 float *iris_init_noise(int batch, int channels, int h, int w, int64_t seed) {
-    int target_size = batch * channels * h * w;
+    size_t target_size = (size_t)batch * channels * h * w;
     float *noise = (float *)malloc(target_size * sizeof(float));
+    if (!noise) return NULL;
 
     if (seed >= 0) {
         iris_rng_seed((uint64_t)seed);
@@ -1320,16 +1344,20 @@ float *iris_init_noise(int batch, int channels, int h, int w, int64_t seed) {
 
     /* If target is max size or larger, just generate directly */
     if (h >= NOISE_MAX_LATENT_DIM && w >= NOISE_MAX_LATENT_DIM) {
-        iris_randn(noise, target_size);
+        iris_randn(noise, (int)target_size);
         return noise;
     }
 
     /* Generate noise at max latent size */
     int max_h = NOISE_MAX_LATENT_DIM;
     int max_w = NOISE_MAX_LATENT_DIM;
-    int max_size = batch * channels * max_h * max_w;
+    size_t max_size = (size_t)batch * channels * max_h * max_w;
     float *max_noise = (float *)malloc(max_size * sizeof(float));
-    iris_randn(max_noise, max_size);
+    if (!max_noise) {
+        free(noise);
+        return NULL;
+    }
+    iris_randn(max_noise, (int)max_size);
 
     /* Subsample to target size using nearest-neighbor */
     for (int b = 0; b < batch; b++) {

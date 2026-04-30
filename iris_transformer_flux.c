@@ -68,12 +68,8 @@ void iris_reset_blas_profile(void) {
     prof_single_proj_matmul = prof_single_gated_add = 0;
 }
 
-/* Helper to get current time in ms (wall-clock) */
-static double tf_get_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
-}
+/* tf_get_time_ms is identical to prof_get_time — use prof_get_time everywhere */
+#define tf_get_time_ms prof_get_time
 
 /* Use BLAS for matrix operations when enabled via Makefile */
 #ifdef USE_BLAS
@@ -247,7 +243,7 @@ typedef struct iris_transformer_flux {
     single_block_t *single_blocks;
 
     /* Final layer */
-    float *final_norm_weight;       /* [hidden] (always f32) */
+    float *final_norm_weight;       /* [hidden*2, hidden] (always f32) */
     float *final_proj_weight;       /* [latent_channels, hidden] */
     uint16_t *final_proj_weight_bf16; /* [latent_channels, hidden] (bf16) */
 
@@ -807,6 +803,10 @@ static void compute_rope_2d(float *cos_out, float *sin_out,
 
     /* Precompute base frequencies on stack (axis_dim is always 32, half_axis=16) */
     float base_freqs[16];
+    if (half_axis > 16) {
+        fprintf(stderr, "base_freqs overflow: half_axis=%d\n", half_axis);
+        return;
+    }
     for (int d = 0; d < half_axis; d++) {
         base_freqs[d] = 1.0f / powf(theta, (float)(2 * d) / (float)axis_dim);
     }
@@ -870,6 +870,10 @@ static void compute_rope_2d_with_t_offset(float *cos_out, float *sin_out,
 
     /* Precompute base frequencies */
     float base_freqs[16];
+    if (half_axis > 16) {
+        fprintf(stderr, "base_freqs overflow: half_axis=%d\n", half_axis);
+        return;
+    }
     for (int d = 0; d < half_axis; d++) {
         base_freqs[d] = 1.0f / powf(theta, (float)(2 * d) / (float)axis_dim);
     }
@@ -964,6 +968,10 @@ static void compute_rope_text(float *cos_out, float *sin_out,
 
     /* Precompute base frequencies on stack (axis_dim is always 32, half_axis=16) */
     float base_freqs[16];
+    if (half_axis > 16) {
+        fprintf(stderr, "base_freqs overflow: half_axis=%d\n", half_axis);
+        return;
+    }
     for (int d = 0; d < half_axis; d++) {
         base_freqs[d] = 1.0f / powf(theta, (float)(2 * d) / (float)axis_dim);
     }
@@ -1016,6 +1024,18 @@ static void get_cached_img_rope(iris_transformer_flux_t *tf, int patch_h, int pa
     if (tf->cached_img_rope_sin) free(tf->cached_img_rope_sin);
     tf->cached_img_rope_cos = (float *)malloc(size);
     tf->cached_img_rope_sin = (float *)malloc(size);
+    if (!tf->cached_img_rope_cos || !tf->cached_img_rope_sin) {
+        fprintf(stderr, "Failed to allocate cached img RoPE buffers\n");
+        free(tf->cached_img_rope_cos);
+        free(tf->cached_img_rope_sin);
+        tf->cached_img_rope_cos = NULL;
+        tf->cached_img_rope_sin = NULL;
+        tf->cached_img_h = 0;
+        tf->cached_img_w = 0;
+        *cos_out = NULL;
+        *sin_out = NULL;
+        return;
+    }
     tf->cached_img_h = patch_h;
     tf->cached_img_w = patch_w;
 
@@ -1047,6 +1067,19 @@ static void get_cached_ref_rope(iris_transformer_flux_t *tf, int patch_h, int pa
     if (tf->cached_ref_rope_sin) free(tf->cached_ref_rope_sin);
     tf->cached_ref_rope_cos = (float *)malloc(size);
     tf->cached_ref_rope_sin = (float *)malloc(size);
+    if (!tf->cached_ref_rope_cos || !tf->cached_ref_rope_sin) {
+        fprintf(stderr, "Failed to allocate cached ref RoPE buffers\n");
+        free(tf->cached_ref_rope_cos);
+        free(tf->cached_ref_rope_sin);
+        tf->cached_ref_rope_cos = NULL;
+        tf->cached_ref_rope_sin = NULL;
+        tf->cached_ref_h = 0;
+        tf->cached_ref_w = 0;
+        tf->cached_ref_t_offset = 0;
+        *cos_out = NULL;
+        *sin_out = NULL;
+        return;
+    }
     tf->cached_ref_h = patch_h;
     tf->cached_ref_w = patch_w;
     tf->cached_ref_t_offset = t_offset;
@@ -1077,6 +1110,17 @@ static void get_cached_txt_rope(iris_transformer_flux_t *tf, int txt_seq,
     if (tf->cached_txt_rope_sin) free(tf->cached_txt_rope_sin);
     tf->cached_txt_rope_cos = (float *)malloc(size);
     tf->cached_txt_rope_sin = (float *)malloc(size);
+    if (!tf->cached_txt_rope_cos || !tf->cached_txt_rope_sin) {
+        fprintf(stderr, "Failed to allocate cached txt RoPE buffers\n");
+        free(tf->cached_txt_rope_cos);
+        free(tf->cached_txt_rope_sin);
+        tf->cached_txt_rope_cos = NULL;
+        tf->cached_txt_rope_sin = NULL;
+        tf->cached_txt_seq = 0;
+        *cos_out = NULL;
+        *sin_out = NULL;
+        return;
+    }
     tf->cached_txt_seq = txt_seq;
 
     compute_rope_text(tf->cached_txt_rope_cos, tf->cached_txt_rope_sin,
@@ -1117,6 +1161,21 @@ static void get_cached_combined_rope(iris_transformer_flux_t *tf,
     if (tf->cached_combined_rope_sin) free(tf->cached_combined_rope_sin);
     tf->cached_combined_rope_cos = (float *)malloc(combined_size);
     tf->cached_combined_rope_sin = (float *)malloc(combined_size);
+    if (!tf->cached_combined_rope_cos || !tf->cached_combined_rope_sin) {
+        fprintf(stderr, "Failed to allocate cached combined RoPE buffers\n");
+        free(tf->cached_combined_rope_cos);
+        free(tf->cached_combined_rope_sin);
+        tf->cached_combined_rope_cos = NULL;
+        tf->cached_combined_rope_sin = NULL;
+        tf->cached_combined_img_h = 0;
+        tf->cached_combined_img_w = 0;
+        tf->cached_combined_ref_h = 0;
+        tf->cached_combined_ref_w = 0;
+        tf->cached_combined_t_offset = 0;
+        *cos_out = NULL;
+        *sin_out = NULL;
+        return;
+    }
     tf->cached_combined_img_h = img_h;
     tf->cached_combined_img_w = img_w;
     tf->cached_combined_ref_h = ref_h;
@@ -3761,6 +3820,10 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
      */
     int sincos_dim = tf->time_embed.sincos_dim;
     float *t_emb = (float *)malloc(hidden * sizeof(float));
+    if (!t_emb) {
+        fprintf(stderr, "Failed to allocate t_emb\n");
+        return NULL;
+    }
     float t_sincos[256];  /* sincos_dim is always 256 */
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
@@ -3779,6 +3842,11 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
      */
     int channels = tf->latent_channels;
     float *img_transposed = (float *)malloc(img_seq * channels * sizeof(float));
+    if (!img_transposed) {
+        fprintf(stderr, "Failed to allocate img_transposed\n");
+        free(t_emb);
+        return NULL;
+    }
     for (int pos = 0; pos < img_seq; pos++) {
         for (int c = 0; c < channels; c++) {
             img_transposed[pos * channels + c] = img_latent[c * img_seq + pos];
@@ -3941,6 +4009,11 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     /* Concatenate text and image for single-stream blocks
      * Python uses [txt, img] order for concatenation */
     float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
+    if (!concat_hidden) {
+        fprintf(stderr, "Failed to allocate concat_hidden\n");
+        free(t_emb);
+        return NULL;
+    }
 
     /* Single-stream blocks */
     double single_start = tf_get_time_ms();
@@ -4304,6 +4377,10 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
     /* Get timestep embedding */
     int sincos_dim = tf->time_embed.sincos_dim;
     float *t_emb = (float *)malloc(hidden * sizeof(float));
+    if (!t_emb) {
+        fprintf(stderr, "Failed to allocate t_emb\n");
+        return NULL;
+    }
     float t_sincos[256];
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
@@ -4319,6 +4396,11 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
 
     /* Transpose and concatenate image latents: [target, reference] */
     float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
+    if (!combined_transposed) {
+        fprintf(stderr, "Failed to allocate combined_transposed\n");
+        free(t_emb);
+        return NULL;
+    }
 
     /* Target image */
     for (int pos = 0; pos < img_seq; pos++) {
@@ -4356,6 +4438,12 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
 
     /* Project combined image latent to hidden */
     float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
+    if (!combined_hidden) {
+        fprintf(stderr, "Failed to allocate combined_hidden\n");
+        free(combined_transposed);
+        free(t_emb);
+        return NULL;
+    }
     LINEAR_BF16_OR_F32(combined_hidden, combined_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
                        combined_img_seq, tf->latent_channels, hidden);
     free(combined_transposed);
@@ -4398,6 +4486,12 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
 
     /* Concatenate for single blocks: [txt, combined_img] */
     float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
+    if (!concat_hidden) {
+        fprintf(stderr, "Failed to allocate concat_hidden\n");
+        free(combined_hidden);
+        free(t_emb);
+        return NULL;
+    }
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, combined_hidden, combined_img_seq * hidden * sizeof(float));
     free(combined_hidden);
@@ -4538,6 +4632,10 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
     /* Get timestep embedding */
     int sincos_dim = tf->time_embed.sincos_dim;
     float *t_emb = (float *)malloc(hidden * sizeof(float));
+    if (!t_emb) {
+        fprintf(stderr, "Failed to allocate t_emb\n");
+        return NULL;
+    }
     float t_sincos[256];
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
@@ -4545,6 +4643,13 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
     /* Allocate combined RoPE arrays */
     float *combined_rope_cos = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
     float *combined_rope_sin = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
+    if (!combined_rope_cos || !combined_rope_sin) {
+        fprintf(stderr, "Failed to allocate combined RoPE arrays\n");
+        free(combined_rope_cos);
+        free(combined_rope_sin);
+        free(t_emb);
+        return NULL;
+    }
 
     /* Compute RoPE for target image (T=0) */
     compute_rope_2d(combined_rope_cos, combined_rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
@@ -4566,6 +4671,13 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
 
     /* Transpose and concatenate all image latents */
     float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
+    if (!combined_transposed) {
+        fprintf(stderr, "Failed to allocate combined_transposed\n");
+        free(combined_rope_cos);
+        free(combined_rope_sin);
+        free(t_emb);
+        return NULL;
+    }
 
     /* Target image */
     for (int pos = 0; pos < img_seq; pos++) {
@@ -4610,6 +4722,14 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
 
     /* Project combined image latent to hidden */
     float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
+    if (!combined_hidden) {
+        fprintf(stderr, "Failed to allocate combined_hidden\n");
+        free(combined_transposed);
+        free(combined_rope_cos);
+        free(combined_rope_sin);
+        free(t_emb);
+        return NULL;
+    }
     LINEAR_BF16_OR_F32(combined_hidden, combined_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
                        combined_img_seq, tf->latent_channels, hidden);
     free(combined_transposed);
@@ -4651,6 +4771,14 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
 
     /* Concatenate for single blocks */
     float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
+    if (!concat_hidden) {
+        fprintf(stderr, "Failed to allocate concat_hidden\n");
+        free(combined_hidden);
+        free(combined_rope_cos);
+        free(combined_rope_sin);
+        free(t_emb);
+        return NULL;
+    }
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, combined_hidden, combined_img_seq * hidden * sizeof(float));
     free(combined_hidden);
@@ -4735,10 +4863,10 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
  * Transformer Loading
  * ======================================================================== */
 
-static float *read_floats(FILE *f, int count) {
+static float *read_floats(FILE *f, size_t count) {
     float *data = (float *)malloc(count * sizeof(float));
     if (!data) return NULL;
-    if (fread(data, sizeof(float), count, f) != (size_t)count) {
+    if (fread(data, sizeof(float), count, f) != count) {
         free(data);
         return NULL;
     }
@@ -4823,8 +4951,8 @@ iris_transformer_flux_t *iris_transformer_load_flux(FILE *f) {
     }
 
     /* Read final layer */
-    tf->final_norm_weight = read_floats(f, tf->hidden_size);
-    tf->final_proj_weight = read_floats(f, tf->latent_channels * tf->hidden_size);
+    tf->final_norm_weight = read_floats(f, (size_t)tf->hidden_size * tf->hidden_size * 2);
+    tf->final_proj_weight = read_floats(f, (size_t)tf->latent_channels * tf->hidden_size);
 
     /* Work buffers are dynamically allocated in forward() based on actual sequence
      * length. This avoids 8.4GB pre-allocation that was causing OOM on 16GB systems. */

@@ -891,6 +891,8 @@ kernel void attention_fused(
     uint tid = tid_pos.x;
     uint threads = tg_size.x;
 
+    // Guard: shared_q[128] is fixed-size
+    if (head_dim > 128) return;
     if (query_idx >= seq_q || head_idx >= num_heads) return;
 
     int hidden = num_heads * head_dim;
@@ -965,28 +967,29 @@ kernel void attention_fused(
     // ========== Phase 6: Compute output = scores @ V (tiled) ==========
     // Per-thread accumulator for each dimension this thread owns.
     // With threads=256 and head_dim=128, each thread handles at most 1 dim.
-    // 8 slots supports head_dim up to 2048 with threads=256.
-    float acc[8] = {0};
+    // 16 slots supports head_dim up to 4096 with threads=256, and handles
+    // small threadgroup sizes (threads as low as 8 with head_dim=128).
+    float acc[16] = {0};
 
     for (int tile_start = 0; tile_start < seq_k; tile_start += FUSED_V_TILE) {
         int tile_size = min(FUSED_V_TILE, seq_k - tile_start);
 
         // Cooperative load: all threads load V[tile_start:tile_end, :] into
-        // shared_v[tile_size, 128]. Contiguous device reads across threads.
+        // shared_v[tile_size, head_dim]. Contiguous device reads across threads.
         int total_elems = tile_size * head_dim;
         for (int idx = (int)tid; idx < total_elems; idx += (int)threads) {
             int k = idx / head_dim;
             int d = idx % head_dim;
-            shared_v[k * 128 + d] = V_head[(tile_start + k) * hidden + d];
+            shared_v[k * head_dim + d] = V_head[(tile_start + k) * hidden + d];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Accumulate: each thread processes its assigned dimensions
         int dim_slot = 0;
         for (int d = (int)tid; d < head_dim; d += (int)threads) {
-            if (dim_slot >= 8) break;
+            if (dim_slot >= 16) break;
             for (int k = 0; k < tile_size; k++) {
-                acc[dim_slot] += shared_scores[tile_start + k] * shared_v[k * 128 + d];
+                acc[dim_slot] += shared_scores[tile_start + k] * shared_v[k * head_dim + d];
             }
             dim_slot++;
         }
@@ -996,7 +999,7 @@ kernel void attention_fused(
     // Write output
     int dim_slot = 0;
     for (int d = (int)tid; d < head_dim; d += (int)threads) {
-        if (dim_slot >= 8) break;
+        if (dim_slot >= 16) break;
         out_row[d] = acc[dim_slot];
         dim_slot++;
     }
@@ -1057,8 +1060,9 @@ kernel void attention_flash(
     float running_max = -INFINITY;
     float running_sum = 0.0f;
     /* Max accumulator slots: ceil(head_dim / threads).
-     * 8 supports head_dim up to 2048 with threads=256. */
-    float acc[8] = {0};
+     * 16 supports head_dim up to 4096 with threads=256, and handles
+     * small threadgroup sizes (threads as low as 8 with head_dim=128). */
+    float acc[16] = {0};
 
     int num_tiles = (seq_k + FLASH_TILE_K - 1) / FLASH_TILE_K;
 
@@ -1097,7 +1101,7 @@ kernel void attention_flash(
         running_sum *= correction;
         int dim_idx = 0;
         for (int d = (int)tid; d < head_dim; d += (int)threads) {
-            if (dim_idx >= 8) break;
+            if (dim_idx >= 16) break;
             acc[dim_idx] *= correction;
             dim_idx++;
         }
@@ -1125,7 +1129,7 @@ kernel void attention_flash(
 
         dim_idx = 0;
         for (int d = (int)tid; d < head_dim; d += (int)threads) {
-            if (dim_idx >= 8) break;
+            if (dim_idx >= 16) break;
             float v_acc = 0.0f;
             for (int k = 0; k < tile_len; k++) {
                 int key_idx = tile_start + k;
@@ -1141,7 +1145,7 @@ kernel void attention_flash(
     float inv_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
     int dim_idx = 0;
     for (int d = (int)tid; d < head_dim; d += (int)threads) {
-        if (dim_idx >= 8) break;
+        if (dim_idx >= 16) break;
         out_row[d] = acc[dim_idx] * inv_sum;
         dim_idx++;
     }
@@ -1181,6 +1185,9 @@ kernel void causal_attention_fused(
     uint3 tid_pos [[thread_position_in_threadgroup]],
     uint3 tg_size [[threads_per_threadgroup]]
 ) {
+    // Guard: shared_scores is fixed at 512 entries
+    if (seq > 512) return;
+
     // Shared memory for scores and reductions
     threadgroup float shared_scores[512];  // For attention scores (up to 512 seq len)
     threadgroup float shared_max[256];
@@ -1280,14 +1287,11 @@ kernel void causal_attention_fused(
 
     // ========== Phase 6: Compute output = scores @ V ==========
     // Each thread computes a subset of output dimensions
+    // Masked positions have score==0, so 0*v_val==0 — no branch needed.
     for (int d = tid; d < head_dim; d += threads) {
         float acc = 0.0f;
         for (int key_idx = 0; key_idx < seq; key_idx++) {
-            float score = shared_scores[key_idx];
-            if (score > 0.0f) {  // Skip zeros (masked positions)
-                float v_val = V_head[key_idx * kv_dim + d];
-                acc += score * v_val;
-            }
+            acc += shared_scores[key_idx] * V_head[key_idx * kv_dim + d];
         }
         out_row[d] = acc;
     }
@@ -1508,6 +1512,8 @@ inline float bf16_to_f32(ushort bf16) {
 
 inline ushort f32_to_bf16(float f32) {
     uint bits = as_type<uint>(f32);
+    // Inf/NaN: exponent all-1s — truncate without rounding to preserve payload
+    if ((bits & 0x7F800000u) == 0x7F800000u) return ushort(bits >> 16);
     // Round to nearest even
     uint lsb = (bits >> 16) & 1;
     uint rounding = 0x7FFF + lsb;
@@ -2348,6 +2354,8 @@ kernel void attention_fused_bf16(
     uint tid = tid_pos.x;
     uint threads = tg_size.x;
 
+    // Guard: shared_q[128] is fixed-size
+    if (head_dim > 128) return;
     if (query_idx >= seq_q || head_idx >= num_heads) return;
 
     int hidden = num_heads * head_dim;
@@ -2462,6 +2470,10 @@ kernel void causal_attention_fused_bf16(
     uint3 tid_pos [[thread_position_in_threadgroup]],
     uint3 tg_size [[threads_per_threadgroup]]
 ) {
+    // Guards: shared_scores[512] and shared_q[128] are fixed-size
+    if (seq > 512) return;
+    if (head_dim > 128) return;
+
     // Shared memory for scores and reductions
     threadgroup float shared_scores[512];
     threadgroup float shared_max[256];
@@ -2564,14 +2576,11 @@ kernel void causal_attention_fused_bf16(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ========== Phase 6: Compute output = scores @ V ==========
+    // Masked positions have score==0, so 0*v_val==0 — no branch needed.
     for (int d = tid; d < head_dim; d += threads) {
         float acc = 0.0f;
         for (int key_idx = 0; key_idx < seq; key_idx++) {
-            float score = shared_scores[key_idx];
-            if (score > 0.0f) {
-                float v_val = bf16_to_f32(V_head[key_idx * kv_dim + d]);
-                acc += score * v_val;
-            }
+            acc += shared_scores[key_idx] * bf16_to_f32(V_head[key_idx * kv_dim + d]);
         }
         out_row[d] = f32_to_bf16(acc);
     }
@@ -2679,12 +2688,18 @@ kernel void group_norm_f32(
     device const float *x_batch = x + batch_idx * channels * spatial;
     device float *out_batch = out + batch_idx * channels * spatial;
 
-    /* First pass: compute mean */
+    /* First pass: compute mean
+     * Use incremental c/s tracking to avoid per-element integer division. */
     float local_sum = 0.0f;
-    for (int i = tid; i < group_size; i += threads) {
-        int c = c_start + i / spatial;
-        int s = i % spatial;
-        local_sum += x_batch[c * spatial + s];
+    {
+        int c = c_start + (int)tid / spatial;
+        int s = (int)tid % spatial;
+        for (int i = tid; i < group_size; i += threads) {
+            local_sum += x_batch[c * spatial + s];
+            /* Advance (c, s) by 'threads' positions */
+            s += threads;
+            while (s >= spatial) { s -= spatial; c++; }
+        }
     }
     shared_sum[tid] = local_sum;
 
@@ -2699,13 +2714,18 @@ kernel void group_norm_f32(
 
     float mean = shared_sum[0] / float(group_size);
 
-    /* Second pass: variance via Welford (numerically stable) */
+    /* Second pass: variance via Welford (numerically stable)
+     * Same incremental c/s tracking. */
     float var_local = 0.0f;
-    for (int i = tid; i < group_size; i += threads) {
-        int c = c_start + i / spatial;
-        int s = i % spatial;
-        float diff = x_batch[c * spatial + s] - mean;
-        var_local += diff * diff;
+    {
+        int c = c_start + (int)tid / spatial;
+        int s = (int)tid % spatial;
+        for (int i = tid; i < group_size; i += threads) {
+            float diff = x_batch[c * spatial + s] - mean;
+            var_local += diff * diff;
+            s += threads;
+            while (s >= spatial) { s -= spatial; c++; }
+        }
     }
     shared_sum[tid] = var_local;
 
@@ -2721,13 +2741,18 @@ kernel void group_norm_f32(
     float var = shared_sum[0] / float(group_size);
     float inv_std = rsqrt(var + eps);
 
-    /* Apply normalization with gamma/beta per channel */
-    for (int i = tid; i < group_size; i += threads) {
-        int c = c_start + i / spatial;
-        int s = i % spatial;
-        int idx = c * spatial + s;
-        float val = (x_batch[idx] - mean) * inv_std;
-        out_batch[idx] = gamma[c] * val + beta[c];
+    /* Apply normalization with gamma/beta per channel
+     * Same incremental c/s tracking. */
+    {
+        int c = c_start + (int)tid / spatial;
+        int s = (int)tid % spatial;
+        for (int i = tid; i < group_size; i += threads) {
+            int idx = c * spatial + s;
+            float val = (x_batch[idx] - mean) * inv_std;
+            out_batch[idx] = gamma[c] * val + beta[c];
+            s += threads;
+            while (s >= spatial) { s -= spatial; c++; }
+        }
     }
 }
 
@@ -2757,12 +2782,17 @@ kernel void group_norm_swish_f32(
     device const float *x_batch = x + batch_idx * channels * spatial;
     device float *out_batch = out + batch_idx * channels * spatial;
 
-    /* First pass: compute mean */
+    /* First pass: compute mean
+     * Use incremental c/s tracking to avoid per-element integer division. */
     float local_sum = 0.0f;
-    for (int i = tid; i < group_size; i += threads) {
-        int c = c_start + i / spatial;
-        int s = i % spatial;
-        local_sum += x_batch[c * spatial + s];
+    {
+        int c = c_start + (int)tid / spatial;
+        int s = (int)tid % spatial;
+        for (int i = tid; i < group_size; i += threads) {
+            local_sum += x_batch[c * spatial + s];
+            s += threads;
+            while (s >= spatial) { s -= spatial; c++; }
+        }
     }
     shared_sum[tid] = local_sum;
 
@@ -2777,13 +2807,18 @@ kernel void group_norm_swish_f32(
 
     float mean = shared_sum[0] / float(group_size);
 
-    /* Second pass: variance via Welford (numerically stable) */
+    /* Second pass: variance via Welford (numerically stable)
+     * Same incremental c/s tracking. */
     float var_local = 0.0f;
-    for (int i = tid; i < group_size; i += threads) {
-        int c = c_start + i / spatial;
-        int s = i % spatial;
-        float diff = x_batch[c * spatial + s] - mean;
-        var_local += diff * diff;
+    {
+        int c = c_start + (int)tid / spatial;
+        int s = (int)tid % spatial;
+        for (int i = tid; i < group_size; i += threads) {
+            float diff = x_batch[c * spatial + s] - mean;
+            var_local += diff * diff;
+            s += threads;
+            while (s >= spatial) { s -= spatial; c++; }
+        }
     }
     shared_sum[tid] = var_local;
 
@@ -2799,12 +2834,17 @@ kernel void group_norm_swish_f32(
     float var = shared_sum[0] / float(group_size);
     float inv_std = rsqrt(var + eps);
 
-    for (int i = tid; i < group_size; i += threads) {
-        int c = c_start + i / spatial;
-        int s = i % spatial;
-        int idx = c * spatial + s;
-        float normed = gamma[c] * ((x_batch[idx] - mean) * inv_std) + beta[c];
-        out_batch[idx] = normed / (1.0f + metal::fast::exp(-normed));
+    /* Apply fused norm + swish with incremental c/s tracking. */
+    {
+        int c = c_start + (int)tid / spatial;
+        int s = (int)tid % spatial;
+        for (int i = tid; i < group_size; i += threads) {
+            int idx = c * spatial + s;
+            float normed = gamma[c] * ((x_batch[idx] - mean) * inv_std) + beta[c];
+            out_batch[idx] = normed / (1.0f + metal::fast::exp(-normed));
+            s += threads;
+            while (s >= spatial) { s -= spatial; c++; }
+        }
     }
 }
 
