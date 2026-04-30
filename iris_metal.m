@@ -441,7 +441,9 @@ static id<MTLBuffer> pool_get_buffer(size_t size) {
     pthread_mutex_unlock(&g_pool_mutex);
 
     /* Pool full or allocation failed - create temporary buffer */
-    return [g_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf = [g_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    if (!buf) return NULL;
+    return buf;
 }
 
 /* Return buffer to pool immediately (mark as available). */
@@ -462,7 +464,7 @@ static void pool_release_buffer_immediate(id<MTLBuffer> buffer) {
 static void pool_release_buffer(id<MTLBuffer> buffer) {
     if (!buffer) return;
 
-    if (tensor_batch_active() || tensor_chain_active()) {
+    if (tensor_batch_active() || tensor_chain_active() || g_in_batch) {
         pthread_mutex_lock(&g_pool_mutex);
         if (g_deferred_pool_count >= DEFERRED_POOL_RELEASE_MAX) {
             pthread_mutex_unlock(&g_pool_mutex);
@@ -808,6 +810,9 @@ void iris_metal_end_batch(void) {
             pool_release_buffer_immediate(g_batch_inputs[i].gpu_buffer);
         }
         g_batch_input_count = 0;
+
+        /* Flush pool buffers that were deferred during the batch. */
+        pool_flush_deferred();
     }
 }
 
@@ -2757,6 +2762,14 @@ void iris_gpu_tensor_set_persistent(iris_gpu_tensor_t tensor, int persistent) {
 void iris_gpu_tensor_read(iris_gpu_tensor_t tensor, float *out) {
     if (!tensor || !out) return;
 
+    /* bf16 tensors have sizeof(uint16_t) per element, not sizeof(float).
+     * Reading with f32 size would overrun the buffer. */
+    if (tensor->is_f16) {
+        fprintf(stderr, "iris_gpu_tensor_read: cannot read bf16 tensor as f32 "
+                "(use iris_gpu_tensor_bf16_to_f32 first)\n");
+        return;
+    }
+
     /* If there's pending work, sync first */
     if (tensor->has_pending_work) {
         iris_gpu_sync();
@@ -3994,6 +4007,28 @@ void iris_metal_qk_rms_norm(float *q, float *k,
                 g_pending_outputs[g_pending_count].cpu_ptr = k;
                 g_pending_outputs[g_pending_count].size = data_size;
                 g_pending_count++;
+            } else {
+                /* Overflow: one-shot cmd buffer, skip g_batch_cmd */
+                id<MTLCommandBuffer> oneshot = [g_queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [oneshot computeCommandEncoder];
+                [enc setComputePipelineState:g_qk_rms_norm_pipeline];
+                [enc setBuffer:bufQ offset:0 atIndex:0];
+                [enc setBuffer:bufK offset:0 atIndex:1];
+                [enc setBuffer:bufQWeight offset:0 atIndex:2];
+                [enc setBuffer:bufKWeight offset:0 atIndex:3];
+                [enc setBytes:&heads length:sizeof(int) atIndex:4];
+                [enc setBytes:&head_dim length:sizeof(int) atIndex:5];
+                [enc setBytes:&eps length:sizeof(float) atIndex:6];
+                NSUInteger tpg2 = MIN(128, (NSUInteger)head_dim);
+                [enc dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
+                        threadsPerThreadgroup:MTLSizeMake(tpg2, 1, 1)];
+                [enc endEncoding];
+                [oneshot commit];
+                [oneshot waitUntilCompleted];
+                memcpy(q, [bufQ contents], data_size);
+                memcpy(k, [bufK contents], data_size);
+                pool_release_buffer(bufQ);
+                pool_release_buffer(bufK);
             }
         }
     }
@@ -4054,16 +4089,56 @@ int iris_metal_qknorm_rope(float *q, float *k,
                 threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         [encoder endEncoding];
 
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
+        if (!g_in_batch) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
 
-        memcpy(q, [bufQ contents], data_size);
-        memcpy(k, [bufK contents], data_size);
+            memcpy(q, [bufQ contents], data_size);
+            memcpy(k, [bufK contents], data_size);
 
-        pool_release_buffer(bufQ);
-        pool_release_buffer(bufK);
-        pool_release_buffer(bufCos);
-        pool_release_buffer(bufSin);
+            pool_release_buffer(bufQ);
+            pool_release_buffer(bufK);
+            pool_release_buffer(bufCos);
+            pool_release_buffer(bufSin);
+        } else {
+            /* In batch mode, defer copy-back to end_batch */
+            if (g_pending_count + 1 < MAX_BATCH_OUTPUTS) {
+                g_pending_outputs[g_pending_count].buffer = bufQ;
+                g_pending_outputs[g_pending_count].cpu_ptr = q;
+                g_pending_outputs[g_pending_count].size = data_size;
+                g_pending_count++;
+                g_pending_outputs[g_pending_count].buffer = bufK;
+                g_pending_outputs[g_pending_count].cpu_ptr = k;
+                g_pending_outputs[g_pending_count].size = data_size;
+                g_pending_count++;
+            } else {
+                /* Overflow: one-shot cmd buffer, skip g_batch_cmd */
+                id<MTLCommandBuffer> oneshot = [g_queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [oneshot computeCommandEncoder];
+                [enc setComputePipelineState:g_qknorm_rope_pipeline];
+                [enc setBuffer:bufQ offset:0 atIndex:0];
+                [enc setBuffer:bufK offset:0 atIndex:1];
+                [enc setBuffer:bufQWeight offset:0 atIndex:2];
+                [enc setBuffer:bufKWeight offset:0 atIndex:3];
+                [enc setBuffer:bufCos offset:0 atIndex:4];
+                [enc setBuffer:bufSin offset:0 atIndex:5];
+                [enc setBytes:&heads length:sizeof(int) atIndex:6];
+                [enc setBytes:&head_dim length:sizeof(int) atIndex:7];
+                [enc setBytes:&eps length:sizeof(float) atIndex:8];
+                NSUInteger tpg2 = MIN(128, (NSUInteger)head_dim);
+                [enc dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
+                        threadsPerThreadgroup:MTLSizeMake(tpg2, 1, 1)];
+                [enc endEncoding];
+                [oneshot commit];
+                [oneshot waitUntilCompleted];
+                memcpy(q, [bufQ contents], data_size);
+                memcpy(k, [bufK contents], data_size);
+                pool_release_buffer(bufQ);
+                pool_release_buffer(bufK);
+            }
+            pool_release_buffer(bufCos);
+            pool_release_buffer(bufSin);
+        }
     }
     return 1;
 }
@@ -4307,14 +4382,45 @@ void iris_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
 
         [encoder endEncoding];
 
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
+        if (!g_in_batch) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
 
-        memcpy(x, [bufX contents], data_size);
+            memcpy(x, [bufX contents], data_size);
 
-        pool_release_buffer(bufX);
-        pool_release_buffer(bufCos);
-        pool_release_buffer(bufSin);
+            pool_release_buffer(bufX);
+            pool_release_buffer(bufCos);
+            pool_release_buffer(bufSin);
+        } else {
+            /* In batch mode, defer copy-back to end_batch */
+            if (g_pending_count < MAX_BATCH_OUTPUTS) {
+                g_pending_outputs[g_pending_count].buffer = bufX;
+                g_pending_outputs[g_pending_count].cpu_ptr = x;
+                g_pending_outputs[g_pending_count].size = data_size;
+                g_pending_count++;
+            } else {
+                /* Overflow: one-shot cmd buffer */
+                id<MTLCommandBuffer> oneshot = [g_queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [oneshot computeCommandEncoder];
+                [enc setComputePipelineState:g_rope_2d_pipeline];
+                [enc setBuffer:bufX offset:0 atIndex:0];
+                [enc setBuffer:bufCos offset:0 atIndex:1];
+                [enc setBuffer:bufSin offset:0 atIndex:2];
+                [enc setBytes:&seq length:sizeof(int) atIndex:3];
+                [enc setBytes:&heads length:sizeof(int) atIndex:4];
+                [enc setBytes:&head_dim length:sizeof(int) atIndex:5];
+                [enc setBytes:&axis_dim length:sizeof(int) atIndex:6];
+                [enc dispatchThreads:MTLSizeMake(seq, heads, 1)
+                   threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+                [enc endEncoding];
+                [oneshot commit];
+                [oneshot waitUntilCompleted];
+                memcpy(x, [bufX contents], data_size);
+                pool_release_buffer(bufX);
+            }
+            pool_release_buffer(bufCos);
+            pool_release_buffer(bufSin);
+        }
     }
 }
 
@@ -5669,8 +5775,13 @@ int iris_gpu_attention_custom_bf16(iris_gpu_tensor_t out,
         }
 
         /* Encode f32->bf16 conversions + attention + bf16->f32 conversion
-         * into a single command buffer to avoid multiple syncs. */
-        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+         * into a single command buffer to avoid multiple syncs.
+         * In tensor batch mode, use a dedicated one-shot command buffer
+         * instead of get_tensor_cmd() because this function unconditionally
+         * commits+waits, which would prematurely flush the shared batch buffer. */
+        id<MTLCommandBuffer> cmdBuffer = g_tensor_batch_mode
+            ? [g_queue commandBuffer]
+            : get_tensor_cmd();
 
         /* Encode f32 -> bf16 conversions for Q, K, V */
         {

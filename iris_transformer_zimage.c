@@ -586,6 +586,10 @@ static void zi_precompute_rope(zi_transformer_t *tf) {
 
         /* Hoist powf: precompute inverse frequencies once per axis */
         float inv_freq[64];  /* max half_d = 48/2 = 24 */
+        if (half_d > 64) {
+            fprintf(stderr, "zi_precompute_rope: half_d=%d exceeds buffer\n", half_d);
+            return;
+        }
         for (int i = 0; i < half_d; i++) {
             inv_freq[i] = 1.0f / powf(tf->rope_theta, (float)(2 * i) / (float)d);
         }
@@ -874,6 +878,10 @@ static uint16_t *zi_f32_to_bf16(const float *src, size_t n) {
     for (size_t i = 0; i < n; i++) {
         uint32_t bits;
         memcpy(&bits, &src[i], 4);
+        if ((bits & 0x7F800000u) == 0x7F800000u) {
+            dst[i] = (uint16_t)(bits >> 16);  // Inf/NaN: truncate, don't round
+            continue;
+        }
         uint32_t rounding_bias = 0x7FFF + ((bits >> 16) & 1);
         bits += rounding_bias;
         dst[i] = (uint16_t)(bits >> 16);

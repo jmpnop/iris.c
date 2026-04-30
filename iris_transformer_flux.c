@@ -116,8 +116,8 @@ static int bf16_debug_enabled(void) {
         } else if ((w_f32) != NULL) { \
             iris_linear_nobias((out), (x), (w_f32), (seq), (in_dim), (out_dim)); \
         } else { \
-            fprintf(stderr, "FATAL: Neither bf16 nor f32 weights available\n"); \
-            exit(1); \
+            fprintf(stderr, "FATAL: missing weight for linear layer\n"); \
+            goto error; \
         } \
     } while(0)
 
@@ -2155,6 +2155,9 @@ static void swiglu_ffn_bf16(float *out, const float *x,
     LINEAR_BF16_OR_F32(out, gate, down_weight, down_weight_bf16, seq, mlp_hidden, hidden);
 
     /* No free - using pre-allocated buffers */
+    return;
+error:
+    return;
 }
 
 /* ========================================================================
@@ -2383,6 +2386,9 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
 #ifdef DEBUG_DOUBLE_BLOCK
     block_idx++;
 #endif
+    return;
+error:
+    return;
 }
 
 /* ========================================================================
@@ -2756,10 +2762,25 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
     float attn_scale = 1.0f / sqrtf((float)head_dim);
     if (!iris_gpu_attention_fused(attn_out_gpu, q_gpu, k_gpu, v_gpu,
                                   seq, seq, heads, head_dim, attn_scale)) {
-        /* Fused attention failed (seq > 1024) - use bf16 MPS attention */
+        /* Fused attention failed (seq > 1024) - try bf16 MPS attention */
         iris_gpu_batch_end();
-        iris_gpu_attention_bf16(attn_out_gpu, q_gpu, k_gpu, v_gpu,
-                                seq, seq, heads, head_dim, attn_scale);
+        if (!iris_gpu_attention_bf16(attn_out_gpu, q_gpu, k_gpu, v_gpu,
+                                     seq, seq, heads, head_dim, attn_scale)) {
+            /* Both GPU attention paths failed - free tensors and fall back to CPU */
+            iris_gpu_tensor_free(hidden_gpu);
+            iris_gpu_tensor_free(norm_gpu);
+            iris_gpu_tensor_free(fused_gpu);
+            iris_gpu_tensor_free(fused_result);
+            iris_gpu_tensor_free(q_gpu);
+            iris_gpu_tensor_free(k_gpu);
+            iris_gpu_tensor_free(v_gpu);
+            iris_gpu_tensor_free(gate_gpu);
+            iris_gpu_tensor_free(up_gpu);
+            iris_gpu_tensor_free(attn_out_gpu);
+            iris_gpu_tensor_free(concat_gpu);
+            iris_gpu_tensor_free(proj_out_gpu);
+            return 0;
+        }
         iris_gpu_batch_begin();
     }
 
@@ -3785,6 +3806,9 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     prof_single_gated_add += _t8 - _t7;
 
     /* No free - using pre-allocated buffers */
+    return;
+error:
+    return;
 }
 
 /* ========================================================================
@@ -4317,6 +4341,10 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
 #endif
 
     return output;
+
+error:
+    free(t_emb);
+    return NULL;
 }
 
 /* ========================================================================
@@ -4570,6 +4598,10 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
 #endif
 
     return output;
+
+error:
+    free(t_emb);
+    return NULL;
 }
 
 /* ========================================================================
@@ -4857,6 +4889,12 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
 #endif
 
     return output;
+
+error:
+    free(t_emb);
+    free(combined_rope_cos);
+    free(combined_rope_sin);
+    return NULL;
 }
 
 /* ========================================================================

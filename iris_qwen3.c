@@ -686,9 +686,9 @@ static void qwen3_attention_forward_bf16(qwen3_model_t *model, qwen3_layer_t *la
                 if (iris_gpu_causal_attention_bf16(attn_out, q, k, v, attention_mask,
                                                     seq_len, num_heads, num_kv_heads,
                                                     head_dim, scale)) {
-                    iris_gpu_tensor_free(q);
-                    iris_gpu_tensor_free(k);
-                    iris_gpu_tensor_free(v);
+                    iris_gpu_tensor_free(q); q = NULL;
+                    iris_gpu_tensor_free(k); k = NULL;
+                    iris_gpu_tensor_free(v); v = NULL;
 
                     /* Output projection on GPU - input already bf16 */
                     iris_gpu_tensor_t out = iris_gpu_linear_bf16_native(attn_out, layer->attn.o_proj_weight_bf16,
