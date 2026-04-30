@@ -140,33 +140,6 @@ static void vae_conv2d(float *out, const float *in,
                 H, W, kH, kW, stride, padding);
 }
 
-/* FLUX.2 VAE uses asymmetric padding for stride-2 downsampling convolutions:
- * pad right and bottom by 1, then do a VALID 3x3/stride-2 conv.
- *
- * This matches the reference implementation (e.g. diffusers' Downsample2D)
- * and avoids a ~7px top/left shift that shows up as a border in img2img. */
-static void vae_pad_right_bottom(float *out, const float *in,
-                                 int batch, int channels, int H, int W) {
-    int Hp = H + 1;
-    int Wp = W + 1;
-    size_t in_plane = (size_t)H * (size_t)W;
-    size_t out_plane = (size_t)Hp * (size_t)Wp;
-
-    memset(out, 0, (size_t)batch * (size_t)channels * out_plane * sizeof(float));
-
-    for (int b = 0; b < batch; b++) {
-        for (int c = 0; c < channels; c++) {
-            const float *src = in + ((size_t)b * (size_t)channels + (size_t)c) * in_plane;
-            float *dst = out + ((size_t)b * (size_t)channels + (size_t)c) * out_plane;
-            for (int y = 0; y < H; y++) {
-                memcpy(dst + (size_t)y * (size_t)Wp,
-                       src + (size_t)y * (size_t)W,
-                       (size_t)W * sizeof(float));
-            }
-        }
-    }
-}
-
 /* Single-head self-attention over spatial dimensions. Reshapes [C,H,W]
  * to [C, H*W], computes full attention, then reshapes back. Used only in
  * the bottleneck (mid_block) of both encoder and decoder, where the spatial
@@ -698,7 +671,7 @@ static float *vae_encode_gpu(iris_vae_t *vae, const float *img,
                 iris_vae_progress_callback(progress++, total_blocks);
         }
 
-        /* Downsample (except last level) — asymmetric padding needs CPU */
+        /* Downsample (except last level) — asymmetric padding on GPU */
         if (level < 3) {
             vae_downsample_t *ds = &vae->enc_downsample[down_idx++];
             int padded_h = cur_h + 1;
@@ -706,21 +679,11 @@ static float *vae_encode_gpu(iris_vae_t *vae, const float *img,
             int new_h = (padded_h - 3) / 2 + 1;
             int new_w = (padded_w - 3) / 2 + 1;
 
-            /* Read tensor back for asymmetric padding (only 3 times total) */
-            float *cpu_buf = vae->work1;
-
-            iris_gpu_batch_end();
-            iris_gpu_tensor_read(x, cpu_buf);
+            /* GPU-resident asymmetric padding — no CPU round-trip */
+            iris_gpu_tensor_t padded = iris_gpu_pad_right_bottom(x, ch_out, cur_h, cur_w);
             iris_gpu_tensor_free(x);
-
-            float *padded = vae->work3;
-            vae_pad_right_bottom(padded, cpu_buf, batch, ch_out, cur_h, cur_w);
-
-            size_t padded_size = (size_t)batch * ch_out * padded_h * padded_w;
-            x = iris_gpu_tensor_create(padded, padded_size);
-            if (!x) return NULL;
-
-            iris_gpu_batch_begin();
+            if (!padded) { iris_gpu_batch_end(); return NULL; }
+            x = padded;
 
             /* Stride-2 conv with padding=0 (padding already applied) */
             t = vae_gpu_conv2d(x, ds->conv_weight, ds->conv_bias,

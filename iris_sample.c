@@ -196,6 +196,14 @@ extern float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
                                        const float *txt_emb, int txt_seq,
                                        float timestep);
 
+/* CFG-optimized forward: shared pre-block computation for both passes */
+extern float *iris_transformer_forward_cfg_flux(iris_transformer_flux_t *tf,
+                                       const float *img_latent, int img_h, int img_w,
+                                       const float *txt_emb_cond, int txt_seq_cond,
+                                       const float *txt_emb_uncond, int txt_seq_uncond,
+                                       float guidance_scale,
+                                       float timestep);
+
 /* Z-Image transformer */
 typedef struct zi_transformer zi_transformer_t;
 extern float *iris_transformer_forward_zimage(zi_transformer_t *tf,
@@ -912,10 +920,12 @@ float *iris_sample_euler_multirefs_flux(void *transformer, void *text_encoder,
  * ======================================================================== */
 
 /* Euler sampler with Classifier-Free Guidance for Flux base models.
- * Each step runs the transformer twice: once with empty prompt (unconditional)
- * and once with real prompt (conditional). Combined as
- * v = v_uncond + guidance_scale * (v_cond - v_uncond), which steers
- * generation toward the prompt at the cost of 2x compute per step. */
+ * Uses the CFG-optimized transformer forward that shares computation
+ * (timestep embedding, SiLU, AdaLN modulation, image transpose, image
+ * input projection) between the unconditional and conditional passes.
+ * The combined velocity v = v_uncond + scale * (v_cond - v_uncond) is
+ * computed inside the transformer forward, so only one velocity buffer
+ * is returned per step. */
 float *iris_sample_euler_cfg_flux(void *transformer, void *text_encoder,
                               float *z, int batch, int channels, int h, int w,
                               const float *text_emb_cond, int text_seq_cond,
@@ -946,35 +956,22 @@ float *iris_sample_euler_cfg_flux(void *transformer, void *text_encoder,
         if (iris_step_callback)
             iris_step_callback(step + 1, num_steps);
 
-        /* Unconditioned prediction */
-        float *v_uncond = iris_transformer_forward_flux(tf, z_curr, h, w,
-                                                    text_emb_uncond, text_seq_uncond,
-                                                    t_curr);
-        if (!v_uncond) {
+        /* CFG-optimized forward: shared pre-block work, two text passes,
+         * combined output = v_uncond + scale * (v_cond - v_uncond) */
+        float *v_combined = iris_transformer_forward_cfg_flux(tf, z_curr, h, w,
+                                                              text_emb_cond, text_seq_cond,
+                                                              text_emb_uncond, text_seq_uncond,
+                                                              guidance_scale, t_curr);
+        if (!v_combined) {
             free(z_curr);
             iris_transformer_free_mmap_cache_flux(tf);
             return NULL;
         }
 
-        /* Conditioned prediction */
-        float *v_cond = iris_transformer_forward_flux(tf, z_curr, h, w,
-                                                  text_emb_cond, text_seq_cond,
-                                                  t_curr);
-        if (!v_cond) {
-            free(v_uncond);
-            free(z_curr);
-            iris_transformer_free_mmap_cache_flux(tf);
-            return NULL;
-        }
+        /* Euler step: z_next = z_curr + dt * v */
+        iris_axpy(z_curr, dt, v_combined, latent_size);
 
-        /* CFG combine: v = v_uncond + scale * (v_cond - v_uncond) */
-        for (int i = 0; i < latent_size; i++) {
-            float v = v_uncond[i] + guidance_scale * (v_cond[i] - v_uncond[i]);
-            z_curr[i] += dt * v;
-        }
-
-        free(v_uncond);
-        free(v_cond);
+        free(v_combined);
 
         step_times[step] = get_time_ms() - step_start;
 

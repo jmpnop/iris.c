@@ -4489,6 +4489,750 @@ error:
 }
 
 /* ========================================================================
+ * CFG-Optimized Transformer Forward (shared pre-block computation)
+ * ======================================================================== */
+
+/*
+ * Classifier-Free Guidance forward pass that shares computation between
+ * the unconditional and conditional passes.
+ *
+ * In standard CFG, the transformer runs twice per step with the same
+ * z_curr and timestep but different text embeddings. Several operations
+ * are redundant between the two passes:
+ *   - Timestep embedding (get_timestep_embedding + time_embed_forward)
+ *   - SiLU(t_emb)
+ *   - AdaLN modulation (linear projection from t_emb_silu)
+ *   - NCHW->NLC transpose of the image latent
+ *   - Image input projection (img_in_weight @ img_transposed)
+ *
+ * This function computes these shared operations once, then runs the
+ * text-dependent part (text projection + block loop + final layer)
+ * twice with different text embeddings, and combines the outputs with
+ * the CFG formula: v = v_uncond + scale * (v_cond - v_uncond).
+ *
+ * Returns a single combined velocity in NCHW format. Caller must free.
+ */
+float *iris_transformer_forward_cfg_flux(iris_transformer_flux_t *tf,
+                                         const float *img_latent, int img_h, int img_w,
+                                         const float *txt_emb_cond, int txt_seq_cond,
+                                         const float *txt_emb_uncond, int txt_seq_uncond,
+                                         float guidance_scale,
+                                         float timestep) {
+    int hidden = tf->hidden_size;
+    int img_seq = img_h * img_w;
+
+    /* Use the larger text sequence for buffer allocation */
+    int max_txt_seq = txt_seq_cond > txt_seq_uncond ? txt_seq_cond : txt_seq_uncond;
+    int max_total_seq = img_seq + max_txt_seq;
+
+    /* Ensure work buffers are sized for the larger pass */
+    if (ensure_work_buffers(tf, max_total_seq) < 0) {
+        fprintf(stderr, "Failed to allocate work buffers for seq_len=%d\n", max_total_seq);
+        return NULL;
+    }
+    if (ensure_attn_scores(tf, img_seq, max_txt_seq) < 0) {
+        fprintf(stderr, "Failed to allocate attention scores buffer\n");
+        return NULL;
+    }
+    if (ensure_forward_buffers(tf, img_seq, max_total_seq) < 0) {
+        fprintf(stderr, "Failed to allocate forward buffers\n");
+        return NULL;
+    }
+
+    /* ---- SHARED COMPUTATION (done once for both passes) ---- */
+
+    /* 1. Timestep embedding */
+    int sincos_dim = tf->time_embed.sincos_dim;
+    float *t_emb = tf->fwd_t_emb;
+    float t_sincos[256];
+    get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
+    time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
+
+    /* 2. Image RoPE cache (depends only on image dimensions) */
+    float *img_rope_cos, *img_rope_sin;
+    get_cached_img_rope(tf, img_h, img_w, &img_rope_cos, &img_rope_sin);
+
+    /* 3. NCHW->NLC transpose of image latent */
+    int channels = tf->latent_channels;
+    float *img_transposed = tf->fwd_img_transposed;
+    for (int pos = 0; pos < img_seq; pos++) {
+        for (int c = 0; c < channels; c++) {
+            img_transposed[pos * channels + c] = img_latent[c * img_seq + pos];
+        }
+    }
+
+    /* 4. SiLU(t_emb) -- reused by double blocks, single blocks, and final layer */
+    memcpy(tf->t_emb_silu, t_emb, hidden * sizeof(float));
+    iris_silu(tf->t_emb_silu, hidden);
+
+    /* 5. AdaLN double-block modulation (depends only on t_emb_silu) */
+    int double_mod_size = hidden * 6;
+    iris_linear_nobias(tf->double_mod_img, tf->t_emb_silu, tf->adaln_double_img_weight,
+                       1, hidden, double_mod_size);
+    iris_linear_nobias(tf->double_mod_txt, tf->t_emb_silu, tf->adaln_double_txt_weight,
+                       1, hidden, double_mod_size);
+
+    /* 6. Image input projection (the big shared GEMM: [img_seq, 128] -> [img_seq, 3072]) */
+    float *img_hidden = tf->img_hidden;
+
+    /* Declare output and save buffers before any goto-error-capable macro */
+    float *saved_img_hidden = NULL;
+    float *v_uncond = NULL;
+    float *v_cond = NULL;
+    int latent_out_size = img_seq * tf->latent_channels;
+
+#ifdef USE_METAL
+    /* For the bf16 GPU path, we try it per-pass below since it's self-contained.
+     * The f32 image projection is only needed for the CPU/f32-GPU paths. */
+    int bf16_available = iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16;
+    if (!bf16_available) {
+#endif
+        LINEAR_BF16_OR_F32(img_hidden, img_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
+                           img_seq, tf->latent_channels, hidden);
+#ifdef USE_METAL
+    }
+#endif
+
+    /* Save img_hidden for the second pass -- the block loop modifies it in place. */
+    saved_img_hidden = (float *)malloc((size_t)img_seq * hidden * sizeof(float));
+    if (!saved_img_hidden) {
+        fprintf(stderr, "Failed to allocate saved_img_hidden\n");
+        return NULL;
+    }
+
+#ifdef USE_METAL
+    if (!bf16_available) {
+#endif
+        memcpy(saved_img_hidden, img_hidden, (size_t)img_seq * hidden * sizeof(float));
+#ifdef USE_METAL
+    }
+#endif
+
+    /* ==== PASS 1: UNCONDITIONAL (empty/null text) ==== */
+    {
+        int txt_seq = txt_seq_uncond;
+        const float *txt_emb = txt_emb_uncond;
+        int total_seq = img_seq + txt_seq;
+
+        /* Text RoPE for this pass */
+        float *txt_rope_cos, *txt_rope_sin;
+        get_cached_txt_rope(tf, txt_seq, &txt_rope_cos, &txt_rope_sin);
+
+#ifdef USE_METAL
+        if (bf16_available) {
+            /* BF16 path: self-contained, does its own projections on GPU */
+            v_uncond = iris_transformer_forward_bf16_flux(tf, img_transposed, img_seq,
+                                                          img_seq,
+                                                          txt_emb, txt_seq, t_emb,
+                                                          img_rope_cos, img_rope_sin,
+                                                          txt_rope_cos, txt_rope_sin);
+            if (!v_uncond) {
+                BF16_DEBUG("[BF16-CFG] bf16 uncond pass failed, falling back\n");
+                /* Fall through to f32 path by recomputing img projection */
+                LINEAR_BF16_OR_F32(img_hidden, img_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
+                                   img_seq, tf->latent_channels, hidden);
+                memcpy(saved_img_hidden, img_hidden, (size_t)img_seq * hidden * sizeof(float));
+            }
+        }
+
+        if (!v_uncond) {
+#else
+        {
+#endif
+            /* Text input projection */
+            float *txt_hidden = tf->txt_hidden;
+            LINEAR_BF16_OR_F32(txt_hidden, txt_emb, tf->txt_in_weight, tf->txt_in_weight_bf16,
+                               txt_seq, tf->text_dim, hidden);
+
+            /* Double-stream blocks */
+            double double_start = tf_get_time_ms();
+
+#ifdef USE_METAL
+            int double_gpu_done = 0;
+            iris_gpu_tensor_t double_img_gpu = NULL;
+            iris_gpu_tensor_t double_txt_gpu = NULL;
+
+            if (iris_metal_available() && iris_metal_shaders_available() && !tf->use_mmap &&
+                tf->double_blocks[0].img_q_weight_bf16) {
+                iris_gpu_tensor_t img_gpu = iris_gpu_tensor_create(img_hidden, (size_t)img_seq * hidden);
+                iris_gpu_tensor_t txt_gpu = iris_gpu_tensor_create(txt_hidden, (size_t)txt_seq * hidden);
+                if (img_gpu && txt_gpu) {
+                    iris_gpu_tensor_set_persistent(img_gpu, 1);
+                    iris_gpu_tensor_set_persistent(txt_gpu, 1);
+
+                    double_block_gpu_scratch_t db_scratch;
+                    int scratch_ok = double_block_gpu_scratch_init(&db_scratch, img_seq, txt_seq,
+                                                                    hidden, tf->mlp_hidden);
+                    iris_gpu_batch_begin();
+
+                    for (int i = 0; i < tf->num_double_layers; i++) {
+                        if (!double_block_forward_gpu_chained(img_gpu, txt_gpu,
+                                                              &tf->double_blocks[i],
+                                                              tf->double_mod_img, tf->double_mod_txt,
+                                                              img_rope_cos, img_rope_sin,
+                                                              txt_rope_cos, txt_rope_sin,
+                                                              img_seq, txt_seq, tf,
+                                                              scratch_ok ? &db_scratch : NULL)) {
+                            iris_gpu_batch_end();
+                            iris_gpu_tensor_read(img_gpu, img_hidden);
+                            iris_gpu_tensor_read(txt_gpu, txt_hidden);
+                            iris_gpu_tensor_free(img_gpu);
+                            iris_gpu_tensor_free(txt_gpu);
+                            double_img_gpu = NULL;
+                            double_txt_gpu = NULL;
+                            break;
+                        }
+                        double_gpu_done = i + 1;
+                    }
+
+                    if (scratch_ok) double_block_gpu_scratch_free(&db_scratch);
+
+                    if (double_gpu_done == tf->num_double_layers) {
+                        iris_gpu_batch_end();
+                        double_img_gpu = img_gpu;
+                        double_txt_gpu = txt_gpu;
+                    }
+                } else {
+                    if (img_gpu) iris_gpu_tensor_free(img_gpu);
+                    if (txt_gpu) iris_gpu_tensor_free(txt_gpu);
+                }
+            }
+
+            if (double_gpu_done < tf->num_double_layers) {
+                for (int i = double_gpu_done; i < tf->num_double_layers; i++) {
+#else
+            {
+                for (int i = 0; i < tf->num_double_layers; i++) {
+#endif
+                    if (tf->use_mmap && tf->double_blocks[i].img_q_weight == NULL
+                                     && tf->double_blocks[i].img_q_weight_bf16 == NULL) {
+                        load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
+                                                  tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+                    }
+                    double_block_forward(img_hidden, txt_hidden,
+                                         &tf->double_blocks[i],
+                                         tf->double_mod_img, tf->double_mod_txt,
+                                         img_rope_cos, img_rope_sin,
+                                         txt_rope_cos, txt_rope_sin,
+                                         img_seq, txt_seq, tf);
+                    if (tf->use_mmap) free_double_block_weights(&tf->double_blocks[i]);
+                }
+            }
+
+            double double_time = tf_get_time_ms() - double_start;
+
+            /* Concatenate text and image for single-stream blocks: [txt, img] */
+            float *concat_hidden = tf->fwd_concat_hidden;
+
+            double single_start = tf_get_time_ms();
+
+#ifdef USE_METAL
+            int gpu_chained_ok = 0;
+            iris_gpu_tensor_t concat_hidden_gpu = NULL;
+
+            if (double_img_gpu && double_txt_gpu) {
+                concat_hidden_gpu = iris_gpu_tensor_alloc((size_t)total_seq * hidden);
+                if (concat_hidden_gpu) {
+                    iris_gpu_copy_region_f32(concat_hidden_gpu, 0,
+                                              double_txt_gpu, 0, (size_t)txt_seq * hidden);
+                    iris_gpu_copy_region_f32(concat_hidden_gpu, (size_t)txt_seq * hidden,
+                                              double_img_gpu, 0, (size_t)img_seq * hidden);
+                    iris_gpu_tensor_set_persistent(concat_hidden_gpu, 1);
+                    gpu_chained_ok = 1;
+                } else {
+                    iris_gpu_tensor_read(double_img_gpu, img_hidden);
+                    iris_gpu_tensor_read(double_txt_gpu, txt_hidden);
+                }
+                iris_gpu_tensor_free(double_img_gpu);
+                iris_gpu_tensor_free(double_txt_gpu);
+                double_img_gpu = NULL;
+                double_txt_gpu = NULL;
+            }
+
+            if (!gpu_chained_ok) {
+#else
+            {
+#endif
+                memcpy(concat_hidden, txt_hidden, (size_t)txt_seq * hidden * sizeof(float));
+                memcpy(concat_hidden + txt_seq * hidden, img_hidden,
+                       (size_t)img_seq * hidden * sizeof(float));
+            }
+
+#ifdef USE_METAL
+            if (!gpu_chained_ok &&
+                iris_metal_available() && iris_metal_shaders_available() && !tf->use_mmap) {
+                concat_hidden_gpu = iris_gpu_tensor_create(concat_hidden, (size_t)total_seq * hidden);
+                if (concat_hidden_gpu) {
+                    iris_gpu_tensor_set_persistent(concat_hidden_gpu, 1);
+                    gpu_chained_ok = 1;
+                }
+            }
+
+            if (gpu_chained_ok && concat_hidden_gpu) {
+                int mod_size = hidden * 3;
+                int fused_dim = hidden * 3 + tf->mlp_hidden * 2;
+                float *mod_params = tf->work2 + total_seq * fused_dim;
+                iris_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
+                float *precomputed_shift = mod_params;
+                float *precomputed_scale = mod_params + hidden;
+                float *precomputed_gate = mod_params + hidden * 2;
+
+                iris_gpu_batch_begin();
+
+                single_block_gpu_scratch_t scratch;
+                int scratch_ok = single_block_gpu_scratch_init(&scratch, total_seq, hidden, tf->mlp_hidden);
+
+                for (int i = 0; i < tf->num_single_layers && gpu_chained_ok; i++) {
+                    if (!single_block_forward_gpu_chained(concat_hidden_gpu, &tf->single_blocks[i],
+                                                            precomputed_shift, precomputed_scale, precomputed_gate,
+                                                            img_rope_cos, img_rope_sin,
+                                                            txt_rope_cos, txt_rope_sin,
+                                                            total_seq, txt_seq, tf,
+                                                            scratch_ok ? &scratch : NULL)) {
+                        gpu_chained_ok = 0;
+                        iris_gpu_batch_end();
+                        iris_gpu_tensor_read(concat_hidden_gpu, concat_hidden);
+                    }
+                }
+
+                if (scratch_ok) single_block_gpu_scratch_free(&scratch);
+
+                if (gpu_chained_ok) {
+                    iris_gpu_batch_end();
+                    iris_gpu_tensor_read(concat_hidden_gpu, concat_hidden);
+                }
+
+                iris_gpu_tensor_free(concat_hidden_gpu);
+                concat_hidden_gpu = NULL;
+            }
+
+            if (!gpu_chained_ok) {
+#endif
+                {
+                    int fb_mod_size = hidden * 3;
+                    int fb_fused_dim = hidden * 3 + tf->mlp_hidden * 2;
+                    float *fb_mod_params = tf->work2 + total_seq * fb_fused_dim;
+                    iris_linear_nobias(fb_mod_params, tf->t_emb_silu, tf->adaln_single_weight,
+                                       1, hidden, fb_mod_size);
+                    float *fb_shift = fb_mod_params;
+                    float *fb_scale = fb_mod_params + hidden;
+                    float *fb_gate  = fb_mod_params + hidden * 2;
+
+#ifdef USE_METAL
+                    single_block_gpu_scratch_t fb_scratch;
+                    int fb_scratch_ok = single_block_gpu_scratch_init(&fb_scratch, total_seq, hidden, tf->mlp_hidden);
+#endif
+
+                    for (int i = 0; i < tf->num_single_layers; i++) {
+                        if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
+                                         && tf->single_blocks[i].qkv_mlp_weight_bf16 == NULL) {
+                            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
+                                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+                        }
+#ifdef USE_METAL
+                        if (!single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
+                                                      t_emb, tf->adaln_single_weight,
+                                                      img_rope_cos, img_rope_sin,
+                                                      txt_rope_cos, txt_rope_sin,
+                                                      total_seq, txt_seq, tf,
+                                                      fb_shift, fb_scale, fb_gate,
+                                                      fb_scratch_ok ? &fb_scratch : NULL))
+#endif
+                        {
+                            single_block_forward(concat_hidden, &tf->single_blocks[i],
+                                                 t_emb, tf->adaln_single_weight,
+                                                 img_rope_cos, img_rope_sin,
+                                                 txt_rope_cos, txt_rope_sin,
+                                                 total_seq, txt_seq, tf,
+                                                 fb_shift, fb_scale, fb_gate);
+                        }
+                        if (tf->use_mmap) free_single_block_weights(&tf->single_blocks[i]);
+                    }
+#ifdef USE_METAL
+                    if (fb_scratch_ok) single_block_gpu_scratch_free(&fb_scratch);
+#endif
+                }
+#ifdef USE_METAL
+            }
+#endif
+
+            double single_time = tf_get_time_ms() - single_start;
+
+            /* Extract image hidden states */
+            memcpy(img_hidden, concat_hidden + txt_seq * hidden, (size_t)img_seq * hidden * sizeof(float));
+
+            /* Final layer */
+            double final_start = tf_get_time_ms();
+
+            float *final_mod = tf->double_mod_img;  /* Reuse (needs hidden*2, has hidden*6) */
+            iris_linear_nobias(final_mod, tf->t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
+
+            float *final_scale = final_mod;
+            float *final_shift = final_mod + hidden;
+
+            float *final_norm = tf->work1;
+            apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
+
+            float *output_nlc = tf->fwd_output_nlc;
+            LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
+                               img_seq, hidden, tf->latent_channels);
+
+            /* NLC -> NCHW transpose */
+            v_uncond = (float *)malloc(latent_out_size * sizeof(float));
+            if (!v_uncond) {
+                free(saved_img_hidden);
+                return NULL;
+            }
+            for (int pos = 0; pos < img_seq; pos++) {
+                for (int c = 0; c < channels; c++) {
+                    v_uncond[c * img_seq + pos] = output_nlc[pos * channels + c];
+                }
+            }
+
+            double final_time = tf_get_time_ms() - final_start;
+
+            iris_timing_transformer_double += double_time;
+            iris_timing_transformer_single += single_time;
+            iris_timing_transformer_final += final_time;
+            iris_timing_transformer_total += double_time + single_time + final_time;
+        }
+
+#ifdef USE_METAL
+        iris_gpu_sync();
+#endif
+    }
+
+    /* ==== Restore shared state for PASS 2 ==== */
+
+    /* Restore img_hidden from saved copy */
+#ifdef USE_METAL
+    if (!bf16_available) {
+#endif
+        memcpy(img_hidden, saved_img_hidden, (size_t)img_seq * hidden * sizeof(float));
+
+        /* Recompute double_mod_img since final layer overwrote it */
+        iris_linear_nobias(tf->double_mod_img, tf->t_emb_silu, tf->adaln_double_img_weight,
+                           1, hidden, double_mod_size);
+        /* double_mod_txt was never overwritten -- still valid */
+#ifdef USE_METAL
+    }
+#endif
+
+    /* ==== PASS 2: CONDITIONAL (real prompt) ==== */
+    {
+        int txt_seq = txt_seq_cond;
+        const float *txt_emb = txt_emb_cond;
+        int total_seq = img_seq + txt_seq;
+
+        /* Text RoPE for this pass */
+        float *txt_rope_cos, *txt_rope_sin;
+        get_cached_txt_rope(tf, txt_seq, &txt_rope_cos, &txt_rope_sin);
+
+#ifdef USE_METAL
+        if (bf16_available) {
+            v_cond = iris_transformer_forward_bf16_flux(tf, img_transposed, img_seq,
+                                                        img_seq,
+                                                        txt_emb, txt_seq, t_emb,
+                                                        img_rope_cos, img_rope_sin,
+                                                        txt_rope_cos, txt_rope_sin);
+            if (!v_cond) {
+                BF16_DEBUG("[BF16-CFG] bf16 cond pass failed, falling back\n");
+                /* Fall through to f32 path */
+                LINEAR_BF16_OR_F32(img_hidden, img_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
+                                   img_seq, tf->latent_channels, hidden);
+                /* Recompute double mods (they may have been overwritten in pass 1) */
+                iris_linear_nobias(tf->double_mod_img, tf->t_emb_silu, tf->adaln_double_img_weight,
+                                   1, hidden, double_mod_size);
+            }
+        }
+
+        if (!v_cond) {
+#else
+        {
+#endif
+            /* Text input projection */
+            float *txt_hidden = tf->txt_hidden;
+            LINEAR_BF16_OR_F32(txt_hidden, txt_emb, tf->txt_in_weight, tf->txt_in_weight_bf16,
+                               txt_seq, tf->text_dim, hidden);
+
+            /* Double-stream blocks */
+            double double_start = tf_get_time_ms();
+
+#ifdef USE_METAL
+            int double_gpu_done = 0;
+            iris_gpu_tensor_t double_img_gpu = NULL;
+            iris_gpu_tensor_t double_txt_gpu = NULL;
+
+            if (iris_metal_available() && iris_metal_shaders_available() && !tf->use_mmap &&
+                tf->double_blocks[0].img_q_weight_bf16) {
+                iris_gpu_tensor_t img_gpu = iris_gpu_tensor_create(img_hidden, (size_t)img_seq * hidden);
+                iris_gpu_tensor_t txt_gpu = iris_gpu_tensor_create(txt_hidden, (size_t)txt_seq * hidden);
+                if (img_gpu && txt_gpu) {
+                    iris_gpu_tensor_set_persistent(img_gpu, 1);
+                    iris_gpu_tensor_set_persistent(txt_gpu, 1);
+
+                    double_block_gpu_scratch_t db_scratch;
+                    int scratch_ok = double_block_gpu_scratch_init(&db_scratch, img_seq, txt_seq,
+                                                                    hidden, tf->mlp_hidden);
+                    iris_gpu_batch_begin();
+
+                    for (int i = 0; i < tf->num_double_layers; i++) {
+                        if (!double_block_forward_gpu_chained(img_gpu, txt_gpu,
+                                                              &tf->double_blocks[i],
+                                                              tf->double_mod_img, tf->double_mod_txt,
+                                                              img_rope_cos, img_rope_sin,
+                                                              txt_rope_cos, txt_rope_sin,
+                                                              img_seq, txt_seq, tf,
+                                                              scratch_ok ? &db_scratch : NULL)) {
+                            iris_gpu_batch_end();
+                            iris_gpu_tensor_read(img_gpu, img_hidden);
+                            iris_gpu_tensor_read(txt_gpu, txt_hidden);
+                            iris_gpu_tensor_free(img_gpu);
+                            iris_gpu_tensor_free(txt_gpu);
+                            double_img_gpu = NULL;
+                            double_txt_gpu = NULL;
+                            break;
+                        }
+                        double_gpu_done = i + 1;
+                    }
+
+                    if (scratch_ok) double_block_gpu_scratch_free(&db_scratch);
+
+                    if (double_gpu_done == tf->num_double_layers) {
+                        iris_gpu_batch_end();
+                        double_img_gpu = img_gpu;
+                        double_txt_gpu = txt_gpu;
+                    }
+                } else {
+                    if (img_gpu) iris_gpu_tensor_free(img_gpu);
+                    if (txt_gpu) iris_gpu_tensor_free(txt_gpu);
+                }
+            }
+
+            if (double_gpu_done < tf->num_double_layers) {
+                for (int i = double_gpu_done; i < tf->num_double_layers; i++) {
+#else
+            {
+                for (int i = 0; i < tf->num_double_layers; i++) {
+#endif
+                    if (tf->use_mmap && tf->double_blocks[i].img_q_weight == NULL
+                                     && tf->double_blocks[i].img_q_weight_bf16 == NULL) {
+                        load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
+                                                  tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+                    }
+                    double_block_forward(img_hidden, txt_hidden,
+                                         &tf->double_blocks[i],
+                                         tf->double_mod_img, tf->double_mod_txt,
+                                         img_rope_cos, img_rope_sin,
+                                         txt_rope_cos, txt_rope_sin,
+                                         img_seq, txt_seq, tf);
+                    if (tf->use_mmap) free_double_block_weights(&tf->double_blocks[i]);
+                }
+            }
+
+            double double_time = tf_get_time_ms() - double_start;
+
+            /* Concatenate text and image for single-stream blocks: [txt, img] */
+            float *concat_hidden = tf->fwd_concat_hidden;
+
+            double single_start = tf_get_time_ms();
+
+#ifdef USE_METAL
+            int gpu_chained_ok = 0;
+            iris_gpu_tensor_t concat_hidden_gpu = NULL;
+
+            if (double_img_gpu && double_txt_gpu) {
+                concat_hidden_gpu = iris_gpu_tensor_alloc((size_t)total_seq * hidden);
+                if (concat_hidden_gpu) {
+                    iris_gpu_copy_region_f32(concat_hidden_gpu, 0,
+                                              double_txt_gpu, 0, (size_t)txt_seq * hidden);
+                    iris_gpu_copy_region_f32(concat_hidden_gpu, (size_t)txt_seq * hidden,
+                                              double_img_gpu, 0, (size_t)img_seq * hidden);
+                    iris_gpu_tensor_set_persistent(concat_hidden_gpu, 1);
+                    gpu_chained_ok = 1;
+                } else {
+                    iris_gpu_tensor_read(double_img_gpu, img_hidden);
+                    iris_gpu_tensor_read(double_txt_gpu, txt_hidden);
+                }
+                iris_gpu_tensor_free(double_img_gpu);
+                iris_gpu_tensor_free(double_txt_gpu);
+                double_img_gpu = NULL;
+                double_txt_gpu = NULL;
+            }
+
+            if (!gpu_chained_ok) {
+#else
+            {
+#endif
+                memcpy(concat_hidden, txt_hidden, (size_t)txt_seq * hidden * sizeof(float));
+                memcpy(concat_hidden + txt_seq * hidden, img_hidden,
+                       (size_t)img_seq * hidden * sizeof(float));
+            }
+
+#ifdef USE_METAL
+            if (!gpu_chained_ok &&
+                iris_metal_available() && iris_metal_shaders_available() && !tf->use_mmap) {
+                concat_hidden_gpu = iris_gpu_tensor_create(concat_hidden, (size_t)total_seq * hidden);
+                if (concat_hidden_gpu) {
+                    iris_gpu_tensor_set_persistent(concat_hidden_gpu, 1);
+                    gpu_chained_ok = 1;
+                }
+            }
+
+            if (gpu_chained_ok && concat_hidden_gpu) {
+                int mod_size = hidden * 3;
+                int fused_dim = hidden * 3 + tf->mlp_hidden * 2;
+                float *mod_params = tf->work2 + total_seq * fused_dim;
+                iris_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
+                float *precomputed_shift = mod_params;
+                float *precomputed_scale = mod_params + hidden;
+                float *precomputed_gate = mod_params + hidden * 2;
+
+                iris_gpu_batch_begin();
+
+                single_block_gpu_scratch_t scratch;
+                int scratch_ok = single_block_gpu_scratch_init(&scratch, total_seq, hidden, tf->mlp_hidden);
+
+                for (int i = 0; i < tf->num_single_layers && gpu_chained_ok; i++) {
+                    if (!single_block_forward_gpu_chained(concat_hidden_gpu, &tf->single_blocks[i],
+                                                            precomputed_shift, precomputed_scale, precomputed_gate,
+                                                            img_rope_cos, img_rope_sin,
+                                                            txt_rope_cos, txt_rope_sin,
+                                                            total_seq, txt_seq, tf,
+                                                            scratch_ok ? &scratch : NULL)) {
+                        gpu_chained_ok = 0;
+                        iris_gpu_batch_end();
+                        iris_gpu_tensor_read(concat_hidden_gpu, concat_hidden);
+                    }
+                }
+
+                if (scratch_ok) single_block_gpu_scratch_free(&scratch);
+
+                if (gpu_chained_ok) {
+                    iris_gpu_batch_end();
+                    iris_gpu_tensor_read(concat_hidden_gpu, concat_hidden);
+                }
+
+                iris_gpu_tensor_free(concat_hidden_gpu);
+                concat_hidden_gpu = NULL;
+            }
+
+            if (!gpu_chained_ok) {
+#endif
+                {
+                    int fb_mod_size = hidden * 3;
+                    int fb_fused_dim = hidden * 3 + tf->mlp_hidden * 2;
+                    float *fb_mod_params = tf->work2 + total_seq * fb_fused_dim;
+                    iris_linear_nobias(fb_mod_params, tf->t_emb_silu, tf->adaln_single_weight,
+                                       1, hidden, fb_mod_size);
+                    float *fb_shift = fb_mod_params;
+                    float *fb_scale = fb_mod_params + hidden;
+                    float *fb_gate  = fb_mod_params + hidden * 2;
+
+#ifdef USE_METAL
+                    single_block_gpu_scratch_t fb_scratch;
+                    int fb_scratch_ok = single_block_gpu_scratch_init(&fb_scratch, total_seq, hidden, tf->mlp_hidden);
+#endif
+
+                    for (int i = 0; i < tf->num_single_layers; i++) {
+                        if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
+                                         && tf->single_blocks[i].qkv_mlp_weight_bf16 == NULL) {
+                            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
+                                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+                        }
+#ifdef USE_METAL
+                        if (!single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
+                                                      t_emb, tf->adaln_single_weight,
+                                                      img_rope_cos, img_rope_sin,
+                                                      txt_rope_cos, txt_rope_sin,
+                                                      total_seq, txt_seq, tf,
+                                                      fb_shift, fb_scale, fb_gate,
+                                                      fb_scratch_ok ? &fb_scratch : NULL))
+#endif
+                        {
+                            single_block_forward(concat_hidden, &tf->single_blocks[i],
+                                                 t_emb, tf->adaln_single_weight,
+                                                 img_rope_cos, img_rope_sin,
+                                                 txt_rope_cos, txt_rope_sin,
+                                                 total_seq, txt_seq, tf,
+                                                 fb_shift, fb_scale, fb_gate);
+                        }
+                        if (tf->use_mmap) free_single_block_weights(&tf->single_blocks[i]);
+                    }
+#ifdef USE_METAL
+                    if (fb_scratch_ok) single_block_gpu_scratch_free(&fb_scratch);
+#endif
+                }
+#ifdef USE_METAL
+            }
+#endif
+
+            double single_time = tf_get_time_ms() - single_start;
+
+            /* Extract image hidden states */
+            memcpy(img_hidden, concat_hidden + txt_seq * hidden, (size_t)img_seq * hidden * sizeof(float));
+
+            /* Final layer */
+            double final_start = tf_get_time_ms();
+
+            float *final_mod = tf->double_mod_img;
+            iris_linear_nobias(final_mod, tf->t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
+
+            float *final_scale = final_mod;
+            float *final_shift = final_mod + hidden;
+
+            float *final_norm = tf->work1;
+            apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
+
+            float *output_nlc = tf->fwd_output_nlc;
+            LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
+                               img_seq, hidden, tf->latent_channels);
+
+            /* NLC -> NCHW transpose */
+            v_cond = (float *)malloc(latent_out_size * sizeof(float));
+            if (!v_cond) {
+                free(v_uncond);
+                free(saved_img_hidden);
+                return NULL;
+            }
+            for (int pos = 0; pos < img_seq; pos++) {
+                for (int c = 0; c < channels; c++) {
+                    v_cond[c * img_seq + pos] = output_nlc[pos * channels + c];
+                }
+            }
+
+            double final_time = tf_get_time_ms() - final_start;
+
+            iris_timing_transformer_double += double_time;
+            iris_timing_transformer_single += single_time;
+            iris_timing_transformer_final += final_time;
+            iris_timing_transformer_total += double_time + single_time + final_time;
+        }
+
+#ifdef USE_METAL
+        iris_gpu_sync();
+#endif
+    }
+
+    free(saved_img_hidden);
+
+    /* ==== CFG COMBINE ==== */
+    /* v = v_uncond + guidance_scale * (v_cond - v_uncond)
+     * Reuse v_uncond buffer for the combined output */
+    for (int i = 0; i < latent_out_size; i++) {
+        v_uncond[i] += guidance_scale * (v_cond[i] - v_uncond[i]);
+    }
+    free(v_cond);
+
+    return v_uncond;
+
+error:
+    free(saved_img_hidden);
+    free(v_uncond);
+    return NULL;
+}
+
+/* ========================================================================
  * Transformer Forward with Reference Image Tokens
  * ======================================================================== */
 

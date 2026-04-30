@@ -666,37 +666,37 @@ kernel void apply_rope_2d(
     constant int &heads [[buffer(4)]],
     constant int &head_dim [[buffer(5)]],
     constant int &axis_dim [[buffer(6)]],  // 32 for FLUX
-    uint2 pos [[thread_position_in_grid]]  // (seq_idx, head_idx)
+    uint3 pos [[thread_position_in_grid]]  // (seq_idx, head_idx, pair_idx)
 ) {
     uint seq_idx = pos.x;
     uint head_idx = pos.y;
+    uint pair_idx = pos.z;
 
-    if (seq_idx >= uint(seq) || head_idx >= uint(heads)) return;
+    int half_axis = axis_dim / 2;  // 16
+    int total_pairs = 4 * half_axis;  // 64
+
+    if (seq_idx >= uint(seq) || head_idx >= uint(heads) || pair_idx >= uint(total_pairs)) return;
 
     uint hidden = heads * head_dim;
     device float *vec = x + seq_idx * hidden + head_idx * head_dim;
     device const float *cos_row = cos_freq + seq_idx * head_dim;
     device const float *sin_row = sin_freq + seq_idx * head_dim;
 
-    // RoPE rotation for each axis (4 axes of 32 dims each = 128)
-    int half_axis = axis_dim / 2;  // 16
+    // Map pair_idx to (axis, d) — 4 axes of half_axis pairs each
+    int axis = pair_idx / half_axis;
+    int d = pair_idx % half_axis;
+    int axis_offset = axis * axis_dim;
+    int i0 = axis_offset + d;
+    int i1 = axis_offset + half_axis + d;
 
-    for (int axis = 0; axis < 4; axis++) {
-        int axis_offset = axis * axis_dim;
-        for (int d = 0; d < half_axis; d++) {
-            int i0 = axis_offset + d;
-            int i1 = axis_offset + half_axis + d;
+    float c = cos_row[i0];
+    float s = sin_row[i0];
 
-            float c = cos_row[i0];
-            float s = sin_row[i0];
+    float x0 = vec[i0];
+    float x1 = vec[i1];
 
-            float x0 = vec[i0];
-            float x1 = vec[i1];
-
-            vec[i0] = x0 * c - x1 * s;
-            vec[i1] = x0 * s + x1 * c;
-        }
-    }
+    vec[i0] = x0 * c - x1 * s;
+    vec[i1] = x0 * s + x1 * c;
 }
 
 /* Apply 2D RoPE to bf16 Q or K tensor
@@ -711,29 +711,30 @@ kernel void apply_rope_2d_bf16(
     constant int &heads [[buffer(4)]],
     constant int &head_dim [[buffer(5)]],
     constant int &axis_dim [[buffer(6)]],
-    uint2 pos [[thread_position_in_grid]]
+    uint3 pos [[thread_position_in_grid]]  // (seq_idx, head_idx, pair_idx)
 ) {
     uint seq_idx = pos.x;
     uint head_idx = pos.y;
+    uint pair_idx = pos.z;
 
-    if (seq_idx >= uint(seq) || head_idx >= uint(heads)) return;
+    int half_dim = head_dim / 2;
+
+    if (seq_idx >= uint(seq) || head_idx >= uint(heads) || pair_idx >= uint(half_dim)) return;
 
     uint hidden = heads * head_dim;
     device ushort *vec = x + seq_idx * hidden + head_idx * head_dim;
     device const float *cos_row = cos_freq + seq_idx * head_dim;
     device const float *sin_row = sin_freq + seq_idx * head_dim;
 
-    (void)axis_dim;
-    for (int d = 0; d < head_dim; d += 2) {
-        float c = cos_row[d];
-        float s = sin_row[d];
+    int d = pair_idx * 2;
+    float c = cos_row[d];
+    float s = sin_row[d];
 
-        float x0 = bf16_to_f32(vec[d]);
-        float x1 = bf16_to_f32(vec[d + 1]);
+    float x0 = bf16_to_f32(vec[d]);
+    float x1 = bf16_to_f32(vec[d + 1]);
 
-        vec[d] = f32_to_bf16(x0 * c - x1 * s);
-        vec[d + 1] = f32_to_bf16(x1 * c + x0 * s);
-    }
+    vec[d] = f32_to_bf16(x0 * c - x1 * s);
+    vec[d + 1] = f32_to_bf16(x1 * c + x0 * s);
 }
 
 /* ========================================================================
@@ -753,12 +754,15 @@ kernel void apply_rope_unified(
     constant int &heads [[buffer(7)]],
     constant int &head_dim [[buffer(8)]],
     constant int &axis_dim [[buffer(9)]],
-    uint2 pos [[thread_position_in_grid]]
+    uint3 pos [[thread_position_in_grid]]  // (seq_idx, head_idx, pair_idx)
 ) {
     uint seq_idx = pos.x;
     uint head_idx = pos.y;
+    uint pair_idx = pos.z;
 
-    if (seq_idx >= uint(seq) || head_idx >= uint(heads)) return;
+    int half_dim = head_dim / 2;
+
+    if (seq_idx >= uint(seq) || head_idx >= uint(heads) || pair_idx >= uint(half_dim)) return;
 
     uint hidden = heads * head_dim;
     device float *vec = x + seq_idx * hidden + head_idx * head_dim;
@@ -778,19 +782,18 @@ kernel void apply_rope_unified(
         sin_row = img_sin + img_idx * head_dim;
     }
 
-    // RoPE rotation: apply to consecutive pairs (d, d+1) matching CPU implementation
+    // RoPE rotation: one thread per pair (d, d+1)
     // cos[d] == cos[d+1] due to repeat_interleave in frequency generation
-    for (int d = 0; d < head_dim; d += 2) {
-        float c = cos_row[d];
-        float s = sin_row[d];
+    int d = pair_idx * 2;
+    float c = cos_row[d];
+    float s = sin_row[d];
 
-        float x0 = vec[d];
-        float x1 = vec[d + 1];
+    float x0 = vec[d];
+    float x1 = vec[d + 1];
 
-        // Complex rotation: (x0 + i*x1) * (cos + i*sin)
-        vec[d] = x0 * c - x1 * s;
-        vec[d + 1] = x1 * c + x0 * s;
-    }
+    // Complex rotation: (x0 + i*x1) * (cos + i*sin)
+    vec[d] = x0 * c - x1 * s;
+    vec[d + 1] = x1 * c + x0 * s;
 }
 
 /* ========================================================================
@@ -963,10 +966,12 @@ kernel void attention_fused(
  * [seq_k] score vector never materializes. No sequence length limit.
  *
  * Threadgroup memory: (head_dim + TILE_K + 512) * 4 bytes ≈ 3.5 KB
+ * plus shared_v[8*129] = ~4 KB static for V tiling ≈ 7.5 KB total.
  * (vs up to 30 KB for attention_fused at large seq_k).
  * ======================================================================== */
 
 constant int FLASH_TILE_K = 256;
+constant int FLASH_V_TILE = 8;
 
 kernel void attention_flash(
     device const float *Q [[buffer(0)]],
@@ -991,14 +996,21 @@ kernel void attention_flash(
     uint threads = tg_size.x;
     uint num_simd_groups = (threads + 31) / 32;
 
+    // Guard: shared_v and shared_q are sized for head_dim <= 128
+    if (head_dim > 128) return;
     if (query_idx >= seq_q || head_idx >= num_heads) return;
 
     int hidden = num_heads * head_dim;
+    int v_stride = head_dim + 1;  // Padded stride for bank conflict avoidance
 
     threadgroup float *shared_q      = shared_mem;
     threadgroup float *shared_scores = shared_mem + head_dim;
     threadgroup float *shared_reduce = shared_scores + FLASH_TILE_K;
     // Only 32 slots needed for SIMD reduce (was 256+256 = 512)
+
+    // V tile buffer for coalesced cooperative loading (same pattern as attention_fused)
+    // FLASH_V_TILE rows * (128+1) cols, +1 padding avoids bank conflicts
+    threadgroup float shared_v[FLASH_V_TILE * (128 + 1)];
 
     device const float *q_row = Q + query_idx * hidden + head_idx * head_dim;
     device float *out_row     = out + query_idx * hidden + head_idx * head_dim;
@@ -1082,16 +1094,29 @@ kernel void attention_flash(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         running_sum += shared_reduce[0];
 
-        dim_idx = 0;
-        for (int d = (int)tid; d < head_dim; d += (int)threads) {
-            if (dim_idx >= 16) break;
-            float v_acc = 0.0f;
-            for (int k = 0; k < tile_len; k++) {
-                int key_idx = tile_start + k;
-                v_acc += shared_scores[k] * V_head[key_idx * hidden + d];
+        // V accumulation with shared-memory tiling (same pattern as attention_fused Phase 6)
+        for (int v_tile_start = 0; v_tile_start < tile_len; v_tile_start += FLASH_V_TILE) {
+            int v_tile_size = min(FLASH_V_TILE, tile_len - v_tile_start);
+
+            // Cooperative load: all threads load V[tile_start+v_tile_start : +v_tile_size, :] into shared_v
+            int total_elems = v_tile_size * head_dim;
+            for (int idx = (int)tid; idx < total_elems; idx += (int)threads) {
+                int k = idx / head_dim;
+                int d = idx % head_dim;
+                shared_v[k * v_stride + d] = V_head[(tile_start + v_tile_start + k) * hidden + d];
             }
-            acc[dim_idx] += v_acc;
-            dim_idx++;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Accumulate: each thread processes its assigned dimensions
+            dim_idx = 0;
+            for (int d = (int)tid; d < head_dim; d += (int)threads) {
+                if (dim_idx >= 16) break;
+                for (int k = 0; k < v_tile_size; k++) {
+                    acc[dim_idx] += shared_scores[v_tile_start + k] * shared_v[k * v_stride + d];
+                }
+                dim_idx++;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1142,12 +1167,17 @@ kernel void causal_attention_fused(
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
-    // Guard: shared_scores is fixed at 512 entries
+    // Guard: shared_scores is fixed at 512, shared_q/shared_v sized for head_dim <= 128
     if (seq > 512) return;
+    if (head_dim > 128) return;
 
     // Shared memory for scores and reductions
     threadgroup float shared_scores[512];  // For attention scores (up to 512 seq len)
     threadgroup float shared_reduce[32];
+    // Q cached in threadgroup memory — avoids re-reading from device per key position
+    threadgroup float shared_q[128];   // head_dim is always <= 128
+    // V tile buffer for coalesced cooperative loading (same pattern as attention_fused)
+    threadgroup float shared_v[FUSED_V_TILE * (128 + 1)];  // +1 padding per row to avoid bank conflicts
 
     int query_idx = tg_pos.x;
     int head_idx = tg_pos.y;
@@ -1163,12 +1193,19 @@ kernel void causal_attention_fused(
 
     int q_dim = num_q_heads * head_dim;
     int kv_dim = num_kv_heads * head_dim;
+    int v_stride = head_dim + 1;  // Padded stride for bank conflict avoidance
 
     // Pointers to this head's Q, K, V
     device const float *q_row = Q + query_idx * q_dim + head_idx * head_dim;
     device const float *K_head = K + kv_head_idx * head_dim;
     device const float *V_head = V + kv_head_idx * head_dim;
     device float *out_row = out + query_idx * q_dim + head_idx * head_dim;
+
+    // Cache Q row in threadgroup memory (read once, used for every key position)
+    for (int d = tid; d < head_dim; d += threads) {
+        shared_q[d] = q_row[d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ========== Phase 1: Compute Q @ K^T with causal mask ==========
     // Each thread computes scores for a subset of key positions
@@ -1186,7 +1223,7 @@ kernel void causal_attention_fused(
         float dot = 0.0f;
         device const float *k_row = K_head + key_idx * kv_dim;
         for (int d = 0; d < head_dim; d++) {
-            dot += q_row[d] * k_row[d];
+            dot += shared_q[d] * k_row[d];
         }
         float score = masked ? -INFINITY : (dot * scale);
         shared_scores[key_idx] = score;
@@ -1240,15 +1277,41 @@ kernel void causal_attention_fused(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ========== Phase 6: Compute output = scores @ V ==========
-    // Each thread computes a subset of output dimensions
+    // ========== Phase 6: Compute output = scores @ V (tiled) ==========
     // Masked positions have score==0, so 0*v_val==0 — no branch needed.
-    for (int d = tid; d < head_dim; d += threads) {
-        float acc = 0.0f;
-        for (int key_idx = 0; key_idx < seq; key_idx++) {
-            acc += shared_scores[key_idx] * V_head[key_idx * kv_dim + d];
+    float acc[16] = {0};
+
+    for (int tile_start = 0; tile_start < seq; tile_start += FUSED_V_TILE) {
+        int tile_size = min(FUSED_V_TILE, seq - tile_start);
+
+        // Cooperative load: all threads load V[tile_start:tile_end, :] into
+        // shared_v[tile_size, head_dim] with padded stride. Contiguous device reads across threads.
+        int total_elems = tile_size * head_dim;
+        for (int idx = (int)tid; idx < total_elems; idx += (int)threads) {
+            int k = idx / head_dim;
+            int d = idx % head_dim;
+            shared_v[k * v_stride + d] = V_head[(tile_start + k) * kv_dim + d];
         }
-        out_row[d] = acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate: each thread processes its assigned dimensions
+        int dim_slot = 0;
+        for (int d = (int)tid; d < head_dim; d += (int)threads) {
+            if (dim_slot >= 16) break;
+            for (int k = 0; k < tile_size; k++) {
+                acc[dim_slot] += shared_scores[tile_start + k] * shared_v[k * v_stride + d];
+            }
+            dim_slot++;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write output
+    int dim_slot = 0;
+    for (int d = (int)tid; d < head_dim; d += (int)threads) {
+        if (dim_slot >= 16) break;
+        out_row[d] = acc[dim_slot];
+        dim_slot++;
     }
 }
 
@@ -1799,12 +1862,15 @@ kernel void apply_rope_unified_bf16(
     constant int &heads [[buffer(7)]],
     constant int &head_dim [[buffer(8)]],
     constant int &axis_dim [[buffer(9)]],
-    uint2 pos [[thread_position_in_grid]]
+    uint3 pos [[thread_position_in_grid]]  // (seq_idx, head_idx, pair_idx)
 ) {
     uint seq_idx = pos.x;
     uint head_idx = pos.y;
+    uint pair_idx = pos.z;
 
-    if (seq_idx >= uint(seq) || head_idx >= uint(heads)) return;
+    int half_dim = head_dim / 2;
+
+    if (seq_idx >= uint(seq) || head_idx >= uint(heads) || pair_idx >= uint(half_dim)) return;
 
     uint hidden = heads * head_dim;
     device ushort *vec = x + seq_idx * hidden + head_idx * head_dim;
@@ -1821,16 +1887,15 @@ kernel void apply_rope_unified_bf16(
         sin_row = img_sin + img_idx * head_dim;
     }
 
-    for (int d = 0; d < head_dim; d += 2) {
-        float c = cos_row[d];
-        float s = sin_row[d];
+    int d = pair_idx * 2;
+    float c = cos_row[d];
+    float s = sin_row[d];
 
-        float x0 = bf16_to_f32(vec[d]);
-        float x1 = bf16_to_f32(vec[d + 1]);
+    float x0 = bf16_to_f32(vec[d]);
+    float x1 = bf16_to_f32(vec[d + 1]);
 
-        vec[d] = f32_to_bf16(x0 * c - x1 * s);
-        vec[d + 1] = f32_to_bf16(x1 * c + x0 * s);
-    }
+    vec[d] = f32_to_bf16(x0 * c - x1 * s);
+    vec[d + 1] = f32_to_bf16(x1 * c + x0 * s);
 }
 
 /* Batched matmul Q @ K^T for bf16 with f32 accumulation */
@@ -2286,6 +2351,8 @@ kernel void attention_fused_bf16(
 ) {
     // Shared memory for reductions (shared_scores is dynamic via threadgroup(0))
     threadgroup float shared_reduce[32];
+    // V tile buffer for coalesced cooperative loading (bf16->f32 during load)
+    threadgroup float shared_v[FUSED_V_TILE * (128 + 1)];  // +1 padding per row to avoid bank conflicts
 
     int query_idx = tg_pos.x;
     int head_idx = tg_pos.y;
@@ -2293,11 +2360,12 @@ kernel void attention_fused_bf16(
     uint threads = tg_size.x;
     uint num_simd_groups = (threads + 31) / 32;
 
-    // Guard: shared_q[128] is fixed-size
+    // Guard: shared_q[128] and shared_v are fixed-size
     if (head_dim > 128) return;
     if (query_idx >= seq_q || head_idx >= num_heads) return;
 
     int hidden = num_heads * head_dim;
+    int v_stride = head_dim + 1;  // Padded stride for bank conflict avoidance
 
     // Pointers to this position's Q and output (layout: [seq, heads*head_dim])
     device const ushort *q_row = Q + query_idx * hidden + head_idx * head_dim;
@@ -2369,14 +2437,41 @@ kernel void attention_fused_bf16(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ========== Phase 6: Compute output = scores @ V ==========
-    for (int d = tid; d < head_dim; d += threads) {
-        float acc = 0.0f;
-        for (int key_idx = 0; key_idx < seq_k; key_idx++) {
-            float v_val = bf16_to_f32(V_head[key_idx * hidden + d]);
-            acc += shared_scores[key_idx] * v_val;
+    // ========== Phase 6: Compute output = scores @ V (tiled) ==========
+    // Per-thread accumulator for each dimension this thread owns.
+    float acc[16] = {0};
+
+    for (int tile_start = 0; tile_start < seq_k; tile_start += FUSED_V_TILE) {
+        int tile_size = min(FUSED_V_TILE, seq_k - tile_start);
+
+        // Cooperative load: all threads load V[tile_start:tile_end, :] into
+        // shared_v[tile_size, head_dim] with padded stride. Convert bf16->f32 during load.
+        int total_elems = tile_size * head_dim;
+        for (int idx = (int)tid; idx < total_elems; idx += (int)threads) {
+            int k = idx / head_dim;
+            int d = idx % head_dim;
+            shared_v[k * v_stride + d] = bf16_to_f32(V_head[(tile_start + k) * hidden + d]);
         }
-        out_row[d] = f32_to_bf16(acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate: each thread processes its assigned dimensions
+        int dim_slot = 0;
+        for (int d = (int)tid; d < head_dim; d += (int)threads) {
+            if (dim_slot >= 16) break;
+            for (int k = 0; k < tile_size; k++) {
+                acc[dim_slot] += shared_scores[tile_start + k] * shared_v[k * v_stride + d];
+            }
+            dim_slot++;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write output (convert f32->bf16)
+    int dim_slot = 0;
+    for (int d = (int)tid; d < head_dim; d += (int)threads) {
+        if (dim_slot >= 16) break;
+        out_row[d] = f32_to_bf16(acc[dim_slot]);
+        dim_slot++;
     }
 }
 
@@ -2421,6 +2516,8 @@ kernel void causal_attention_fused_bf16(
     threadgroup float shared_scores[512];
     threadgroup float shared_reduce[32];
     threadgroup float shared_q[128];  // Cache Q for this query position
+    // V tile buffer for coalesced cooperative loading (bf16->f32 during load)
+    threadgroup float shared_v[FUSED_V_TILE * (128 + 1)];  // +1 padding per row to avoid bank conflicts
 
     int query_idx = tg_pos.x;
     int head_idx = tg_pos.y;
@@ -2436,6 +2533,7 @@ kernel void causal_attention_fused_bf16(
 
     int q_dim = num_q_heads * head_dim;
     int kv_dim = num_kv_heads * head_dim;
+    int v_stride = head_dim + 1;  // Padded stride for bank conflict avoidance
 
     // Pointers to this head's Q, K, V (bf16)
     device const ushort *q_row = Q + query_idx * q_dim + head_idx * head_dim;
@@ -2516,14 +2614,41 @@ kernel void causal_attention_fused_bf16(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ========== Phase 6: Compute output = scores @ V ==========
+    // ========== Phase 6: Compute output = scores @ V (tiled) ==========
     // Masked positions have score==0, so 0*v_val==0 — no branch needed.
-    for (int d = tid; d < head_dim; d += threads) {
-        float acc = 0.0f;
-        for (int key_idx = 0; key_idx < seq; key_idx++) {
-            acc += shared_scores[key_idx] * bf16_to_f32(V_head[key_idx * kv_dim + d]);
+    float acc[16] = {0};
+
+    for (int tile_start = 0; tile_start < seq; tile_start += FUSED_V_TILE) {
+        int tile_size = min(FUSED_V_TILE, seq - tile_start);
+
+        // Cooperative load: all threads load V[tile_start:tile_end, :] into
+        // shared_v[tile_size, head_dim] with padded stride. Convert bf16->f32 during load.
+        int total_elems = tile_size * head_dim;
+        for (int idx = (int)tid; idx < total_elems; idx += (int)threads) {
+            int k = idx / head_dim;
+            int d = idx % head_dim;
+            shared_v[k * v_stride + d] = bf16_to_f32(V_head[(tile_start + k) * kv_dim + d]);
         }
-        out_row[d] = f32_to_bf16(acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate: each thread processes its assigned dimensions
+        int dim_slot = 0;
+        for (int d = (int)tid; d < head_dim; d += (int)threads) {
+            if (dim_slot >= 16) break;
+            for (int k = 0; k < tile_size; k++) {
+                acc[dim_slot] += shared_scores[tile_start + k] * shared_v[k * v_stride + d];
+            }
+            dim_slot++;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write output (convert f32->bf16)
+    int dim_slot = 0;
+    for (int d = (int)tid; d < head_dim; d += (int)threads) {
+        if (dim_slot >= 16) break;
+        out_row[d] = f32_to_bf16(acc[dim_slot]);
+        dim_slot++;
     }
 }
 
@@ -2552,29 +2677,31 @@ kernel void rope_bf16(
     constant int &num_q_heads [[buffer(5)]],
     constant int &num_kv_heads [[buffer(6)]],
     constant int &head_dim [[buffer(7)]],
-    uint2 gid [[thread_position_in_grid]]  // (pos, head)
+    uint3 gid [[thread_position_in_grid]]  // (pos, head, pair_idx)
 ) {
     int pos = gid.x;
     int head = gid.y;
+    int pair_idx = gid.z;
 
     if (pos >= seq) return;
 
     int half_dim = head_dim / 2;
+
+    if (pair_idx >= half_dim) return;
+
+    float c = cos_cache[pos * half_dim + pair_idx];
+    float s = sin_cache[pos * half_dim + pair_idx];
 
     // Apply RoPE to Q heads
     if (head < num_q_heads) {
         int q_dim = num_q_heads * head_dim;
         device ushort *q_head = Q + pos * q_dim + head * head_dim;
 
-        for (int i = 0; i < half_dim; i++) {
-            float x0 = bf16_to_f32(q_head[i]);
-            float x1 = bf16_to_f32(q_head[i + half_dim]);
-            float c = cos_cache[pos * half_dim + i];
-            float s = sin_cache[pos * half_dim + i];
+        float x0 = bf16_to_f32(q_head[pair_idx]);
+        float x1 = bf16_to_f32(q_head[pair_idx + half_dim]);
 
-            q_head[i] = f32_to_bf16(x0 * c - x1 * s);
-            q_head[i + half_dim] = f32_to_bf16(x0 * s + x1 * c);
-        }
+        q_head[pair_idx] = f32_to_bf16(x0 * c - x1 * s);
+        q_head[pair_idx + half_dim] = f32_to_bf16(x0 * s + x1 * c);
     }
 
     // Apply RoPE to K heads (fewer heads due to GQA)
@@ -2582,15 +2709,11 @@ kernel void rope_bf16(
         int kv_dim = num_kv_heads * head_dim;
         device ushort *k_head = K + pos * kv_dim + head * head_dim;
 
-        for (int i = 0; i < half_dim; i++) {
-            float x0 = bf16_to_f32(k_head[i]);
-            float x1 = bf16_to_f32(k_head[i + half_dim]);
-            float c = cos_cache[pos * half_dim + i];
-            float s = sin_cache[pos * half_dim + i];
+        float x0 = bf16_to_f32(k_head[pair_idx]);
+        float x1 = bf16_to_f32(k_head[pair_idx + half_dim]);
 
-            k_head[i] = f32_to_bf16(x0 * c - x1 * s);
-            k_head[i + half_dim] = f32_to_bf16(x0 * s + x1 * c);
-        }
+        k_head[pair_idx] = f32_to_bf16(x0 * c - x1 * s);
+        k_head[pair_idx + half_dim] = f32_to_bf16(x0 * s + x1 * c);
     }
 }
 
@@ -2867,4 +2990,27 @@ kernel void transpose_2d_scale_f32(
     uint r = pos.y;
     if (r >= uint(rows) || c >= uint(cols)) return;
     out[c * rows + r] = in[r * cols + c] * scale;
+}
+
+/* Asymmetric pad right+bottom by 1 pixel for NCHW tensor (batch=1).
+ * Input:  [channels, in_h, in_w]
+ * Output: [channels, in_h+1, in_w+1]
+ * Padding pixels are zero. Used by VAE encoder downsample blocks. */
+kernel void pad_right_bottom_f32(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant uint &channels [[buffer(2)]],
+    constant uint &in_h [[buffer(3)]],
+    constant uint &in_w [[buffer(4)]],
+    uint3 pos [[thread_position_in_grid]]
+) {
+    uint c = pos.z;
+    uint y = pos.y;
+    uint x = pos.x;
+    uint out_h = in_h + 1;
+    uint out_w = in_w + 1;
+    if (c >= channels || y >= out_h || x >= out_w) return;
+
+    float val = (y < in_h && x < in_w) ? input[c * in_h * in_w + y * in_w + x] : 0.0f;
+    output[c * out_h * out_w + y * out_w + x] = val;
 }

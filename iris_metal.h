@@ -577,6 +577,11 @@ void iris_gpu_add_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t a, iris_gpu_tenso
 iris_gpu_tensor_t iris_gpu_upsample_nearest_2x_f32(iris_gpu_tensor_t x,
                                                      int channels, int H, int W);
 
+/* Asymmetric pad right+bottom by 1 pixel on GPU: [C, H, W] -> [C, H+1, W+1] (batch=1).
+ * Keeps data GPU-resident — eliminates CPU round-trip for VAE encoder downsample padding. */
+iris_gpu_tensor_t iris_gpu_pad_right_bottom(iris_gpu_tensor_t input,
+                                             int channels, int H, int W);
+
 /* Conv2d on f32 GPU tensors using MPSGraph.
  * x: GPU tensor [batch, in_ch, H, W]
  * weight: CPU f32 [out_ch, in_ch, kH, kW] (cached on GPU)

@@ -371,6 +371,7 @@ static id<MTLComputePipelineState> g_group_norm_swish_f32_pipeline;
 static id<MTLComputePipelineState> g_add_f32_pipeline;
 static id<MTLComputePipelineState> g_upsample_nearest_2x_f32_pipeline;
 static id<MTLComputePipelineState> g_transpose_2d_scale_f32_pipeline;
+static id<MTLComputePipelineState> g_pad_right_bottom_f32_pipeline;
 static int g_shaders_initialized;
 
 /* ========================================================================
@@ -748,6 +749,7 @@ void iris_metal_cleanup(void) {
         g_add_f32_pipeline = nil;
         g_upsample_nearest_2x_f32_pipeline = nil;
         g_transpose_2d_scale_f32_pipeline = nil;
+        g_pad_right_bottom_f32_pipeline = nil;
 
         g_queue = nil;
         g_device = nil;
@@ -2694,8 +2696,9 @@ void iris_bf16_rope_unified(id<MTLBuffer> x,
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
         [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
 
-        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
+        int half_dim_bf16 = head_dim / 2;
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, half_dim_bf16)
+           threadsPerThreadgroup:MTLSizeMake(1, 1, MIN(64, (NSUInteger)half_dim_bf16))];
         [encoder endEncoding];
 
         [cmdBuffer commit];
@@ -3976,6 +3979,10 @@ int iris_metal_init_shaders(void) {
         if (func) {
             g_transpose_2d_scale_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
         }
+        func = [g_shader_library newFunctionWithName:@"pad_right_bottom_f32"];
+        if (func) {
+            g_pad_right_bottom_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
 
         g_shaders_initialized = 1;
         if (iris_verbose)
@@ -4475,9 +4482,10 @@ void iris_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
         [encoder setBytes:&axis_dim length:sizeof(int) atIndex:6];
 
-        /* One thread per (seq, head) pair — use X≥32 to fill SIMD lanes */
-        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
+        /* One thread per (seq, head, pair) — parallelize over rotation pairs */
+        int total_pairs_2d = 4 * (axis_dim / 2);
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, total_pairs_2d)
+           threadsPerThreadgroup:MTLSizeMake(1, 1, MIN(64, (NSUInteger)total_pairs_2d))];
 
         [encoder endEncoding];
 
@@ -4509,8 +4517,8 @@ void iris_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
                 [enc setBytes:&heads length:sizeof(int) atIndex:4];
                 [enc setBytes:&head_dim length:sizeof(int) atIndex:5];
                 [enc setBytes:&axis_dim length:sizeof(int) atIndex:6];
-                [enc dispatchThreads:MTLSizeMake(seq, heads, 1)
-                   threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
+                [enc dispatchThreads:MTLSizeMake(seq, heads, total_pairs_2d)
+                   threadsPerThreadgroup:MTLSizeMake(1, 1, MIN(64, (NSUInteger)total_pairs_2d))];
                 [enc endEncoding];
                 [oneshot commit];
                 [oneshot waitUntilCompleted];
@@ -4754,8 +4762,9 @@ void iris_gpu_rope_2d(iris_gpu_tensor_t x, const float *cos_freq, const float *s
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
         [encoder setBytes:&axis_dim length:sizeof(int) atIndex:6];
 
-        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
+        int total_pairs_2d = 4 * (axis_dim / 2);
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, total_pairs_2d)
+           threadsPerThreadgroup:MTLSizeMake(1, 1, MIN(64, (NSUInteger)total_pairs_2d))];
 
         [encoder endEncoding];
 
@@ -4806,6 +4815,8 @@ void iris_gpu_rope_unified(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
 
+        int half_dim_unified = head_dim / 2;
+
         /* Apply unified RoPE to Q */
         {
             id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
@@ -4821,8 +4832,8 @@ void iris_gpu_rope_unified(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
             [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
             [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
 
-            [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-               threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
+            [encoder dispatchThreads:MTLSizeMake(seq, heads, half_dim_unified)
+               threadsPerThreadgroup:MTLSizeMake(1, 1, MIN(64, (NSUInteger)half_dim_unified))];
             [encoder endEncoding];
         }
 
@@ -4841,8 +4852,8 @@ void iris_gpu_rope_unified(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
             [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
             [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
 
-            [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-               threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
+            [encoder dispatchThreads:MTLSizeMake(seq, heads, half_dim_unified)
+               threadsPerThreadgroup:MTLSizeMake(1, 1, MIN(64, (NSUInteger)half_dim_unified))];
             [encoder endEncoding];
         }
 
@@ -4884,8 +4895,9 @@ static void encode_rope_single_f32(id<MTLCommandBuffer> cmdBuffer,
     [encoder setBytes:&heads length:sizeof(int) atIndex:7];
     [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
     [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
-    [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-       threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
+    int half_dim_single = head_dim / 2;
+    [encoder dispatchThreads:MTLSizeMake(seq, heads, half_dim_single)
+       threadsPerThreadgroup:MTLSizeMake(1, 1, MIN(64, (NSUInteger)half_dim_single))];
     [encoder endEncoding];
 
     x->has_pending_work = 1;
@@ -5278,6 +5290,9 @@ int iris_gpu_attention_flash(iris_gpu_tensor_t out,
     if (!out || !Q || !K || !V) return 0;
 
     int FLASH_TILE_K = 256;
+    /* Dynamic threadgroup memory: shared_q[head_dim] + shared_scores[TILE_K] + shared_reduce[32].
+     * Plus static shared_v[8*129] = 4128 bytes (compiled into the kernel).
+     * Worst case total (head_dim=128): 3584 + 4128 = 7712 bytes. */
     NSUInteger tg_mem_size = (NSUInteger)(head_dim + FLASH_TILE_K + 256 + 256) * sizeof(float);
     if (tg_mem_size > 32768) return 0;
 
@@ -5767,9 +5782,11 @@ int iris_gpu_attention_fused_bf16(iris_gpu_tensor_t out,
         }
     }
 
-    /* Dynamic threadgroup memory: shared_scores[seq_k] + static arrays */
+    /* Dynamic threadgroup memory: shared_scores[seq_k] + static arrays.
+     * Static: shared_reduce[32] + shared_q[128] + shared_v[8*129]
+     * = (32 + 128 + 1032) floats = 4768 bytes. */
     NSUInteger bf16_scores_size = (NSUInteger)seq_k * sizeof(float);
-    NSUInteger bf16_static_size = (256 + 256 + 128) * sizeof(float); /* max/sum/q */
+    NSUInteger bf16_static_size = (32 + 128 + 8 * 129) * sizeof(float); /* reduce + q + v_tile */
     int custom_kernel_fits = (bf16_scores_size + bf16_static_size <= 32768);
 
     if (custom_kernel_fits && g_attention_fused_bf16_pipeline) {
@@ -5851,9 +5868,9 @@ int iris_gpu_attention_custom_bf16(iris_gpu_tensor_t out,
     if (!g_shaders_initialized || !g_attention_fused_bf16_pipeline) return 0;
     if (!out || !Q || !K || !V) return 0;
 
-    /* Check threadgroup memory fits: shared_scores[seq_k] + shared_max/sum/q */
+    /* Check threadgroup memory fits: shared_scores[seq_k] + reduce + q + v_tile */
     NSUInteger bf16_scores_size = (NSUInteger)seq_k * sizeof(float);
-    NSUInteger bf16_static_size = (256 + 256 + 128) * sizeof(float);
+    NSUInteger bf16_static_size = (32 + 128 + 8 * 129) * sizeof(float);
     if (bf16_scores_size + bf16_static_size > 32768) return 0;
 
     @autoreleasepool {
@@ -6269,6 +6286,7 @@ void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
         if (!bufTxtCos || !bufTxtSin || !bufImgCos || !bufImgSin) return;
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        int half_dim_ubf16 = head_dim / 2;
 
         /* Apply RoPE to Q */
         {
@@ -6284,8 +6302,8 @@ void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
             [encoder setBytes:&heads length:sizeof(int) atIndex:7];
             [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
             [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
-            [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-               threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
+            [encoder dispatchThreads:MTLSizeMake(seq, heads, half_dim_ubf16)
+               threadsPerThreadgroup:MTLSizeMake(1, 1, MIN(64, (NSUInteger)half_dim_ubf16))];
             [encoder endEncoding];
         }
 
@@ -6303,8 +6321,8 @@ void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
             [encoder setBytes:&heads length:sizeof(int) atIndex:7];
             [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
             [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
-            [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-               threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
+            [encoder dispatchThreads:MTLSizeMake(seq, heads, half_dim_ubf16)
+               threadsPerThreadgroup:MTLSizeMake(1, 1, MIN(64, (NSUInteger)half_dim_ubf16))];
             [encoder endEncoding];
         }
 
@@ -6344,8 +6362,9 @@ void iris_gpu_rope_2d_bf16(iris_gpu_tensor_t x,
         [encoder setBytes:&heads length:sizeof(int) atIndex:4];
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
         [encoder setBytes:&axis_dim length:sizeof(int) atIndex:6];
-        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
+        int half_dim_2dbf16 = head_dim / 2;
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, half_dim_2dbf16)
+           threadsPerThreadgroup:MTLSizeMake(1, 1, MIN(64, (NSUInteger)half_dim_2dbf16))];
         [encoder endEncoding];
 
         x->has_pending_work = 1;
@@ -6463,10 +6482,10 @@ void iris_gpu_rope_text_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
         [encoder setBytes:&num_kv_heads length:sizeof(int) atIndex:6];
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
 
-        /* Dispatch: one thread per (pos, head) - max of q_heads and kv_heads */
+        /* Dispatch: one thread per (pos, head, pair) — parallelize over rotation pairs */
         int max_heads = num_q_heads > num_kv_heads ? num_q_heads : num_kv_heads;
-        [encoder dispatchThreads:MTLSizeMake(seq, max_heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(max_heads, 32), 1)];
+        [encoder dispatchThreads:MTLSizeMake(seq, max_heads, half_dim)
+           threadsPerThreadgroup:MTLSizeMake(1, 1, MIN(64, (NSUInteger)half_dim))];
         [encoder endEncoding];
 
         q->has_pending_work = 1;
@@ -7745,6 +7764,58 @@ iris_gpu_tensor_t iris_gpu_conv2d_bf16(iris_gpu_tensor_t x,
             x->has_pending_work = 0;
         } else {
             g_tensor_cmd = [mpsCmd rootCommandBuffer];
+        }
+    }
+
+    return out;
+}
+
+/* Asymmetric pad right+bottom by 1 pixel on GPU.
+ * Input:  [channels, H, W]  (batch=1)
+ * Output: [channels, H+1, W+1]
+ * Keeps data GPU-resident -- no CPU round-trip needed. */
+iris_gpu_tensor_t iris_gpu_pad_right_bottom(iris_gpu_tensor_t input,
+                                             int channels, int H, int W) {
+    if (!g_shaders_initialized || !g_pad_right_bottom_f32_pipeline) return NULL;
+    if (!input || channels <= 0 || H <= 0 || W <= 0) return NULL;
+
+    int out_h = H + 1;
+    int out_w = W + 1;
+    size_t out_elems = (size_t)channels * out_h * out_w;
+    iris_gpu_tensor_t out = iris_gpu_tensor_alloc(out_elems);
+    if (!out) return NULL;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        uint uch = (uint)channels;
+        uint uH  = (uint)H;
+        uint uW  = (uint)W;
+
+        [encoder setComputePipelineState:g_pad_right_bottom_f32_pipeline];
+        [encoder setBuffer:input->buffer offset:0 atIndex:0];
+        [encoder setBuffer:out->buffer offset:0 atIndex:1];
+        [encoder setBytes:&uch length:sizeof(uint) atIndex:2];
+        [encoder setBytes:&uH  length:sizeof(uint) atIndex:3];
+        [encoder setBytes:&uW  length:sizeof(uint) atIndex:4];
+
+        /* 3D grid: (W+1, H+1, channels) -- one thread per output element */
+        NSUInteger tgW = 8, tgH = 8, tgC = 4;
+        NSUInteger gx = ((NSUInteger)out_w + tgW - 1) / tgW;
+        NSUInteger gy = ((NSUInteger)out_h + tgH - 1) / tgH;
+        NSUInteger gz = ((NSUInteger)channels + tgC - 1) / tgC;
+        [encoder dispatchThreadgroups:MTLSizeMake(gx, gy, gz)
+                threadsPerThreadgroup:MTLSizeMake(tgW, tgH, tgC)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        input->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            input->has_pending_work = 0;
         }
     }
 

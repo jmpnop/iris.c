@@ -9,6 +9,7 @@
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
 #include "iris_qwen3.h"
+#include "embcache.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -534,6 +535,7 @@ void iris_free(iris_ctx *ctx) {
     iris_vae_free(ctx->vae);
     iris_transformer_free_flux(ctx->transformer);
     iris_transformer_free_zimage(ctx->zi_transformer);
+    emb_cache_free();
 
     free(ctx);
 }
@@ -718,6 +720,39 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
     return embeddings;
 }
 
+/* Wrap iris_encode_text() with the 4-bit quantized embedding cache.
+ * On cache hit, returns a dequantized copy (caller must free).
+ * On cache miss, encodes via Qwen3 and stores the result before returning. */
+static float *iris_cached_encode_text(iris_ctx *ctx, const char *prompt,
+                                       int *out_seq_len) {
+    if (!prompt) {
+        *out_seq_len = 0;
+        return NULL;
+    }
+
+    emb_cache_init();  /* idempotent */
+
+    /* Try cache first */
+    int emb_elements = 0;
+    float *cached = emb_cache_lookup_ex(prompt, &emb_elements);
+    if (cached) {
+        int text_dim = ctx->text_dim;
+        if (text_dim > 0 && emb_elements > 0 && (emb_elements % text_dim) == 0) {
+            *out_seq_len = emb_elements / text_dim;
+            return cached;
+        }
+        /* Metadata mismatch (model changed?) — discard and re-encode */
+        free(cached);
+    }
+
+    /* Cache miss — encode and store */
+    float *emb = iris_encode_text(ctx, prompt, out_seq_len);
+    if (emb) {
+        emb_cache_store(prompt, emb, (*out_seq_len) * ctx->text_dim);
+    }
+    return emb;
+}
+
 /* ========================================================================
  * Empty-String Embedding Cache (CFG)
  * ========================================================================
@@ -847,7 +882,7 @@ static float *iris_get_uncond_embedding(iris_ctx *ctx, int *out_seq_len) {
     if (cached) return cached;
 
     /* Cache miss -- encode the empty string */
-    float *emb = iris_encode_text(ctx, "", out_seq_len);
+    float *emb = iris_cached_encode_text(ctx, "", out_seq_len);
     if (!emb) return NULL;
 
     /* Save to cache for next time */
@@ -993,7 +1028,7 @@ static iris_image *iris_generate_zimage(iris_ctx *ctx, const char *prompt,
                                           const iris_params *p_in) {
     /* Encode text (Z-Image mode: extraction mode 1, single layer) */
     int text_seq;
-    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
+    float *text_emb = iris_cached_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
         set_error("Failed to encode prompt");
         return NULL;
@@ -1072,7 +1107,7 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
 
     /* Encode text (and unconditioned text for CFG in base model) */
     int text_seq;
-    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
+    float *text_emb = iris_cached_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
         set_error("Failed to encode prompt");
         return NULL;
@@ -1474,7 +1509,7 @@ static iris_image *iris_img2img_zimage(iris_ctx *ctx, const char *prompt,
 
     /* Encode text (Z-Image mode) */
     int text_seq;
-    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
+    float *text_emb = iris_cached_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
         set_error("Failed to encode prompt");
         return NULL;
@@ -1678,7 +1713,7 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
 
     /* Encode text */
     int text_seq;
-    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
+    float *text_emb = iris_cached_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
         if (resized) iris_image_free(resized);
         set_error("Failed to encode prompt");
@@ -1871,7 +1906,7 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
 
     /* Encode text */
     int text_seq;
-    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
+    float *text_emb = iris_cached_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
         set_error("Failed to encode prompt");
         return NULL;
