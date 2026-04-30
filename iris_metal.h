@@ -406,6 +406,11 @@ int iris_gpu_attention_fused(iris_gpu_tensor_t out,
                              iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                              int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
+/* Flash Attention: tiled online softmax, no sequence length limit */
+int iris_gpu_attention_flash(iris_gpu_tensor_t out,
+                             iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
+                             int seq_q, int seq_k, int num_heads, int head_dim, float scale);
+
 /* Native BF16 attention on GPU tensors (all tensors must be bf16 format).
  * Uses bf16 compute shaders with f32 accumulation for numerical stability.
  * Returns 1 on success, 0 if tensors are not bf16 or shaders unavailable.

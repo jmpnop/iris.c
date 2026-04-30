@@ -3201,6 +3201,7 @@ static id<MTLComputePipelineState> g_causal_attention_bf16_pipeline = nil;
 static id<MTLComputePipelineState> g_rope_bf16_pipeline = nil;
 static id<MTLComputePipelineState> g_head_rms_norm_bf16_pipeline = nil;
 static id<MTLComputePipelineState> g_attention_fused_pipeline = nil;
+static id<MTLComputePipelineState> g_attention_flash_pipeline = nil;
 static id<MTLComputePipelineState> g_gated_add_pipeline = nil;
 static id<MTLComputePipelineState> g_split_qkv_mlp_pipeline = nil;
 static id<MTLComputePipelineState> g_split_silu_mul_pipeline = nil;
@@ -3391,6 +3392,15 @@ int iris_metal_init_shaders(void) {
             g_attention_fused_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
             if (!g_attention_fused_pipeline) {
                 fprintf(stderr, "Metal shaders: attention_fused pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"attention_flash"];
+        if (func) {
+            g_attention_flash_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_attention_flash_pipeline) {
+                fprintf(stderr, "Metal shaders: attention_flash pipeline failed: %s\n",
                         [[error localizedDescription] UTF8String]);
             }
         }
@@ -4536,6 +4546,59 @@ int iris_gpu_attention_fused(iris_gpu_tensor_t out,
         [encoder setThreadgroupMemoryLength:scores_size atIndex:0];
 
         NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq_q, num_heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        Q->has_pending_work = 1;
+        K->has_pending_work = 1;
+        V->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            Q->has_pending_work = 0;
+            K->has_pending_work = 0;
+            V->has_pending_work = 0;
+        }
+
+        return 1;
+    }
+}
+
+/* Flash Attention: tiled online softmax, no sequence length limit.
+ * Same interface as iris_gpu_attention_fused but uses the attention_flash
+ * kernel. Returns 0 if pipeline unavailable (caller falls back). */
+int iris_gpu_attention_flash(iris_gpu_tensor_t out,
+                             iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
+                             int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
+    if (!g_shaders_initialized || !g_attention_flash_pipeline) return 0;
+    if (!out || !Q || !K || !V) return 0;
+
+    int FLASH_TILE_K = 256;
+    NSUInteger tg_mem_size = (NSUInteger)(head_dim + FLASH_TILE_K + 256 + 256) * sizeof(float);
+    if (tg_mem_size > 32768) return 0;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_attention_flash_pipeline];
+        [encoder setBuffer:Q->buffer offset:0 atIndex:0];
+        [encoder setBuffer:K->buffer offset:0 atIndex:1];
+        [encoder setBuffer:V->buffer offset:0 atIndex:2];
+        [encoder setBuffer:out->buffer offset:0 atIndex:3];
+        [encoder setBytes:&seq_q length:sizeof(int) atIndex:4];
+        [encoder setBytes:&seq_k length:sizeof(int) atIndex:5];
+        [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
+        [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+        [encoder setThreadgroupMemoryLength:tg_mem_size atIndex:0];
+
+        NSUInteger threadsPerGroup = 256;
         [encoder dispatchThreadgroups:MTLSizeMake(seq_q, num_heads, 1)
                 threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
 

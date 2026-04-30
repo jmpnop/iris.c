@@ -337,16 +337,17 @@ static int zi_gpu_linear_into_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
     return 0;
 }
 
-/* Self-attention dispatcher for GPU. Uses f32 fused attention exclusively —
- * the f32->bf16->sdpa->bf16->f32 round-trip causes grid artifacts at non-square
- * resolutions due to error accumulation across 30+ transformer layers with
- * 3-axis RoPE. The f32 kernel fits in threadgroup memory for all supported
- * Z-Image dimensions (max ~7680 tokens at 32KB; 1792x1792 needs ~3648). */
+/* Self-attention dispatcher for GPU. F32 only — BF16 SDPA causes grid
+ * artifacts at non-square resolutions. Tries Flash Attention first (tiled,
+ * no seq limit), falls back to fused attention (stores full score vector). */
 static int zi_gpu_attention(iris_gpu_tensor_t out_f32,
                              iris_gpu_tensor_t q_f32, iris_gpu_tensor_t k_f32, iris_gpu_tensor_t v_f32,
                              int seq, int n_heads, int head_dim, float attn_scale,
                              zi_gpu_scratch_t *scratch) {
     (void)scratch;
+    if (iris_gpu_attention_flash(out_f32, q_f32, k_f32, v_f32,
+                                 seq, seq, n_heads, head_dim, attn_scale))
+        return 1;
     return iris_gpu_attention_fused(out_f32, q_f32, k_f32, v_f32,
                                     seq, seq, n_heads, head_dim, attn_scale);
 }

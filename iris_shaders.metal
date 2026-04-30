@@ -623,6 +623,146 @@ kernel void attention_fused(
 }
 
 /* ========================================================================
+ * Flash Attention (Tiled Online Softmax)
+ *
+ * Drop-in replacement for attention_fused. Tiles over K/V in chunks of
+ * TILE_K, maintaining a running max and sum (online softmax) so the full
+ * [seq_k] score vector never materializes. No sequence length limit.
+ *
+ * Threadgroup memory: (head_dim + TILE_K + 512) * 4 bytes ≈ 3.5 KB
+ * (vs up to 30 KB for attention_fused at large seq_k).
+ * ======================================================================== */
+
+constant int FLASH_TILE_K = 256;
+
+kernel void attention_flash(
+    device const float *Q [[buffer(0)]],
+    device const float *K [[buffer(1)]],
+    device const float *V [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant int &seq_q [[buffer(4)]],
+    constant int &seq_k [[buffer(5)]],
+    constant int &num_heads [[buffer(6)]],
+    constant int &head_dim [[buffer(7)]],
+    constant float &scale [[buffer(8)]],
+    threadgroup float *shared_mem [[threadgroup(0)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tid_pos [[thread_position_in_threadgroup]],
+    uint3 tg_size [[threads_per_threadgroup]]
+) {
+    int query_idx = tg_pos.x;
+    int head_idx = tg_pos.y;
+    uint tid = tid_pos.x;
+    uint threads = tg_size.x;
+
+    if (query_idx >= seq_q || head_idx >= num_heads) return;
+
+    int hidden = num_heads * head_dim;
+
+    threadgroup float *shared_q      = shared_mem;
+    threadgroup float *shared_scores = shared_mem + head_dim;
+    threadgroup float *shared_max    = shared_scores + FLASH_TILE_K;
+    threadgroup float *shared_sum    = shared_max + 256;
+
+    device const float *q_row = Q + query_idx * hidden + head_idx * head_dim;
+    device float *out_row     = out + query_idx * hidden + head_idx * head_dim;
+    device const float *K_head = K + head_idx * head_dim;
+    device const float *V_head = V + head_idx * head_dim;
+
+    for (int d = (int)tid; d < head_dim; d += (int)threads) {
+        shared_q[d] = q_row[d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    int num_tiles = (seq_k + FLASH_TILE_K - 1) / FLASH_TILE_K;
+
+    for (int tile = 0; tile < num_tiles; tile++) {
+        int tile_start = tile * FLASH_TILE_K;
+        int tile_end = min(tile_start + FLASH_TILE_K, seq_k);
+        int tile_len = tile_end - tile_start;
+
+        float local_tile_max = -INFINITY;
+        for (int k = (int)tid; k < tile_len; k += (int)threads) {
+            int key_idx = tile_start + k;
+            device const float *k_row = K_head + key_idx * hidden;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                dot += shared_q[d] * k_row[d];
+            }
+            float score = dot * scale;
+            shared_scores[k] = score;
+            local_tile_max = max(local_tile_max, score);
+        }
+
+        shared_max[tid] = local_tile_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride && tid + stride < threads) {
+                shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float tile_max = shared_max[0];
+
+        float new_max = max(running_max, tile_max);
+        float correction = (running_max > -INFINITY) ? exp(running_max - new_max) : 0.0f;
+
+        running_sum *= correction;
+        int dim_idx = 0;
+        for (int d = (int)tid; d < head_dim; d += (int)threads) {
+            acc[dim_idx] *= correction;
+            dim_idx++;
+        }
+        running_max = new_max;
+
+        float local_tile_sum = 0.0f;
+        for (int k = (int)tid; k < tile_len; k += (int)threads) {
+            float e = exp(shared_scores[k] - new_max);
+            shared_scores[k] = e;
+            local_tile_sum += e;
+        }
+
+        shared_sum[tid] = local_tile_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride && tid + stride < threads) {
+                shared_sum[tid] += shared_sum[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        running_sum += shared_sum[0];
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        dim_idx = 0;
+        for (int d = (int)tid; d < head_dim; d += (int)threads) {
+            float v_acc = 0.0f;
+            for (int k = 0; k < tile_len; k++) {
+                int key_idx = tile_start + k;
+                v_acc += shared_scores[k] * V_head[key_idx * hidden + d];
+            }
+            acc[dim_idx] += v_acc;
+            dim_idx++;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
+    int dim_idx = 0;
+    for (int d = (int)tid; d < head_dim; d += (int)threads) {
+        out_row[d] = acc[dim_idx] * inv_sum;
+        dim_idx++;
+    }
+}
+
+/* ========================================================================
  * Fused Causal Attention for Text Encoder (Qwen3)
  * Processes all heads in parallel with causal masking and GQA support.
  *
