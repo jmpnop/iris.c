@@ -3844,20 +3844,25 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     /* Double-stream blocks */
     double double_start = tf_get_time_ms();
 
-    /* Pre-compute AdaLN modulation ONCE for all 5 double blocks.
-     * t_emb and adaln weights are the same for all blocks within a step. */
-    int double_mod_size = hidden * 6;  /* shift1, scale1, gate1, shift2, scale2, gate2 */
+    /* Compute SiLU(t_emb) ONCE — reused by double blocks, single blocks, and final layer */
     for (int j = 0; j < hidden; j++) {
         float x = t_emb[j];
         tf->t_emb_silu[j] = x / (1.0f + expf(-x));
     }
+
+    /* Pre-compute AdaLN modulation ONCE for all 5 double blocks.
+     * t_emb and adaln weights are the same for all blocks within a step. */
+    int double_mod_size = hidden * 6;  /* shift1, scale1, gate1, shift2, scale2, gate2 */
     iris_linear_nobias(tf->double_mod_img, tf->t_emb_silu, tf->adaln_double_img_weight,
                        1, hidden, double_mod_size);
     iris_linear_nobias(tf->double_mod_txt, tf->t_emb_silu, tf->adaln_double_txt_weight,
                        1, hidden, double_mod_size);
 
 #ifdef USE_METAL
-    int double_gpu_done = 0;  /* number of blocks completed on GPU */
+    int double_gpu_done = 0;
+    iris_gpu_tensor_t double_img_gpu = NULL;
+    iris_gpu_tensor_t double_txt_gpu = NULL;
+
     if (iris_metal_available() && iris_metal_shaders_available() && !tf->use_mmap &&
         tf->double_blocks[0].img_q_weight_bf16) {
         iris_gpu_tensor_t img_gpu = iris_gpu_tensor_create(img_hidden, (size_t)img_seq * hidden);
@@ -3882,6 +3887,10 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
                     iris_gpu_batch_end();
                     iris_gpu_tensor_read(img_gpu, img_hidden);
                     iris_gpu_tensor_read(txt_gpu, txt_hidden);
+                    iris_gpu_tensor_free(img_gpu);
+                    iris_gpu_tensor_free(txt_gpu);
+                    double_img_gpu = NULL;
+                    double_txt_gpu = NULL;
                     break;
                 }
                 double_gpu_done = i + 1;
@@ -3893,12 +3902,9 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
 
             if (double_gpu_done == tf->num_double_layers) {
                 iris_gpu_batch_end();
-                iris_gpu_tensor_read(img_gpu, img_hidden);
-                iris_gpu_tensor_read(txt_gpu, txt_hidden);
+                double_img_gpu = img_gpu;
+                double_txt_gpu = txt_gpu;
             }
-
-            iris_gpu_tensor_free(img_gpu);
-            iris_gpu_tensor_free(txt_gpu);
         } else {
             if (img_gpu) iris_gpu_tensor_free(img_gpu);
             if (txt_gpu) iris_gpu_tensor_free(txt_gpu);
@@ -3931,29 +3937,50 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     double double_time = tf_get_time_ms() - double_start;
 
     /* Concatenate text and image for single-stream blocks
-     * Python uses [txt, img] order for concatenation
-     */
+     * Python uses [txt, img] order for concatenation */
     float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
-    memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
-    memcpy(concat_hidden + txt_seq * hidden, img_hidden,
-           img_seq * hidden * sizeof(float));
 
     /* Single-stream blocks */
     double single_start = tf_get_time_ms();
 
 #ifdef USE_METAL
-    /* Try BF16 native path first */
     int bf16_path_ok = 0;
     int gpu_chained_ok = 0;
     iris_gpu_tensor_t concat_hidden_gpu = NULL;
 
-    /* BF16 native single block path - currently disabled.
-     * MPS GEMM doesn't support bf16, so our custom bf16 linear kernel is ~4x slower than
-     * MPS SGEMM with f16 weights. To achieve higher bf16 performance, we would need
-     * highly optimized custom Metal matmul kernels.
-     * The f32 path with f16 weights and pre-warmed caches is currently faster. */
+    /* Bridge: if double blocks completed on GPU, concat directly on GPU
+     * to avoid GPU→CPU→GPU round-trip */
+    if (double_img_gpu && double_txt_gpu) {
+        concat_hidden_gpu = iris_gpu_tensor_alloc((size_t)total_seq * hidden);
+        if (concat_hidden_gpu) {
+            iris_gpu_copy_region_f32(concat_hidden_gpu, 0,
+                                      double_txt_gpu, 0, (size_t)txt_seq * hidden);
+            iris_gpu_copy_region_f32(concat_hidden_gpu, (size_t)txt_seq * hidden,
+                                      double_img_gpu, 0, (size_t)img_seq * hidden);
+            iris_gpu_tensor_set_persistent(concat_hidden_gpu, 1);
+            gpu_chained_ok = 1;
+        } else {
+            iris_gpu_tensor_read(double_img_gpu, img_hidden);
+            iris_gpu_tensor_read(double_txt_gpu, txt_hidden);
+        }
+        iris_gpu_tensor_free(double_img_gpu);
+        iris_gpu_tensor_free(double_txt_gpu);
+        double_img_gpu = NULL;
+        double_txt_gpu = NULL;
+    }
+
+    if (!gpu_chained_ok) {
+#else
+    {
+#endif
+        memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
+        memcpy(concat_hidden + txt_seq * hidden, img_hidden,
+               img_seq * hidden * sizeof(float));
+    }
+
+#ifdef USE_METAL
+    /* BF16 native single block path - currently disabled. */
     if (0 && iris_metal_available() && iris_bf16_pipeline_available() && !tf->use_mmap && tf->use_bf16) {
-        /* Create f32 GPU tensor first, then convert to bf16 */
         iris_gpu_tensor_t hidden_f32 = iris_gpu_tensor_create(concat_hidden, total_seq * hidden);
         if (hidden_f32) {
             iris_gpu_tensor_t hidden_bf16 = iris_gpu_tensor_f32_to_bf16(hidden_f32);
@@ -3963,12 +3990,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
                 iris_gpu_tensor_set_persistent(hidden_bf16, 1);
                 bf16_path_ok = 1;
 
-                /* Pre-compute AdaLN modulation and convert to bf16 */
                 int mod_size = hidden * 3;
-                for (int j = 0; j < hidden; j++) {
-                    float x = t_emb[j];
-                    tf->t_emb_silu[j] = x / (1.0f + expf(-x));
-                }
                 int fused_dim = hidden * 3 + tf->mlp_hidden * 2;
                 float *mod_params = tf->work2 + total_seq * fused_dim;
                 iris_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
@@ -4048,69 +4070,53 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     }
 
     /* Fall back to f32 GPU-chained path if bf16 path not used or failed */
-    if (!bf16_path_ok && iris_metal_available() && iris_metal_shaders_available() && !tf->use_mmap) {
-        /* Create persistent GPU tensor for hidden state */
+    if (!bf16_path_ok && !gpu_chained_ok &&
+        iris_metal_available() && iris_metal_shaders_available() && !tf->use_mmap) {
         concat_hidden_gpu = iris_gpu_tensor_create(concat_hidden, total_seq * hidden);
         if (concat_hidden_gpu) {
             iris_gpu_tensor_set_persistent(concat_hidden_gpu, 1);
             gpu_chained_ok = 1;
+        }
+    }
 
-            /* Pre-compute AdaLN modulation ONCE for all 20 single blocks.
-             * t_emb and adaln_single_weight are the same for all blocks within a step,
-             * so the output (shift, scale, gate) is identical. Computing this 20x was wasteful. */
-            int mod_size = hidden * 3;
-            for (int j = 0; j < hidden; j++) {
-                float x = t_emb[j];
-                tf->t_emb_silu[j] = x / (1.0f + expf(-x));
-            }
-            int fused_dim = hidden * 3 + tf->mlp_hidden * 2;
-            float *mod_params = tf->work2 + total_seq * fused_dim;  /* Place after fused_out buffer */
-            iris_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
-            float *precomputed_shift = mod_params;
-            float *precomputed_scale = mod_params + hidden;
-            float *precomputed_gate = mod_params + hidden * 2;
+    if (gpu_chained_ok && concat_hidden_gpu) {
+        int mod_size = hidden * 3;
+        int fused_dim = hidden * 3 + tf->mlp_hidden * 2;
+        float *mod_params = tf->work2 + total_seq * fused_dim;
+        iris_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
+        float *precomputed_shift = mod_params;
+        float *precomputed_scale = mod_params + hidden;
+        float *precomputed_gate = mod_params + hidden * 2;
 
-            /* Start batch mode OUTSIDE the loop so all 20 blocks share the same
-             * command buffer. This eliminates the sync between blocks. */
-            iris_gpu_batch_begin();
+        iris_gpu_batch_begin();
 
-            /* Allocate scratch buffers once for all 20 single blocks.
-             * This eliminates 200 GPU tensor alloc/frees per denoising step. */
-            single_block_gpu_scratch_t scratch;
-            int scratch_ok = single_block_gpu_scratch_init(&scratch, total_seq, hidden, tf->mlp_hidden);
+        single_block_gpu_scratch_t scratch;
+        int scratch_ok = single_block_gpu_scratch_init(&scratch, total_seq, hidden, tf->mlp_hidden);
 
-            /* Process all single blocks with GPU tensor chaining */
-            for (int i = 0; i < tf->num_single_layers && gpu_chained_ok; i++) {
-                if (!single_block_forward_gpu_chained(concat_hidden_gpu, &tf->single_blocks[i],
-                                                      precomputed_shift, precomputed_scale, precomputed_gate,
-                                                      img_rope_cos, img_rope_sin,
-                                                      txt_rope_cos, txt_rope_sin,
-                                                      total_seq, txt_seq, tf,
-                                                      scratch_ok ? &scratch : NULL)) {
-                    /* GPU chained path failed, need to fall back */
-                    gpu_chained_ok = 0;
-                    /* End batch mode before falling back */
-                    iris_gpu_batch_end();
-                    /* Read current state back to CPU to continue with CPU/old GPU path */
-                    iris_gpu_tensor_read(concat_hidden_gpu, concat_hidden);
-                }
-                if (iris_substep_callback)
-                    iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
-            }
-
-            /* Free scratch buffers */
-            if (scratch_ok) single_block_gpu_scratch_free(&scratch);
-
-            if (gpu_chained_ok) {
-                /* End batch mode - commits all GPU work and waits for completion */
+        for (int i = 0; i < tf->num_single_layers && gpu_chained_ok; i++) {
+            if (!single_block_forward_gpu_chained(concat_hidden_gpu, &tf->single_blocks[i],
+                                                    precomputed_shift, precomputed_scale, precomputed_gate,
+                                                    img_rope_cos, img_rope_sin,
+                                                    txt_rope_cos, txt_rope_sin,
+                                                    total_seq, txt_seq, tf,
+                                                    scratch_ok ? &scratch : NULL)) {
+                gpu_chained_ok = 0;
                 iris_gpu_batch_end();
-                /* Read final result back to CPU */
                 iris_gpu_tensor_read(concat_hidden_gpu, concat_hidden);
             }
-
-            iris_gpu_tensor_free(concat_hidden_gpu);
-            concat_hidden_gpu = NULL;
+            if (iris_substep_callback)
+                iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
         }
+
+        if (scratch_ok) single_block_gpu_scratch_free(&scratch);
+
+        if (gpu_chained_ok) {
+            iris_gpu_batch_end();
+            iris_gpu_tensor_read(concat_hidden_gpu, concat_hidden);
+        }
+
+        iris_gpu_tensor_free(concat_hidden_gpu);
+        concat_hidden_gpu = NULL;
     }
 
     /* Fall back to per-block GPU/CPU path if both bf16 and f32 chained paths failed */
@@ -4170,15 +4176,8 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
 #endif
 
     /* Final layer: AdaLN modulation -> project to latent channels
-     * norm_out.linear.weight is [6144, 3072] = [shift, scale] projection
-     * Apply SiLU to t_emb before modulation projection (FLUX architecture)
-     */
+     * t_emb_silu was pre-computed once at the top of this function */
     double final_start = tf_get_time_ms();
-    /* Reuse pre-allocated t_emb_silu buffer */
-    for (int i = 0; i < hidden; i++) {
-        float x = t_emb[i];
-        tf->t_emb_silu[i] = x / (1.0f + expf(-x));
-    }
 
     /* Reuse double_mod_img buffer for final_mod (needs hidden*2, has hidden*6) */
     float *final_mod = tf->double_mod_img;
