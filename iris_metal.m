@@ -3203,6 +3203,8 @@ static id<MTLComputePipelineState> g_head_rms_norm_bf16_pipeline = nil;
 static id<MTLComputePipelineState> g_attention_fused_pipeline = nil;
 static id<MTLComputePipelineState> g_attention_flash_pipeline = nil;
 static id<MTLComputePipelineState> g_gated_add_pipeline = nil;
+static id<MTLComputePipelineState> g_norm_gated_add_pipeline = nil;
+static id<MTLComputePipelineState> g_norm_add_pipeline = nil;
 static id<MTLComputePipelineState> g_split_qkv_mlp_pipeline = nil;
 static id<MTLComputePipelineState> g_split_silu_mul_pipeline = nil;
 static id<MTLComputePipelineState> g_concat_attn_mlp_pipeline = nil;
@@ -3410,6 +3412,24 @@ int iris_metal_init_shaders(void) {
             g_gated_add_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
             if (!g_gated_add_pipeline) {
                 fprintf(stderr, "Metal shaders: gated_add pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"norm_gated_add"];
+        if (func) {
+            g_norm_gated_add_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_norm_gated_add_pipeline) {
+                fprintf(stderr, "Metal shaders: norm_gated_add pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"norm_add"];
+        if (func) {
+            g_norm_add_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_norm_add_pipeline) {
+                fprintf(stderr, "Metal shaders: norm_add pipeline failed: %s\n",
                         [[error localizedDescription] UTF8String]);
             }
         }
@@ -4425,6 +4445,93 @@ void iris_gpu_gated_add(iris_gpu_tensor_t out, const float *gate,
         }
         /* ARC will release bufGate after command completes */
     }
+}
+
+/* Fused RMSNorm + gated add: out += gate * rms_norm(proj, weight).
+ * Eliminates the intermediate normalized tensor. Returns 1 on success. */
+int iris_gpu_norm_gated_add(iris_gpu_tensor_t out, iris_gpu_tensor_t proj,
+                            const float *weight, const float *gate,
+                            int seq, int hidden, float eps) {
+    if (!g_shaders_initialized || !g_norm_gated_add_pipeline || !out || !proj) return 0;
+
+    @autoreleasepool {
+        size_t vec_size = (size_t)hidden * sizeof(float);
+        id<MTLBuffer> bufWeight = get_cached_weight_buffer(weight, vec_size);
+        if (!bufWeight) return 0;
+
+        id<MTLBuffer> bufGate = [g_device newBufferWithBytes:gate
+                                                      length:vec_size
+                                                     options:MTLResourceStorageModeShared];
+        if (!bufGate) return 0;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_norm_gated_add_pipeline];
+        [encoder setBuffer:proj->buffer offset:0 atIndex:0];
+        [encoder setBuffer:out->buffer offset:0 atIndex:1];
+        [encoder setBuffer:bufWeight offset:0 atIndex:2];
+        [encoder setBuffer:bufGate offset:0 atIndex:3];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:4];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:5];
+
+        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)hidden);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        proj->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            proj->has_pending_work = 0;
+        }
+    }
+    return 1;
+}
+
+/* Fused RMSNorm + add (ungated): out += rms_norm(proj, weight).
+ * For unmodulated (context_refiner) blocks. Returns 1 on success. */
+int iris_gpu_norm_add(iris_gpu_tensor_t out, iris_gpu_tensor_t proj,
+                      const float *weight, int seq, int hidden, float eps) {
+    if (!g_shaders_initialized || !g_norm_add_pipeline || !out || !proj) return 0;
+
+    @autoreleasepool {
+        size_t vec_size = (size_t)hidden * sizeof(float);
+        id<MTLBuffer> bufWeight = get_cached_weight_buffer(weight, vec_size);
+        if (!bufWeight) return 0;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_norm_add_pipeline];
+        [encoder setBuffer:proj->buffer offset:0 atIndex:0];
+        [encoder setBuffer:out->buffer offset:0 atIndex:1];
+        [encoder setBuffer:bufWeight offset:0 atIndex:2];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:3];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:4];
+
+        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)hidden);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        proj->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            proj->has_pending_work = 0;
+        }
+    }
+    return 1;
 }
 
 /* Split fused QKV+MLP output into separate tensors */

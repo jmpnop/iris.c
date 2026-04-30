@@ -387,6 +387,15 @@ void iris_gpu_silu_mul(iris_gpu_tensor_t gate, iris_gpu_tensor_t up, int n);
 int iris_gpu_split_silu_mul(iris_gpu_tensor_t out, iris_gpu_tensor_t fused,
                             int seq, int mlp_hidden);
 
+/* Fused RMSNorm + gated add: out += gate * rms_norm(proj, weight) */
+int iris_gpu_norm_gated_add(iris_gpu_tensor_t out, iris_gpu_tensor_t proj,
+                            const float *weight, const float *gate,
+                            int seq, int hidden, float eps);
+
+/* Fused RMSNorm + add (ungated): out += rms_norm(proj, weight) */
+int iris_gpu_norm_add(iris_gpu_tensor_t out, iris_gpu_tensor_t proj,
+                      const float *weight, int seq, int hidden, float eps);
+
 /* Gated add on GPU: out += gate * proj */
 void iris_gpu_gated_add(iris_gpu_tensor_t out, const float *gate,
                         iris_gpu_tensor_t proj, int seq, int hidden);

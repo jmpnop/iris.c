@@ -212,6 +212,86 @@ kernel void split_silu_mul(
 }
 
 /* ========================================================================
+ * Fused RMSNorm + Gated Add:
+ *   out[s,h] += gate[h] * (rms_norm(proj[s,:], weight) [h])
+ * Eliminates the intermediate normalized tensor. Same RMS reduction
+ * strategy as rms_norm (one threadgroup per sequence row).
+ * ======================================================================== */
+
+kernel void norm_gated_add(
+    device const float *proj [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    device const float *weight [[buffer(2)]],
+    device const float *gate [[buffer(3)]],
+    constant int &hidden [[buffer(4)]],
+    constant float &eps [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+
+    device const float *proj_row = proj + row * hidden;
+    device float *out_row = out + row * hidden;
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < hidden; i += threads) {
+        float val = proj_row[i];
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rms_inv = rsqrt(shared_sum[0] / float(hidden) + eps);
+
+    for (int i = tid; i < hidden; i += threads) {
+        out_row[i] += gate[i] * (proj_row[i] * rms_inv * weight[i]);
+    }
+}
+
+/* Ungated variant for unmodulated (context_refiner) blocks:
+ *   out[s,h] += rms_norm(proj[s,:], weight)[h] */
+kernel void norm_add(
+    device const float *proj [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    device const float *weight [[buffer(2)]],
+    constant int &hidden [[buffer(3)]],
+    constant float &eps [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+
+    device const float *proj_row = proj + row * hidden;
+    device float *out_row = out + row * hidden;
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < hidden; i += threads) {
+        float val = proj_row[i];
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            shared_sum[tid] += shared_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rms_inv = rsqrt(shared_sum[0] / float(hidden) + eps);
+
+    for (int i = tid; i < hidden; i += threads) {
+        out_row[i] += proj_row[i] * rms_inv * weight[i];
+    }
+}
+
+/* ========================================================================
  * Gated Add: out += gate * proj
  * gate: [hidden], proj: [seq, hidden], out: [seq, hidden]
  * ======================================================================== */

@@ -1000,10 +1000,14 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                                     block->attn_out_weight_bf16, block->attn_out_weight,
                                     seq, dim, dim)) return 0;
 
-        /* GPU: attn_norm2 + gated residual: x += gate_msa * norm2(proj) */
-        iris_gpu_rms_norm_f32(scratch->norm2, scratch->proj, block->attn_norm2,
-                               seq, dim, ZI_NORM_EPS);
-        iris_gpu_gated_add(hidden_gpu, gate_msa, scratch->norm2, seq, dim);
+        /* GPU: fused attn_norm2 + gated residual: x += gate_msa * norm2(proj) */
+        if (!iris_gpu_norm_gated_add(hidden_gpu, scratch->proj,
+                                      block->attn_norm2, gate_msa,
+                                      seq, dim, ZI_NORM_EPS)) {
+            iris_gpu_rms_norm_f32(scratch->norm2, scratch->proj, block->attn_norm2,
+                                   seq, dim, ZI_NORM_EPS);
+            iris_gpu_gated_add(hidden_gpu, gate_msa, scratch->norm2, seq, dim);
+        }
 
         /* CPU: fuse FFN norm weight * scale_mlp */
         float *fused_ffn_norm = scratch->fused_ffn_norm;
@@ -1051,10 +1055,14 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                                     block->ffn_w2_bf16, block->ffn_w2,
                                     seq, ffn_dim, dim)) return 0;
 
-        /* GPU: ffn_norm2 + gated residual: x += gate_mlp * norm2(ffn_out) */
-        iris_gpu_rms_norm_f32(scratch->norm2, scratch->down, block->ffn_norm2,
-                               seq, dim, ZI_NORM_EPS);
-        iris_gpu_gated_add(hidden_gpu, gate_mlp, scratch->norm2, seq, dim);
+        /* GPU: fused ffn_norm2 + gated residual: x += gate_mlp * norm2(ffn_out) */
+        if (!iris_gpu_norm_gated_add(hidden_gpu, scratch->down,
+                                      block->ffn_norm2, gate_mlp,
+                                      seq, dim, ZI_NORM_EPS)) {
+            iris_gpu_rms_norm_f32(scratch->norm2, scratch->down, block->ffn_norm2,
+                                   seq, dim, ZI_NORM_EPS);
+            iris_gpu_gated_add(hidden_gpu, gate_mlp, scratch->norm2, seq, dim);
+        }
 
     } else {
         /* ---- Unmodulated block (context_refiner) ---- */
@@ -1117,10 +1125,13 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                                     block->attn_out_weight_bf16, block->attn_out_weight,
                                     seq, dim, dim)) return 0;
 
-        /* GPU: norm2(proj) + residual: x += norm2(attn_out) */
-        iris_gpu_rms_norm_f32(scratch->norm2, scratch->proj, block->attn_norm2,
-                               seq, dim, ZI_NORM_EPS);
-        iris_gpu_add_f32(hidden_gpu, hidden_gpu, scratch->norm2, seq * dim);
+        /* GPU: fused norm2 + residual: x += norm2(attn_out) */
+        if (!iris_gpu_norm_add(hidden_gpu, scratch->proj, block->attn_norm2,
+                                seq, dim, ZI_NORM_EPS)) {
+            iris_gpu_rms_norm_f32(scratch->norm2, scratch->proj, block->attn_norm2,
+                                   seq, dim, ZI_NORM_EPS);
+            iris_gpu_add_f32(hidden_gpu, hidden_gpu, scratch->norm2, seq * dim);
+        }
 
         /* GPU: FFN */
         iris_gpu_rms_norm_f32(scratch->norm, hidden_gpu, block->ffn_norm1,
@@ -1159,10 +1170,13 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                                     block->ffn_w2_bf16, block->ffn_w2,
                                     seq, ffn_dim, dim)) return 0;
 
-        /* GPU: ffn_norm2 + residual: x += norm2(ffn_out) */
-        iris_gpu_rms_norm_f32(scratch->norm2, scratch->down, block->ffn_norm2,
-                               seq, dim, ZI_NORM_EPS);
-        iris_gpu_add_f32(hidden_gpu, hidden_gpu, scratch->norm2, seq * dim);
+        /* GPU: fused ffn_norm2 + residual: x += norm2(ffn_out) */
+        if (!iris_gpu_norm_add(hidden_gpu, scratch->down, block->ffn_norm2,
+                                seq, dim, ZI_NORM_EPS)) {
+            iris_gpu_rms_norm_f32(scratch->norm2, scratch->down, block->ffn_norm2,
+                                   seq, dim, ZI_NORM_EPS);
+            iris_gpu_add_f32(hidden_gpu, hidden_gpu, scratch->norm2, seq * dim);
+        }
     }
 
     return 1;
