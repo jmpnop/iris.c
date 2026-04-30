@@ -259,10 +259,17 @@ static void compute_rope_freqs(float *cos_out, float *sin_out,
                                int max_seq_len, int head_dim, float theta) {
     int half_dim = head_dim / 2;
 
+    /* Precompute inverse frequencies — depends only on i, not pos.
+     * Hoisting powf out of the inner loop eliminates
+     * (max_seq_len - 1) * half_dim redundant powf calls. */
+    float inv_freq[128]; /* half_dim is at most 64 for head_dim=128 */
+    for (int i = 0; i < half_dim; i++)
+        inv_freq[i] = 1.0f / powf(theta, (float)(2 * i) / (float)head_dim);
+
     for (int pos = 0; pos < max_seq_len; pos++) {
+        float p = (float)pos;
         for (int i = 0; i < half_dim; i++) {
-            float freq = 1.0f / powf(theta, (float)(2 * i) / head_dim);
-            float angle = pos * freq;
+            float angle = p * inv_freq[i];
             cos_out[pos * half_dim + i] = cosf(angle);
             sin_out[pos * half_dim + i] = sinf(angle);
         }
@@ -1461,7 +1468,12 @@ static int open_safetensors_shards(const char *model_dir,
         fseek(f, 0, SEEK_SET);
         char *buf = malloc(fsize + 1);
         if (!buf) { fclose(f); return 0; }
-        fread(buf, 1, fsize, f);
+        size_t bytes_read = fread(buf, 1, fsize, f);
+        if (bytes_read != (size_t)fsize) {
+            free(buf);
+            fclose(f);
+            return 0;
+        }
         buf[fsize] = '\0';
         fclose(f);
 
@@ -1528,8 +1540,35 @@ static int open_safetensors_shards(const char *model_dir,
     return 0;
 }
 
-/* Allocate working memory for Qwen3 model based on architecture fields. */
-static void qwen3_alloc_work_buffers(qwen3_model_t *model) {
+/* Free working memory buffers. Handles NULL pointers safely (free(NULL)
+ * is a no-op per C standard). Used both by qwen3_model_free and as
+ * cleanup on allocation failure in qwen3_alloc_work_buffers. */
+static void qwen3_free_work_buffers(qwen3_model_t *model) {
+    free(model->hidden_state);  model->hidden_state = NULL;
+    free(model->residual);      model->residual = NULL;
+    free(model->q_buf);         model->q_buf = NULL;
+    free(model->k_buf);         model->k_buf = NULL;
+    free(model->v_buf);         model->v_buf = NULL;
+    free(model->attn_scores);   model->attn_scores = NULL;
+    free(model->attn_out);      model->attn_out = NULL;
+    free(model->mlp_gate);      model->mlp_gate = NULL;
+    free(model->mlp_up);        model->mlp_up = NULL;
+    free(model->mlp_out);       model->mlp_out = NULL;
+    free(model->norm_buf);      model->norm_buf = NULL;
+
+    free(model->attn_q_head);   model->attn_q_head = NULL;
+    free(model->attn_v_head);   model->attn_v_head = NULL;
+    free(model->attn_out_head); model->attn_out_head = NULL;
+
+    for (int i = 0; i < 3; i++) {
+        free(model->layer_outputs[i]);
+        model->layer_outputs[i] = NULL;
+    }
+}
+
+/* Allocate working memory for Qwen3 model based on architecture fields.
+ * Returns 0 on success, -1 on allocation failure (all buffers freed). */
+static int qwen3_alloc_work_buffers(qwen3_model_t *model) {
     int seq_len = QWEN3_MAX_SEQ_LEN;
     int hidden = model->hidden_size;
     int num_heads = model->num_heads;
@@ -1556,6 +1595,22 @@ static void qwen3_alloc_work_buffers(qwen3_model_t *model) {
     for (int i = 0; i < 3; i++) {
         model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
     }
+
+    /* Check all allocations at once */
+    if (!model->hidden_state || !model->residual ||
+        !model->q_buf || !model->k_buf || !model->v_buf ||
+        !model->attn_scores || !model->attn_out ||
+        !model->mlp_gate || !model->mlp_up || !model->mlp_out ||
+        !model->norm_buf ||
+        !model->attn_q_head || !model->attn_v_head || !model->attn_out_head ||
+        !model->layer_outputs[0] || !model->layer_outputs[1] ||
+        !model->layer_outputs[2]) {
+        fprintf(stderr, "qwen3_alloc_work_buffers: allocation failed\n");
+        qwen3_free_work_buffers(model);
+        return -1;
+    }
+
+    return 0;
 }
 
 /* Eager-mode model loading: reads all weights into RAM upfront. Parses
@@ -1621,7 +1676,10 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
                        model->head_dim, model->rope_theta);
 
     /* Allocate working memory */
-    qwen3_alloc_work_buffers(model);
+    if (qwen3_alloc_work_buffers(model) != 0) {
+        fprintf(stderr, "qwen3_model_load: work buffer allocation failed\n");
+        goto error;
+    }
 
     return model;
 
@@ -1700,7 +1758,10 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
                        model->head_dim, model->rope_theta);
 
     /* Allocate working memory */
-    qwen3_alloc_work_buffers(model);
+    if (qwen3_alloc_work_buffers(model) != 0) {
+        fprintf(stderr, "qwen3_model_load_mmap: work buffer allocation failed\n");
+        goto error;
+    }
 
     return model;
 
@@ -1735,26 +1796,8 @@ void qwen3_model_free(qwen3_model_t *model) {
         free(model->layers);
     }
 
-    free(model->hidden_state);
-    free(model->residual);
-    free(model->q_buf);
-    free(model->k_buf);
-    free(model->v_buf);
-    free(model->attn_scores);
-    free(model->attn_out);
-    free(model->mlp_gate);
-    free(model->mlp_up);
-    free(model->mlp_out);
-    free(model->norm_buf);
-
-    /* Free attention work buffers */
-    free(model->attn_q_head);
-    free(model->attn_v_head);
-    free(model->attn_out_head);
-
-    for (int i = 0; i < 3; i++) {
-        free(model->layer_outputs[i]);
-    }
+    /* Free all working memory buffers */
+    qwen3_free_work_buffers(model);
 
     /* Close mmap'd safetensors files if open */
     for (int i = 0; i < model->num_sf_files; i++) {

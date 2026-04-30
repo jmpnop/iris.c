@@ -14,6 +14,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 #ifdef USE_METAL
 #include "iris_metal.h"
@@ -225,9 +226,15 @@ struct iris_ctx {
 
 /* Global error message */
 static char g_error_msg[256] = {0};
+static pthread_mutex_t g_error_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 const char *iris_get_error(void) {
-    return g_error_msg;
+    static _Thread_local char tls_error[256];
+    pthread_mutex_lock(&g_error_mutex);
+    strncpy(tls_error, g_error_msg, sizeof(tls_error) - 1);
+    tls_error[255] = '\0';
+    pthread_mutex_unlock(&g_error_mutex);
+    return tls_error;
 }
 
 void iris_set_step_image_callback(iris_ctx *ctx, iris_step_image_cb_t callback) {
@@ -236,8 +243,10 @@ void iris_set_step_image_callback(iris_ctx *ctx, iris_step_image_cb_t callback) 
 }
 
 static void set_error(const char *msg) {
+    pthread_mutex_lock(&g_error_mutex);
     strncpy(g_error_msg, msg, sizeof(g_error_msg) - 1);
     g_error_msg[sizeof(g_error_msg) - 1] = '\0';
+    pthread_mutex_unlock(&g_error_mutex);
 }
 
 /* ========================================================================
@@ -2030,7 +2039,7 @@ void iris_set_seed(int64_t seed) {
 }
 
 const char *iris_model_info(iris_ctx *ctx) {
-    static char info[256];
+    static _Thread_local char info[256];
     const char *type;
     if (!ctx) {
         return "No model loaded";

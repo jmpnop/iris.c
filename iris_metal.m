@@ -369,7 +369,7 @@ static int tensor_batch_active(void);
 static int tensor_chain_active(void);
 
 /* Deferred pool releases to avoid buffer reuse while command buffers are in-flight. */
-#define DEFERRED_POOL_RELEASE_MAX 16384
+#define DEFERRED_POOL_RELEASE_MAX 65536
 static id<MTLBuffer> g_deferred_pool_buffers[DEFERRED_POOL_RELEASE_MAX];
 static int g_deferred_pool_count = 0;
 
@@ -435,12 +435,16 @@ static void pool_release_buffer(id<MTLBuffer> buffer) {
 
     if (tensor_batch_active() || tensor_chain_active()) {
         pthread_mutex_lock(&g_pool_mutex);
-        if (g_deferred_pool_count < DEFERRED_POOL_RELEASE_MAX) {
-            g_deferred_pool_buffers[g_deferred_pool_count++] = buffer;
+        if (g_deferred_pool_count >= DEFERRED_POOL_RELEASE_MAX) {
             pthread_mutex_unlock(&g_pool_mutex);
+            fprintf(stderr, "WARNING: deferred pool overflow (%d), forcing immediate release\n",
+                    DEFERRED_POOL_RELEASE_MAX);
+            pool_release_buffer_immediate(buffer);
             return;
         }
+        g_deferred_pool_buffers[g_deferred_pool_count++] = buffer;
         pthread_mutex_unlock(&g_pool_mutex);
+        return;
     }
 
     pool_release_buffer_immediate(buffer);
@@ -805,57 +809,44 @@ static void iris_metal_sgemm_impl(int transpose_a, int transpose_b,
                        alpha:alpha
                         beta:beta];
 
-        /* Use batch command buffer if in batch mode, otherwise create new one */
-        id<MTLCommandBuffer> cmdBuffer = g_in_batch ? g_batch_cmd : [g_queue commandBuffer];
-
-        [matmul encodeToCommandBuffer:cmdBuffer
-                           leftMatrix:matrixA
-                          rightMatrix:matrixB
-                         resultMatrix:matrixC];
-
-        if (g_in_batch) {
-            /* In batch mode: defer result copy until end_batch */
-            if (g_pending_count < MAX_BATCH_OUTPUTS) {
-                g_pending_outputs[g_pending_count].buffer = bufferC;
-                g_pending_outputs[g_pending_count].cpu_ptr = C;
-                g_pending_outputs[g_pending_count].size = sizeC;
-                g_pending_count++;
-                /* Don't release bufferA if it came from batch input cache */
-                if (!bufferA_from_cache) {
-                    pool_release_buffer(bufferA);
-                }
-            } else {
-                /* Overflow: create a one-shot command buffer so we don't
-                 * corrupt the shared g_batch_cmd that other ops depend on. */
-                id<MTLCommandBuffer> oneshot = [g_queue commandBuffer];
-                MPSMatrixMultiplication *matmul2 = [[MPSMatrixMultiplication alloc]
-                    initWithDevice:g_device
-                       transposeLeft:transpose_a ? YES : NO
-                      transposeRight:transpose_b ? YES : NO
-                          resultRows:M
-                       resultColumns:N
-                     interiorColumns:K
-                               alpha:alpha
-                                beta:beta];
-                [matmul2 encodeToCommandBuffer:oneshot
-                                   leftMatrix:matrixA
-                                  rightMatrix:matrixB
-                                 resultMatrix:matrixC];
-                [oneshot commit];
-                [oneshot waitUntilCompleted];
-                memcpy(C, [bufferC contents], sizeC);
-                if (!bufferA_from_cache) {
-                    pool_release_buffer(bufferA);
-                }
-                pool_release_buffer(bufferC);
+        if (g_in_batch && g_pending_count < MAX_BATCH_OUTPUTS) {
+            /* Batch mode, room in pending array: encode to shared batch cmd */
+            [matmul encodeToCommandBuffer:g_batch_cmd
+                               leftMatrix:matrixA
+                              rightMatrix:matrixB
+                             resultMatrix:matrixC];
+            g_pending_outputs[g_pending_count].buffer = bufferC;
+            g_pending_outputs[g_pending_count].cpu_ptr = C;
+            g_pending_outputs[g_pending_count].size = sizeC;
+            g_pending_count++;
+            if (!bufferA_from_cache) {
+                pool_release_buffer(bufferA);
             }
+        } else if (g_in_batch) {
+            /* Batch mode, overflow: one-shot cmd buffer, skip g_batch_cmd
+             * entirely to avoid double-encoding. */
+            id<MTLCommandBuffer> oneshot = [g_queue commandBuffer];
+            [matmul encodeToCommandBuffer:oneshot
+                               leftMatrix:matrixA
+                              rightMatrix:matrixB
+                             resultMatrix:matrixC];
+            [oneshot commit];
+            [oneshot waitUntilCompleted];
+            memcpy(C, [bufferC contents], sizeC);
+            if (!bufferA_from_cache) {
+                pool_release_buffer(bufferA);
+            }
+            pool_release_buffer(bufferC);
         } else {
             /* Not in batch mode: execute immediately */
+            id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+            [matmul encodeToCommandBuffer:cmdBuffer
+                               leftMatrix:matrixA
+                              rightMatrix:matrixB
+                             resultMatrix:matrixC];
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
             memcpy(C, [bufferC contents], sizeC);
-
-            /* Release pooled buffers */
             pool_release_buffer(bufferA);
             pool_release_buffer(bufferC);
         }
@@ -1312,49 +1303,41 @@ void iris_metal_sgemm_bf16(int transpose_a, int transpose_b,
                        alpha:alpha
                         beta:beta];
 
-        id<MTLCommandBuffer> cmdBuffer = g_in_batch ? g_batch_cmd : [g_queue commandBuffer];
-
-        [matmul encodeToCommandBuffer:cmdBuffer
-                           leftMatrix:matrixA
-                          rightMatrix:matrixB
-                         resultMatrix:matrixC];
-
-        if (g_in_batch) {
-            if (g_pending_count < MAX_BATCH_OUTPUTS) {
-                g_pending_outputs[g_pending_count].buffer = bufferC;
-                g_pending_outputs[g_pending_count].cpu_ptr = C;
-                g_pending_outputs[g_pending_count].size = sizeC;
-                g_pending_count++;
-                /* Don't release bufferA if it came from batch input cache */
-                if (!bufferA_from_cache) {
-                    pool_release_buffer(bufferA);
-                }
-            } else {
-                /* Overflow: create a one-shot command buffer so we don't
-                 * corrupt the shared g_batch_cmd that other ops depend on. */
-                id<MTLCommandBuffer> oneshot = [g_queue commandBuffer];
-                MPSMatrixMultiplication *matmul2 = [[MPSMatrixMultiplication alloc]
-                    initWithDevice:g_device
-                       transposeLeft:transpose_a ? YES : NO
-                      transposeRight:transpose_b ? YES : NO
-                          resultRows:M
-                       resultColumns:N
-                     interiorColumns:K
-                               alpha:alpha
-                                beta:beta];
-                [matmul2 encodeToCommandBuffer:oneshot
-                                   leftMatrix:matrixA
-                                  rightMatrix:matrixB
-                                 resultMatrix:matrixC];
-                [oneshot commit];
-                [oneshot waitUntilCompleted];
-                memcpy(C, [bufferC contents], sizeC);
-                if (!bufferA_from_cache) {
-                    pool_release_buffer(bufferA);
-                }
-                pool_release_buffer(bufferC);
+        if (g_in_batch && g_pending_count < MAX_BATCH_OUTPUTS) {
+            /* Batch mode, room in pending array: encode to shared batch cmd */
+            [matmul encodeToCommandBuffer:g_batch_cmd
+                               leftMatrix:matrixA
+                              rightMatrix:matrixB
+                             resultMatrix:matrixC];
+            g_pending_outputs[g_pending_count].buffer = bufferC;
+            g_pending_outputs[g_pending_count].cpu_ptr = C;
+            g_pending_outputs[g_pending_count].size = sizeC;
+            g_pending_count++;
+            if (!bufferA_from_cache) {
+                pool_release_buffer(bufferA);
             }
+        } else if (g_in_batch) {
+            /* Batch mode, overflow: one-shot cmd buffer, skip g_batch_cmd
+             * entirely to avoid double-encoding. */
+            id<MTLCommandBuffer> oneshot = [g_queue commandBuffer];
+            [matmul encodeToCommandBuffer:oneshot
+                               leftMatrix:matrixA
+                              rightMatrix:matrixB
+                             resultMatrix:matrixC];
+            [oneshot commit];
+            [oneshot waitUntilCompleted];
+            memcpy(C, [bufferC contents], sizeC);
+            if (!bufferA_from_cache) {
+                pool_release_buffer(bufferA);
+            }
+            pool_release_buffer(bufferC);
         } else {
+            /* Not in batch mode: execute immediately */
+            id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+            [matmul encodeToCommandBuffer:cmdBuffer
+                               leftMatrix:matrixA
+                              rightMatrix:matrixB
+                             resultMatrix:matrixC];
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
             memcpy(C, [bufferC contents], sizeC);

@@ -197,8 +197,8 @@ static char *parse_json_string(const char **pp) {
         }
     }
 
-    /* Allocate and copy */
-    char *result = malloc(len + 1);
+    /* Allocate worst-case: each escape counted as 1 can expand to 3 UTF-8 bytes */
+    char *result = (char *)malloc(len * 3 + 1);
     if (!result) return NULL;
 
     p = start;
@@ -637,15 +637,9 @@ void qwen3_tokenizer_free(qwen3_tokenizer_t *tok) {
  * ======================================================================== */
 
 static int get_merge_rank(qwen3_tokenizer_t *tok, const char *left, const char *right) {
-    /* Build "left right" string */
-    int len1 = strlen(left);
-    int len2 = strlen(right);
-    char *key = malloc(len1 + len2 + 2);
-    if (!key) return -1;
-    memcpy(key, left, len1);
-    key[len1] = ' ';
-    memcpy(key + len1 + 1, right, len2);
-    key[len1 + len2 + 1] = '\0';
+    /* Build "left right" string on the stack (max token len is 256) */
+    char key[513];  /* 256 + 1 space + 256 */
+    snprintf(key, sizeof(key), "%s %s", left, right);
 
     /* Lookup in hash table */
     unsigned int h = hash_string(key) % tok->hash_size;
@@ -656,7 +650,6 @@ static int get_merge_rank(qwen3_tokenizer_t *tok, const char *left, const char *
             /* Check if this is the right merge */
             if (strcmp(tok->merges[rank].left, left) == 0 &&
                 strcmp(tok->merges[rank].right, right) == 0) {
-                free(key);
                 return rank;
             }
         }
@@ -664,7 +657,6 @@ static int get_merge_rank(qwen3_tokenizer_t *tok, const char *left, const char *
         probes++;
     }
 
-    free(key);
     return -1;
 }
 
@@ -829,10 +821,10 @@ static char **pretokenize(const char *text, int *num_chunks) {
             while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
                           (unsigned char)*p >= 128)) {
                 if ((unsigned char)*p >= 128) {
-                    /* Skip UTF-8 continuation bytes */
-                    if (((unsigned char)*p & 0xE0) == 0xC0) p += 2;
-                    else if (((unsigned char)*p & 0xF0) == 0xE0) p += 3;
-                    else if (((unsigned char)*p & 0xF8) == 0xF0) p += 4;
+                    /* Skip UTF-8 multi-byte sequences, validating continuation bytes */
+                    if (((unsigned char)*p & 0xE0) == 0xC0 && p[1]) p += 2;
+                    else if (((unsigned char)*p & 0xF0) == 0xE0 && p[1] && p[2]) p += 3;
+                    else if (((unsigned char)*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) p += 4;
                     else p++;
                 } else {
                     p++;
@@ -849,9 +841,9 @@ static char **pretokenize(const char *text, int *num_chunks) {
             while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
                           (unsigned char)*p >= 128)) {
                 if ((unsigned char)*p >= 128) {
-                    if (((unsigned char)*p & 0xE0) == 0xC0) p += 2;
-                    else if (((unsigned char)*p & 0xF0) == 0xE0) p += 3;
-                    else if (((unsigned char)*p & 0xF8) == 0xF0) p += 4;
+                    if (((unsigned char)*p & 0xE0) == 0xC0 && p[1]) p += 2;
+                    else if (((unsigned char)*p & 0xF0) == 0xE0 && p[1] && p[2]) p += 3;
+                    else if (((unsigned char)*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) p += 4;
                     else p++;
                 } else {
                     p++;

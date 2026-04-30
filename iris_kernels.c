@@ -108,27 +108,43 @@ void iris_rand(float *out, int n) {
  * ======================================================================== */
 
 void iris_add(float *out, const float *a, const float *b, int n) {
+#ifdef USE_BLAS
+    vDSP_vadd(a, 1, b, 1, out, 1, n);
+#else
     for (int i = 0; i < n; i++) {
         out[i] = a[i] + b[i];
     }
+#endif
 }
 
 void iris_add_inplace(float *a, const float *b, int n) {
+#ifdef USE_BLAS
+    vDSP_vadd(a, 1, b, 1, a, 1, n);
+#else
     for (int i = 0; i < n; i++) {
         a[i] += b[i];
     }
+#endif
 }
 
 void iris_mul_inplace(float *a, const float *b, int n) {
+#ifdef USE_BLAS
+    vDSP_vmul(a, 1, b, 1, a, 1, n);
+#else
     for (int i = 0; i < n; i++) {
         a[i] *= b[i];
     }
+#endif
 }
 
 void iris_axpy(float *a, float scale, const float *b, int n) {
+#ifdef USE_BLAS
+    cblas_saxpy(n, scale, b, 1, a, 1);
+#else
     for (int i = 0; i < n; i++) {
         a[i] += scale * b[i];
     }
+#endif
 }
 
 /* ========================================================================
@@ -314,7 +330,10 @@ void iris_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
 
     /* Fallback: convert bf16 to f32 and use regular linear */
     float *W_f32 = (float *)malloc((size_t)out_dim * in_dim * sizeof(float));
-    if (!W_f32) return;
+    if (!W_f32) {
+        memset(y, 0, (size_t)seq_len * out_dim * sizeof(float));
+        return;
+    }
 
     /* Convert bf16 to f32 */
     for (int i = 0; i < out_dim * in_dim; i++) {
@@ -492,6 +511,14 @@ void iris_rms_norm(float *out, const float *x, const float *weight,
         const float *x_row = x + s * hidden;
         float *out_row = out + s * hidden;
 
+#ifdef USE_BLAS
+        float sum_sq;
+        vDSP_svesq(x_row, 1, &sum_sq, hidden);
+        float rms = sqrtf(sum_sq / hidden + eps);
+        float inv_rms = 1.0f / rms;
+        vDSP_vsmul(x_row, 1, &inv_rms, out_row, 1, hidden);
+        vDSP_vmul(out_row, 1, weight, 1, out_row, 1, hidden);
+#else
         /* Compute RMS */
         float sum_sq = 0.0f;
         for (int i = 0; i < hidden; i++) {
@@ -504,6 +531,7 @@ void iris_rms_norm(float *out, const float *x, const float *weight,
         for (int i = 0; i < hidden; i++) {
             out_row[i] = x_row[i] * rms_inv * weight[i];
         }
+#endif
     }
 }
 
@@ -517,7 +545,7 @@ void iris_group_norm(float *out, const float *x, const float *gamma, const float
             int c_start = g * channels_per_group;
             int c_end = c_start + channels_per_group;
 
-            float mean = 0.0f;
+            double mean = 0.0;
             int count = 0;
             for (int c = c_start; c < c_end; c++) {
                 for (int i = 0; i < spatial; i++) {
@@ -528,22 +556,23 @@ void iris_group_norm(float *out, const float *x, const float *gamma, const float
             }
             mean /= count;
 
-            float var = 0.0f;
+            double var = 0.0;
             for (int c = c_start; c < c_end; c++) {
                 for (int i = 0; i < spatial; i++) {
                     int idx = b * channels * spatial + c * spatial + i;
-                    float diff = x[idx] - mean;
+                    double diff = x[idx] - (float)mean;
                     var += diff * diff;
                 }
             }
             var /= count;
 
-            float std_inv = 1.0f / sqrtf(var + eps);
+            float std_inv = 1.0f / sqrtf((float)var + eps);
 
+            float mean_f = (float)mean;
             for (int c = c_start; c < c_end; c++) {
                 for (int i = 0; i < spatial; i++) {
                     int idx = b * channels * spatial + c * spatial + i;
-                    float norm = (x[idx] - mean) * std_inv;
+                    float norm = (x[idx] - mean_f) * std_inv;
                     out[idx] = gamma[c] * norm + beta[c];
                 }
             }
@@ -658,6 +687,7 @@ void iris_attention(float *out, const float *Q, const float *K, const float *V,
                     float scale) {
     /* Allocate attention scores */
     float *scores = (float *)malloc(seq_q * seq_k * sizeof(float));
+    if (!scores) return;
 
     for (int b = 0; b < batch; b++) {
         for (int h = 0; h < heads; h++) {
@@ -904,6 +934,23 @@ void iris_flash_attention(float *out, const float *Q, const float *K, const floa
 
     /* Allocate tile scratch buffer */
     float *tile_scores = (float *)malloc(q_tile_size * k_tile_size * sizeof(float));
+    if (!tile_scores) return;
+
+    /* Allocate contiguous buffers once, reuse across all heads.
+     * Use max(seq_q, seq_k) sizes so both small and large paths fit. */
+    float *Q_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
+    float *K_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
+    float *V_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
+    float *out_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
+
+    if (!Q_contig || !K_contig || !V_contig || !out_contig) {
+        free(Q_contig);
+        free(K_contig);
+        free(V_contig);
+        free(out_contig);
+        free(tile_scores);
+        return;
+    }
 
     /* Process each head */
     for (int h = 0; h < heads; h++) {
@@ -915,78 +962,41 @@ void iris_flash_attention(float *out, const float *Q, const float *K, const floa
         /* Stride between consecutive positions for this head */
         int hidden = heads * head_dim;
 
+        /* Extract head data into contiguous buffers */
+        for (int i = 0; i < seq_q; i++) {
+            for (int d = 0; d < head_dim; d++) {
+                Q_contig[i * head_dim + d] = Q_head[i * hidden + d];
+            }
+        }
+        for (int j = 0; j < seq_k; j++) {
+            for (int d = 0; d < head_dim; d++) {
+                K_contig[j * head_dim + d] = K_head[j * hidden + d];
+                V_contig[j * head_dim + d] = V_head[j * hidden + d];
+            }
+        }
+
         /* For small sequences, use simple non-tiled version */
         if (seq_q <= 64 && seq_k <= 128) {
-            /* Extract head data into contiguous buffers */
-            float *Q_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
-            float *K_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
-            float *V_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
-            float *out_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
-
-            for (int i = 0; i < seq_q; i++) {
-                for (int d = 0; d < head_dim; d++) {
-                    Q_contig[i * head_dim + d] = Q_head[i * hidden + d];
-                }
-            }
-            for (int j = 0; j < seq_k; j++) {
-                for (int d = 0; d < head_dim; d++) {
-                    K_contig[j * head_dim + d] = K_head[j * hidden + d];
-                    V_contig[j * head_dim + d] = V_head[j * hidden + d];
-                }
-            }
-
             flash_attention_head(out_contig, Q_contig, K_contig, V_contig,
                                  seq_q, seq_k, head_dim, scale);
-
-            /* Copy back with stride */
-            for (int i = 0; i < seq_q; i++) {
-                for (int d = 0; d < head_dim; d++) {
-                    out_head[i * hidden + d] = out_contig[i * head_dim + d];
-                }
-            }
-
-            free(Q_contig);
-            free(K_contig);
-            free(V_contig);
-            free(out_contig);
         } else {
-            /* For larger sequences, use tiled version with strided access */
-            /* Extract head data into contiguous buffers for BLAS efficiency */
-            float *Q_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
-            float *K_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
-            float *V_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
-            float *out_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
-
-            for (int i = 0; i < seq_q; i++) {
-                for (int d = 0; d < head_dim; d++) {
-                    Q_contig[i * head_dim + d] = Q_head[i * hidden + d];
-                }
-            }
-            for (int j = 0; j < seq_k; j++) {
-                for (int d = 0; d < head_dim; d++) {
-                    K_contig[j * head_dim + d] = K_head[j * hidden + d];
-                    V_contig[j * head_dim + d] = V_head[j * hidden + d];
-                }
-            }
-
             flash_attention_head_tiled(out_contig, Q_contig, K_contig, V_contig,
                                         seq_q, seq_k, head_dim, scale,
                                         tile_scores, q_tile_size, k_tile_size);
+        }
 
-            /* Copy back with stride */
-            for (int i = 0; i < seq_q; i++) {
-                for (int d = 0; d < head_dim; d++) {
-                    out_head[i * hidden + d] = out_contig[i * head_dim + d];
-                }
+        /* Copy back with stride */
+        for (int i = 0; i < seq_q; i++) {
+            for (int d = 0; d < head_dim; d++) {
+                out_head[i * hidden + d] = out_contig[i * head_dim + d];
             }
-
-            free(Q_contig);
-            free(K_contig);
-            free(V_contig);
-            free(out_contig);
         }
     }
 
+    free(Q_contig);
+    free(K_contig);
+    free(V_contig);
+    free(out_contig);
     free(tile_scores);
 }
 
@@ -1026,11 +1036,15 @@ void iris_apply_rope(float *x, const float *freqs,
 void iris_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, float theta) {
     int half_dim = dim / 2;
 
+    /* Precompute inverse frequencies (depend only on d, not position) */
+    float *inv_freq = (float *)alloca(half_dim * sizeof(float));
+    for (int d = 0; d < half_dim; d++)
+        inv_freq[d] = 1.0f / powf(theta, (float)(2 * d) / (float)dim);
+
     for (int s = 0; s < seq; s++) {
         float p = (float)pos[s];
         for (int d = 0; d < half_dim; d++) {
-            float freq = 1.0f / powf(theta, (float)(2 * d) / (float)dim);
-            float angle = p * freq;
+            float angle = p * inv_freq[d];
             freqs[s * half_dim * 2 + d * 2] = cosf(angle);
             freqs[s * half_dim * 2 + d * 2 + 1] = sinf(angle);
         }

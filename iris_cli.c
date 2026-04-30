@@ -262,9 +262,11 @@ static void display_image(const char *path) {
     }
     if (state.open_enabled) {
 #ifdef __APPLE__
-        char cmd[CLI_MAX_PATH + 16];
-        snprintf(cmd, sizeof(cmd), "open \"%s\" 2>/dev/null &", path);
-        system(cmd);
+        pid_t pid = fork();
+        if (pid == 0) {
+            execlp("open", "open", path, (char *)NULL);
+            _exit(127);
+        }
 #endif
     }
 }
@@ -363,7 +365,7 @@ static int generate_image(const char *prompt, const char *ref_image,
     if (state.seed >= 0) {
         actual_seed = state.seed;
     } else {
-        actual_seed = (int64_t)time(NULL) ^ (int64_t)rand();
+        actual_seed = (int64_t)arc4random() | ((int64_t)arc4random() << 32);
     }
     params.seed = actual_seed;
     printf("Seed: %lld\n", (long long)actual_seed);
@@ -496,7 +498,7 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     if (state.seed >= 0) {
         actual_seed = state.seed;
     } else {
-        actual_seed = (int64_t)time(NULL) ^ (int64_t)rand();
+        actual_seed = (int64_t)arc4random() | ((int64_t)arc4random() << 32);
     }
     params.seed = actual_seed;
     printf("Seed: %lld\n", (long long)actual_seed);
@@ -842,7 +844,7 @@ static void cmd_explore(char *arg) {
     if (!iris_is_distilled(state.ctx)) {
         /* Base model: use iris_generate() for CFG support */
         for (int i = 0; i < count; i++) {
-            int64_t seed = (int64_t)time(NULL) ^ (int64_t)rand() ^ (int64_t)i;
+            int64_t seed = (int64_t)arc4random() | ((int64_t)arc4random() << 32);
             params.seed = seed;
 
             printf("  [%d/%d] Seed: %lld ", i + 1, count, (long long)seed);
@@ -888,7 +890,7 @@ static void cmd_explore(char *arg) {
         }
 
         for (int i = 0; i < count; i++) {
-            int64_t seed = (int64_t)time(NULL) ^ (int64_t)rand() ^ (int64_t)i;
+            int64_t seed = (int64_t)arc4random() | ((int64_t)arc4random() << 32);
             params.seed = seed;
 
             printf("  [%d/%d] Seed: %lld ", i + 1, count, (long long)seed);
@@ -1190,6 +1192,10 @@ int iris_cli_run(iris_ctx *ctx, const char *model_dir) {
 
     /* Cleanup embedding cache */
     emb_cache_free();
+
+    /* Free reference paths */
+    for (int i = 0; i < state.refs_count; i++) free(state.refs[i].path);
+    free(state.refs);
 
     printf("Goodbye.\n");
     return 0;

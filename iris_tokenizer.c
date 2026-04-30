@@ -74,14 +74,18 @@ static unsigned int hash_string(const char *str) {
 static void vocab_hash_insert(vocab_entry_t *table, int hash_size,
                               const char *token, int id) {
     unsigned int h = hash_string(token) % hash_size;
-    while (table[h].token != NULL) {
+    int probes = 0;
+    while (probes < hash_size && table[h].token != NULL) {
         if (strcmp(table[h].token, token) == 0) {
             return;  /* Already exists */
         }
         h = (h + 1) % hash_size;
+        probes++;
     }
-    table[h].token = strdup(token);
-    table[h].id = id;
+    if (probes < hash_size) {
+        table[h].token = strdup(token);
+        table[h].id = id;
+    }
 }
 
 /* Lookup in hash table, returns -1 if not found */
@@ -209,9 +213,9 @@ static int *bpe_tokenize_word(iris_tokenizer *tok, const char *word,
         return NULL;
     }
 
-    /* Start with character-level tokens */
-    int max_chars = len;  /* UTF-8 can have multi-byte chars */
-    int *tokens = malloc(max_chars * sizeof(int));
+    /* Start with character-level tokens.
+     * Allocate for worst case: every byte becomes a token (byte fallback). */
+    int *tokens = malloc(len * sizeof(int));
     int n = 0;
 
     const char *p = word;
@@ -418,7 +422,8 @@ int *iris_tokenize(iris_tokenizer *tok, const char *text,
     }
 
     /* BPE tokenize each word */
-    for (int w = 0; w < num_words && total < max_len - (tok->add_eos ? 1 : 0); w++) {
+    int w;
+    for (w = 0; w < num_words && total < max_len - (tok->add_eos ? 1 : 0); w++) {
         int n;
         int *word_tokens = bpe_tokenize_word(tok, words[w], &n);
 
@@ -433,6 +438,8 @@ int *iris_tokenize(iris_tokenizer *tok, const char *text,
         free(word_tokens);
         free(words[w]);
     }
+    /* Free any remaining words skipped by early break */
+    for (; w < num_words; w++) free(words[w]);
     free(words);
 
     /* Add EOS if configured */
