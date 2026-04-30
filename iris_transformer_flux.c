@@ -2183,14 +2183,16 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
                        img_seq, hidden, hidden);
     iris_gpu_end_batch();
 
-    /* Apply QK normalization (per-head RMSNorm) */
+    /* Fused QK normalization + RoPE */
+#ifdef USE_METAL
+    iris_metal_qknorm_rope(img_q, img_k, block->img_norm_q_weight, block->img_norm_k_weight,
+                            img_rope_cos, img_rope_sin, img_seq, heads, head_dim, eps);
+#else
     apply_qk_norm(img_q, img_k, block->img_norm_q_weight, block->img_norm_k_weight,
                   img_seq, heads, head_dim, eps);
-
-    /* Apply 2D RoPE to image Q, K (using h, w positions) */
-    int axis_dim = 32;
-    apply_rope_2d(img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, 32);
+    apply_rope_2d(img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, 32);
+#endif
 
 #ifdef DEBUG_DOUBLE_BLOCK
     if (block_idx == 0) {
@@ -2221,15 +2223,16 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
                        txt_seq, hidden, hidden);
     iris_gpu_end_batch();
 
-    /* Apply QK normalization */
+    /* Fused QK normalization + RoPE for text */
+#ifdef USE_METAL
+    iris_metal_qknorm_rope(txt_q, txt_k, block->txt_norm_q_weight, block->txt_norm_k_weight,
+                            txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, eps);
+#else
     apply_qk_norm(txt_q, txt_k, block->txt_norm_q_weight, block->txt_norm_k_weight,
                   txt_seq, heads, head_dim, eps);
-
-    /* Apply text RoPE - text tokens have position IDs (0, 0, 0, L) where L is sequence index
-     * This applies rotation in axis 3 (dims 96-127)
-     */
-    apply_rope_2d(txt_q, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(txt_k, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(txt_q, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, 32);
+    apply_rope_2d(txt_k, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, 32);
+#endif
 
     /* Joint attention - use pre-allocated buffers */
     float *img_attn_out = tf->double_img_attn_out;
@@ -3415,26 +3418,25 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     double _t3 = prof_get_time();
     prof_single_split += _t3 - _t2;
 
-    /* Apply QK normalization */
-    apply_qk_norm(q, k, block->norm_q_weight, block->norm_k_weight,
-                  seq, heads, head_dim, eps);
-
-    /* Apply RoPE: layout is [txt, img]
-     * - Text portion (0 to img_offset-1): RoPE in axis 3 (L dimension)
-     * - Image portion (img_offset to seq-1): 2D RoPE based on H/W positions
-     */
-    int axis_dim = 32;
+    /* Fused QK norm + RoPE: split into text and image portions.
+     * QK norm is per-head, position-independent — splitting is equivalent. */
     int txt_seq = img_offset;
-
-    /* Text portion: apply RoPE in axis 3 (L dimension = sequence position) */
-    apply_rope_2d(q, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(k, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
-
-    /* Image portion: apply 2D RoPE starting at img_offset */
     float *img_q = q + img_offset * h_size;
     float *img_k = k + img_offset * h_size;
-    apply_rope_2d(img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
+
+#ifdef USE_METAL
+    iris_metal_qknorm_rope(q, k, block->norm_q_weight, block->norm_k_weight,
+                            txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, eps);
+    iris_metal_qknorm_rope(img_q, img_k, block->norm_q_weight, block->norm_k_weight,
+                            img_rope_cos, img_rope_sin, img_seq, heads, head_dim, eps);
+#else
+    apply_qk_norm(q, k, block->norm_q_weight, block->norm_k_weight,
+                  seq, heads, head_dim, eps);
+    apply_rope_2d(q, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, 32);
+    apply_rope_2d(k, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, 32);
+    apply_rope_2d(img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, 32);
+    apply_rope_2d(img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, 32);
+#endif
 
     double _t4 = prof_get_time();
     prof_single_qknorm_rope += _t4 - _t3;

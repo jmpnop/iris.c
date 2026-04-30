@@ -706,6 +706,16 @@ void iris_metal_qk_rms_norm(float *q, float *k,
                             int seq, int heads, int head_dim, float eps);
 
 /*
+ * Fused QK RMSNorm + RoPE on CPU pointers (consecutive-pair rotation).
+ * Replaces separate iris_metal_qk_rms_norm + 2x iris_metal_rope_2d.
+ * Returns 1 on success, 0 on failure (caller should fall back to CPU).
+ */
+int iris_metal_qknorm_rope(float *q, float *k,
+                            const float *q_weight, const float *k_weight,
+                            const float *cos_freq, const float *sin_freq,
+                            int seq, int heads, int head_dim, float eps);
+
+/*
  * GPU-accelerated LayerNorm + AdaLN modulation.
  * out = (1 + scale) * layernorm(x) + shift
  * x: [seq_len, hidden], shift/scale: [hidden]

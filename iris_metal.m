@@ -3753,6 +3753,73 @@ void iris_metal_qk_rms_norm(float *q, float *k,
     }
 }
 
+/* Fused QK RMSNorm + RoPE on CPU pointers. Replaces separate
+ * iris_metal_qk_rms_norm + 2x iris_metal_rope_2d calls.
+ * Returns 1 on success, 0 on failure (caller falls back to CPU). */
+int iris_metal_qknorm_rope(float *q, float *k,
+                            const float *q_weight, const float *k_weight,
+                            const float *cos_freq, const float *sin_freq,
+                            int seq, int heads, int head_dim, float eps) {
+    if (!g_shaders_initialized || !g_qknorm_rope_pipeline) return 0;
+    if (!q || !k || seq <= 0) return 0;
+
+    @autoreleasepool {
+        size_t data_size = (size_t)seq * heads * head_dim * sizeof(float);
+        size_t weight_size = (size_t)head_dim * sizeof(float);
+        size_t freq_size = (size_t)seq * head_dim * sizeof(float);
+
+        id<MTLBuffer> bufQ = pool_get_buffer(data_size);
+        id<MTLBuffer> bufK = pool_get_buffer(data_size);
+        id<MTLBuffer> bufCos = pool_get_buffer(freq_size);
+        id<MTLBuffer> bufSin = pool_get_buffer(freq_size);
+        id<MTLBuffer> bufQWeight = get_cached_weight_buffer(q_weight, weight_size);
+        id<MTLBuffer> bufKWeight = get_cached_weight_buffer(k_weight, weight_size);
+
+        if (!bufQ || !bufK || !bufCos || !bufSin || !bufQWeight || !bufKWeight) {
+            if (bufQ) pool_release_buffer(bufQ);
+            if (bufK) pool_release_buffer(bufK);
+            if (bufCos) pool_release_buffer(bufCos);
+            if (bufSin) pool_release_buffer(bufSin);
+            return 0;
+        }
+
+        memcpy([bufQ contents], q, data_size);
+        memcpy([bufK contents], k, data_size);
+        memcpy([bufCos contents], cos_freq, freq_size);
+        memcpy([bufSin contents], sin_freq, freq_size);
+
+        id<MTLCommandBuffer> cmdBuffer = encode_compute_shader();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_qknorm_rope_pipeline];
+        [encoder setBuffer:bufQ offset:0 atIndex:0];
+        [encoder setBuffer:bufK offset:0 atIndex:1];
+        [encoder setBuffer:bufQWeight offset:0 atIndex:2];
+        [encoder setBuffer:bufKWeight offset:0 atIndex:3];
+        [encoder setBuffer:bufCos offset:0 atIndex:4];
+        [encoder setBuffer:bufSin offset:0 atIndex:5];
+        [encoder setBytes:&heads length:sizeof(int) atIndex:6];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:8];
+
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+        [encoder endEncoding];
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        memcpy(q, [bufQ contents], data_size);
+        memcpy(k, [bufK contents], data_size);
+
+        pool_release_buffer(bufQ);
+        pool_release_buffer(bufK);
+        pool_release_buffer(bufCos);
+        pool_release_buffer(bufSin);
+    }
+    return 1;
+}
+
 void iris_metal_adaln_norm(float *out, const float *x,
                            const float *shift, const float *scale,
                            int seq_len, int hidden, float eps) {
