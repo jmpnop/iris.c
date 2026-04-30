@@ -545,6 +545,11 @@ void iris_gpu_group_norm_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
                               const float *gamma, const float *beta,
                               int batch, int channels, int spatial, int num_groups, float eps);
 
+/* Fused GroupNorm + Swish on f32 GPU tensor (same signature as group_norm, applies Swish inline) */
+void iris_gpu_group_norm_swish_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
+                                    const float *gamma, const float *beta,
+                                    int batch, int channels, int spatial, int num_groups, float eps);
+
 /* Swish/SiLU on f32 GPU tensor: out = x * sigmoid(x), in-place safe */
 void iris_gpu_swish_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x, int n);
 

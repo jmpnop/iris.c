@@ -270,6 +270,7 @@ static id<MTLComputePipelineState> g_attention_fused_bf16_pipeline;
 /* F32 VAE pipelines */
 static id<MTLComputePipelineState> g_group_norm_f32_pipeline;
 static id<MTLComputePipelineState> g_swish_f32_pipeline;
+static id<MTLComputePipelineState> g_group_norm_swish_f32_pipeline;
 static id<MTLComputePipelineState> g_add_f32_pipeline;
 static id<MTLComputePipelineState> g_upsample_nearest_2x_f32_pipeline;
 static id<MTLComputePipelineState> g_transpose_2d_scale_f32_pipeline;
@@ -3619,6 +3620,10 @@ int iris_metal_init_shaders(void) {
         if (func) {
             g_swish_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
         }
+        func = [g_shader_library newFunctionWithName:@"group_norm_swish_f32"];
+        if (func) {
+            g_group_norm_swish_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
         func = [g_shader_library newFunctionWithName:@"add_f32"];
         if (func) {
             g_add_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
@@ -6663,6 +6668,51 @@ void iris_gpu_group_norm_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
         [encoder setBytes:&eps length:sizeof(float) atIndex:7];
 
         /* One threadgroup per (batch, group) pair */
+        NSUInteger threads_per_group = 256;
+        [encoder dispatchThreadgroups:MTLSizeMake(total_groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        x->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            x->has_pending_work = 0;
+        }
+    }
+}
+
+/* Fused GroupNorm + Swish on f32 GPU tensor */
+void iris_gpu_group_norm_swish_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
+                                    const float *gamma, const float *beta,
+                                    int batch, int channels, int spatial, int num_groups, float eps) {
+    if (!g_shaders_initialized || !g_group_norm_swish_f32_pipeline) return;
+    if (!out || !x || !gamma || !beta) return;
+
+    @autoreleasepool {
+        size_t gamma_size = (size_t)channels * sizeof(float);
+        id<MTLBuffer> bufGamma = get_cached_weight_buffer(gamma, gamma_size);
+        id<MTLBuffer> bufBeta = get_cached_weight_buffer(beta, gamma_size);
+        if (!bufGamma || !bufBeta) return;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        int channels_per_group = channels / num_groups;
+        int total_groups = batch * num_groups;
+
+        [encoder setComputePipelineState:g_group_norm_swish_f32_pipeline];
+        [encoder setBuffer:x->buffer offset:0 atIndex:0];
+        [encoder setBuffer:bufGamma offset:0 atIndex:1];
+        [encoder setBuffer:bufBeta offset:0 atIndex:2];
+        [encoder setBuffer:out->buffer offset:0 atIndex:3];
+        [encoder setBytes:&channels length:sizeof(int) atIndex:4];
+        [encoder setBytes:&spatial length:sizeof(int) atIndex:5];
+        [encoder setBytes:&channels_per_group length:sizeof(int) atIndex:6];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:7];
+
         NSUInteger threads_per_group = 256;
         [encoder dispatchThreadgroups:MTLSizeMake(total_groups, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];

@@ -577,9 +577,8 @@ static iris_gpu_tensor_t resblock_forward_gpu(iris_gpu_tensor_t x,
     iris_gpu_tensor_t work = iris_gpu_tensor_alloc((size_t)batch * in_ch * spatial);
     if (!work) { iris_gpu_tensor_free(skip); return NULL; }
 
-    iris_gpu_group_norm_f32(work, x, block->norm1_weight, block->norm1_bias,
-                             batch, in_ch, spatial, num_groups, eps);
-    iris_gpu_swish_f32(work, work, batch * in_ch * spatial);
+    iris_gpu_group_norm_swish_f32(work, x, block->norm1_weight, block->norm1_bias,
+                                   batch, in_ch, spatial, num_groups, eps);
 
     iris_gpu_tensor_t conv1_out = iris_gpu_conv2d_f32(work, block->conv1_weight, block->conv1_bias,
                                                        batch, in_ch, out_ch, H, W, 3, 3, 1, 1);
@@ -589,9 +588,8 @@ static iris_gpu_tensor_t resblock_forward_gpu(iris_gpu_tensor_t x,
     work = iris_gpu_tensor_alloc((size_t)batch * out_ch * spatial);
     if (!work) { iris_gpu_tensor_free(skip); iris_gpu_tensor_free(conv1_out); return NULL; }
 
-    iris_gpu_group_norm_f32(work, conv1_out, block->norm2_weight, block->norm2_bias,
-                             batch, out_ch, spatial, num_groups, eps);
-    iris_gpu_swish_f32(work, work, batch * out_ch * spatial);
+    iris_gpu_group_norm_swish_f32(work, conv1_out, block->norm2_weight, block->norm2_bias,
+                                   batch, out_ch, spatial, num_groups, eps);
     iris_gpu_tensor_free(conv1_out);
 
     conv1_out = iris_gpu_conv2d_f32(work, block->conv2_weight, block->conv2_bias,
@@ -761,9 +759,8 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
     size_t final_size = (size_t)batch * out_ch * cur_h * cur_w;
     t = iris_gpu_tensor_alloc(final_size);
     if (!t) { iris_gpu_tensor_free(x); iris_gpu_batch_end(); return NULL; }
-    iris_gpu_group_norm_f32(t, x, vae->dec_norm_out_weight, vae->dec_norm_out_bias,
-                             batch, out_ch, cur_h * cur_w, vae->num_groups, vae->eps);
-    iris_gpu_swish_f32(t, t, (int)final_size);
+    iris_gpu_group_norm_swish_f32(t, x, vae->dec_norm_out_weight, vae->dec_norm_out_bias,
+                                   batch, out_ch, cur_h * cur_w, vae->num_groups, vae->eps);
     iris_gpu_tensor_free(x);
 
     x = iris_gpu_conv2d_f32(t, vae->dec_conv_out_weight, vae->dec_conv_out_bias,

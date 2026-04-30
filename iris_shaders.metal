@@ -2382,6 +2382,68 @@ kernel void group_norm_f32(
     }
 }
 
+/* Fused GroupNorm + Swish: normalize then apply x*sigmoid(x) in one pass */
+kernel void group_norm_swish_f32(
+    device const float *x [[buffer(0)]],
+    device const float *gamma [[buffer(1)]],
+    device const float *beta [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant int &channels [[buffer(4)]],
+    constant int &spatial [[buffer(5)]],
+    constant int &channels_per_group [[buffer(6)]],
+    constant float &eps [[buffer(7)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+    threadgroup float shared_sum2[256];
+
+    int num_groups = channels / channels_per_group;
+    int batch_idx = group_id / num_groups;
+    int group_idx = group_id % num_groups;
+
+    int c_start = group_idx * channels_per_group;
+    int group_size = channels_per_group * spatial;
+
+    device const float *x_batch = x + batch_idx * channels * spatial;
+    device float *out_batch = out + batch_idx * channels * spatial;
+
+    float local_sum = 0.0f;
+    float local_sum2 = 0.0f;
+    for (int i = tid; i < group_size; i += threads) {
+        int c = c_start + i / spatial;
+        int s = i % spatial;
+        float val = x_batch[c * spatial + s];
+        local_sum += val;
+        local_sum2 += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    shared_sum2[tid] = local_sum2;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+            shared_sum2[tid] += shared_sum2[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float mean = shared_sum[0] / float(group_size);
+    float var = shared_sum2[0] / float(group_size) - mean * mean;
+    float inv_std = rsqrt(var + eps);
+
+    for (int i = tid; i < group_size; i += threads) {
+        int c = c_start + i / spatial;
+        int s = i % spatial;
+        int idx = c * spatial + s;
+        float normed = gamma[c] * ((x_batch[idx] - mean) * inv_std) + beta[c];
+        out_batch[idx] = normed / (1.0f + exp(-normed));
+    }
+}
+
 /* Swish f32: out = x * sigmoid(x), in-place safe (out can alias x) */
 kernel void swish_f32(
     device const float *x [[buffer(0)]],
