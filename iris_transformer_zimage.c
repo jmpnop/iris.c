@@ -1921,6 +1921,8 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
     int cache_hit = (tf->cpu_cache_latent_h == latent_h &&
                      tf->cpu_cache_latent_w == latent_w &&
                      tf->cpu_cache_cap_seq_len == cap_seq_len &&
+                     tf->cpu_cache_img_padded == img_padded &&
+                     tf->cpu_cache_cap_padded == cap_padded &&
                      tf->cpu_cache_img_pos != NULL);
 
     if (!cache_hit) {
@@ -2314,6 +2316,11 @@ static int zi_load_block(zi_block_t *block, safetensors_file_t **files,
                                                        block->attn_v_weight_bf16, attn_mat_elems);
         block->ffn_w13_weight_bf16 = zi_concat_bf16(block->ffn_w1_bf16, ffn_mat_elems,
                                                     block->ffn_w3_bf16, ffn_mat_elems);
+        /* NULL from concat is OK — forward pass falls back to separate weights */
+        if (!block->attn_qkv_weight_bf16)
+            fprintf(stderr, "zi_load_block: fused QKV alloc failed (%s), using separate weights\n", prefix);
+        if (!block->ffn_w13_weight_bf16)
+            fprintf(stderr, "zi_load_block: fused W1W3 alloc failed (%s), using separate weights\n", prefix);
 
         /* F32 pointers were from BF16→F32 conversion, free them */
         free(block->attn_q_weight); block->attn_q_weight = NULL;
@@ -2347,6 +2354,11 @@ static int zi_load_block(zi_block_t *block, safetensors_file_t **files,
                                                        block->attn_v_weight_bf16, attn_mat_elems);
         block->ffn_w13_weight_bf16 = zi_concat_bf16(block->ffn_w1_bf16, ffn_mat_elems,
                                                     block->ffn_w3_bf16, ffn_mat_elems);
+        /* NULL from concat is OK — forward pass falls back to separate weights */
+        if (!block->attn_qkv_weight_bf16)
+            fprintf(stderr, "zi_load_block: fused QKV alloc failed (%s), using separate weights\n", prefix);
+        if (!block->ffn_w13_weight_bf16)
+            fprintf(stderr, "zi_load_block: fused W1W3 alloc failed (%s), using separate weights\n", prefix);
 
         /* NULL out f32 pointers — don't free if they're mmap'd */
         if (mmap_gpu_f32) {

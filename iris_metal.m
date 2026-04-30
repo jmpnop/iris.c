@@ -52,6 +52,7 @@ typedef struct {
     int seq_k;
     int num_heads;
     int head_dim;
+    float scale;
     __strong MPSGraph *graph;
     __strong MPSGraphTensor *qTensor;
     __strong MPSGraphTensor *kTensor;
@@ -945,7 +946,14 @@ static void iris_metal_sgemm_impl(int transpose_a, int transpose_b,
         } else if (g_in_batch) {
             /* Dynamic B in batch mode: keep data alive via pool, not pointer cache. */
             bufferB = pool_get_buffer(sizeB);
-            if (bufferB) memcpy([bufferB contents], B, sizeB);
+            if (bufferB) {
+                memcpy([bufferB contents], B, sizeB);
+            } else {
+                /* Pool full + allocation failure: fall back to one-shot upload. */
+                bufferB = [g_device newBufferWithBytes:B
+                                               length:sizeB
+                                              options:MTLResourceStorageModeShared];
+            }
         } else {
             /* Dynamic B outside batch: one-shot upload, no pointer-based cache. */
             bufferB = [g_device newBufferWithBytes:B
@@ -1035,6 +1043,9 @@ static void iris_metal_sgemm_impl(int transpose_a, int transpose_b,
             memcpy(C, [bufferC contents], sizeC);
             if (!bufferA_from_cache) {
                 pool_release_buffer(bufferA);
+            }
+            if (!cache_B) {
+                pool_release_buffer(bufferB);
             }
             pool_release_buffer(bufferC);
         } else {
@@ -5429,7 +5440,8 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
     for (int i = 0; i < g_sdpa_graph_count; i++) {
         sdpa_graph_cache_t *entry = &g_sdpa_graph_cache[i];
         if (entry->seq_q == seq_q && entry->seq_k == seq_k &&
-            entry->num_heads == num_heads && entry->head_dim == head_dim) {
+            entry->num_heads == num_heads && entry->head_dim == head_dim &&
+            entry->scale == scale) {
             pthread_mutex_unlock(&g_sdpa_graph_mutex);
             return entry;
         }
@@ -5448,6 +5460,7 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
     entry->seq_k = seq_k;
     entry->num_heads = num_heads;
     entry->head_dim = head_dim;
+    entry->scale = scale;
 
     @autoreleasepool {
         MPSGraph *graph = [[MPSGraph alloc] init];

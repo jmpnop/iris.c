@@ -109,13 +109,14 @@ static int parse_tensor_entry(const char **p, safetensor_t *t) {
             if (**p != '[') return -1;
             (*p)++;
             skip_whitespace(p);
-            size_t start = (size_t)parse_int(p);
+            int64_t start = parse_int(p);
             skip_whitespace(p);
             if (**p == ',') (*p)++;
             skip_whitespace(p);
-            size_t end = (size_t)parse_int(p);
-            t->data_offset = start;
-            t->data_size = end - start;
+            int64_t end = parse_int(p);
+            if (start < 0 || end < 0 || end < start) return -1;
+            t->data_offset = (size_t)start;
+            t->data_size = (size_t)(end - start);
             skip_whitespace(p);
             if (**p == ']') (*p)++;
         } else {
@@ -252,6 +253,11 @@ safetensors_file_t *safetensors_open(const char *path) {
     }
 
     sf->path = strdup(path);
+    if (!sf->path) {
+        free(sf);
+        munmap(data, file_size);
+        return NULL;
+    }
     sf->data = data;
     sf->file_size = file_size;
     sf->header_size = (size_t)header_size;

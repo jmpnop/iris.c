@@ -2789,8 +2789,8 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
         /* Validate scratch dimensions match */
         if (scratch->seq != seq || scratch->hidden != h_size ||
             scratch->mlp_hidden != mlp_hidden || scratch->fused_dim != fused_dim) {
-            iris_gpu_tensor_free(hidden_gpu);
             iris_gpu_batch_end();
+            iris_gpu_tensor_free(hidden_gpu);
             return 0;
         }
         norm_gpu = scratch->norm;
@@ -2816,6 +2816,7 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
         if (!norm_gpu || !q_gpu || !k_gpu || !v_gpu ||
             !gate_gpu || !up_gpu || !attn_out_gpu || !concat_gpu || !proj_out_gpu) {
             /* Cleanup and fall back */
+            iris_gpu_batch_end();
             iris_gpu_tensor_free(hidden_gpu);
             if (norm_gpu) iris_gpu_tensor_free(norm_gpu);
             if (q_gpu) iris_gpu_tensor_free(q_gpu);
@@ -2826,7 +2827,6 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
             if (attn_out_gpu) iris_gpu_tensor_free(attn_out_gpu);
             if (concat_gpu) iris_gpu_tensor_free(concat_gpu);
             if (proj_out_gpu) iris_gpu_tensor_free(proj_out_gpu);
-            iris_gpu_batch_end();
             return 0;
         }
     }
@@ -2841,8 +2841,8 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
         if (!iris_gpu_linear_bf16_into(fused_result, norm_gpu,
                                         block->qkv_mlp_weight_bf16,
                                         seq, h_size, fused_dim)) {
-            iris_gpu_tensor_free(hidden_gpu);
             iris_gpu_batch_end();
+            iris_gpu_tensor_free(hidden_gpu);
             return 0;
         }
     } else {
@@ -2851,6 +2851,7 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
                                              seq, h_size, fused_dim);
         if (!fused_result) {
             /* Cleanup and fall back */
+            iris_gpu_batch_end();
             iris_gpu_tensor_free(hidden_gpu);
             iris_gpu_tensor_free(norm_gpu);
             iris_gpu_tensor_free(q_gpu);
@@ -2861,7 +2862,6 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
             iris_gpu_tensor_free(attn_out_gpu);
             iris_gpu_tensor_free(concat_gpu);
             iris_gpu_tensor_free(proj_out_gpu);
-            iris_gpu_batch_end();
             return 0;
         }
     }
@@ -2944,7 +2944,22 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
             iris_linear_nobias_bf16(proj_out_cpu, concat_cpu, block->proj_mlp_weight_bf16,
                                     seq, h_size + mlp_hidden, h_size);
             gated_add(hidden, gate, proj_out_cpu, seq, h_size);
-            goto cleanup;
+            /* CPU fallback succeeded — free owned tensors and return success.
+             * Do NOT goto cleanup: batch mode is already ended, and
+             * proj_out_gpu is NULL so the allocating linear's tensor was
+             * already freed above (line where we free pre-allocated). */
+            iris_gpu_tensor_free(hidden_gpu);
+            iris_gpu_tensor_free(norm_gpu);
+            if (fused_result) iris_gpu_tensor_free(fused_result);
+            iris_gpu_tensor_free(q_gpu);
+            iris_gpu_tensor_free(k_gpu);
+            iris_gpu_tensor_free(v_gpu);
+            iris_gpu_tensor_free(gate_gpu);
+            iris_gpu_tensor_free(up_gpu);
+            iris_gpu_tensor_free(attn_out_gpu);
+            iris_gpu_tensor_free(concat_gpu);
+            /* proj_out_gpu is NULL here (linear failed), no free needed */
+            return 1;
         }
     }
 
@@ -2955,7 +2970,6 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
     iris_gpu_batch_end();
     iris_gpu_tensor_read(hidden_gpu, hidden);
 
-cleanup:
     /* === Cleanup === */
     iris_gpu_tensor_free(hidden_gpu);
     if (own_tensors) {
@@ -3153,7 +3167,18 @@ static int single_block_forward_gpu_chained(iris_gpu_tensor_t hidden_gpu,
             iris_gpu_tensor_read(hidden_gpu, hidden_cpu);
             gated_add(hidden_cpu, gate, proj_out_cpu, seq, h_size);
             memcpy(iris_gpu_tensor_data(hidden_gpu), hidden_cpu, seq * h_size * sizeof(float));
-            goto cleanup;
+            /* CPU fallback succeeded — free owned tensors and return success.
+             * proj_out_gpu is NULL (linear failed), no free needed. */
+            if (fused_result) iris_gpu_tensor_free(fused_result);
+            iris_gpu_tensor_free(norm_gpu);
+            iris_gpu_tensor_free(q_gpu);
+            iris_gpu_tensor_free(k_gpu);
+            iris_gpu_tensor_free(v_gpu);
+            iris_gpu_tensor_free(gate_gpu);
+            iris_gpu_tensor_free(up_gpu);
+            iris_gpu_tensor_free(attn_out_gpu);
+            iris_gpu_tensor_free(concat_gpu);
+            return 1;
         }
     }
 
@@ -3167,7 +3192,6 @@ static int single_block_forward_gpu_chained(iris_gpu_tensor_t hidden_gpu,
 
     iris_gpu_tensor_free(proj_out_gpu);
 
-cleanup:
     /* Free all tensors allocated in this function (only when not using scratch) */
     if (fused_result) iris_gpu_tensor_free(fused_result);
     if (norm_gpu) iris_gpu_tensor_free(norm_gpu);

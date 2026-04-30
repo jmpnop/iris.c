@@ -179,7 +179,11 @@ static uint8_t *deflate_store(const uint8_t *data, size_t len, size_t *out_len) 
     /* Zlib header (2 bytes) + deflate blocks + adler32 (4 bytes) */
     size_t max_block = 65535;
     size_t num_blocks = (len + max_block - 1) / max_block;
-    size_t total = 2 + num_blocks * 5 + len + 4;
+    /* Overflow check: total = 2 + num_blocks*5 + len + 4 */
+    if (num_blocks > (SIZE_MAX - 6) / 5) return NULL;
+    size_t overhead = 6 + num_blocks * 5;
+    if (len > SIZE_MAX - overhead) return NULL;
+    size_t total = overhead + len;
 
     uint8_t *out = (uint8_t *)malloc(total);
     if (!out) return NULL;
@@ -244,6 +248,7 @@ static void write_png_chunk(FILE *f, const char *type, const uint8_t *data, size
     }
 
     /* CRC (over type + data) */
+    if (len > SIZE_MAX - 4) return;
     uint8_t *crc_data = (uint8_t *)malloc(4 + len);
     if (!crc_data) return;
     memcpy(crc_data, type, 4);
@@ -318,9 +323,11 @@ static int save_png_with_metadata(const iris_image *img, FILE *f, int64_t seed, 
     else if (channels >= 3) channels = 3;  /* RGB */
     else channels = 1;  /* Grayscale */
 
-    size_t row_bytes = 1 + img->width * channels;  /* +1 for filter byte */
-    size_t raw_len = img->height * row_bytes;
+    size_t row_bytes = 1 + (size_t)img->width * channels;  /* +1 for filter byte */
+    if (row_bytes > SIZE_MAX / (size_t)img->height) return -1;
+    size_t raw_len = (size_t)img->height * row_bytes;
     uint8_t *raw = (uint8_t *)malloc(raw_len);
+    if (!raw) return -1;
 
     for (int y = 0; y < img->height; y++) {
         raw[y * row_bytes] = 0;  /* Filter: None */
@@ -758,6 +765,10 @@ static iris_image *load_png(FILE *f) {
                 free(idat_data);
                 return NULL;
             }
+            if (idat_len > SIZE_MAX - chunk_len) {
+                free(idat_data);
+                return NULL;
+            }
             uint8_t *tmp = (uint8_t *)realloc(idat_data, idat_len + chunk_len);
             if (!tmp) {
                 free(idat_data);
@@ -807,8 +818,13 @@ static iris_image *load_png(FILE *f) {
             return NULL;
     }
 
-    /* Decompress */
-    size_t raw_len = (size_t)height * (1 + (size_t)width * channels);
+    /* Decompress — check for overflow in raw_len calculation */
+    size_t row_size = 1 + (size_t)width * channels;
+    if (row_size > SIZE_MAX / (size_t)height) {
+        free(idat_data);
+        return NULL;
+    }
+    size_t raw_len = (size_t)height * row_size;
     uint8_t *raw = inflate_zlib(idat_data, idat_len, raw_len);
     free(idat_data);
 

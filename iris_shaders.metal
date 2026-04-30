@@ -1280,19 +1280,15 @@ kernel void causal_attention_fused(
             masked = true;
         }
 
-        if (masked) {
-            shared_scores[key_idx] = -INFINITY;
-        } else {
-            // Dot product: Q[query_idx, head] · K[key_idx, kv_head]
-            float dot = 0.0f;
-            device const float *k_row = K_head + key_idx * kv_dim;
-            for (int d = 0; d < head_dim; d++) {
-                dot += q_row[d] * k_row[d];
-            }
-            float score = dot * scale;
-            shared_scores[key_idx] = score;
-            local_max = max(local_max, score);
+        // Always compute dot product (no warp divergence)
+        float dot = 0.0f;
+        device const float *k_row = K_head + key_idx * kv_dim;
+        for (int d = 0; d < head_dim; d++) {
+            dot += q_row[d] * k_row[d];
         }
+        float score = masked ? -INFINITY : (dot * scale);
+        shared_scores[key_idx] = score;
+        local_max = max(local_max, score);
     }
 
     // ========== Phase 2: Find global max (SIMD reduction) ==========
@@ -2126,12 +2122,10 @@ kernel void softmax_bf16(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float max_val = shared_max[0];
 
-    // Compute exp and sum in f32
+    // Compute exp sum in f32 (do NOT write back — preserve original bf16 for recomputation)
     float local_sum = 0.0f;
     for (int i = tid; i < N; i += threads) {
-        float exp_val = metal::fast::exp(bf16_to_f32(row_data[i]) - max_val);
-        row_data[i] = f32_to_bf16(exp_val);
-        local_sum += exp_val;
+        local_sum += metal::fast::exp(bf16_to_f32(row_data[i]) - max_val);
     }
 
     float simd_sum_val = simd_sum(local_sum);
@@ -2147,9 +2141,9 @@ kernel void softmax_bf16(
 
     float inv_sum = (shared_sum[0] > 0.0f) ? (1.0f / shared_sum[0]) : 0.0f;
 
-    // Normalize and store as bf16
+    // Recompute exp and normalize in one pass — avoids bf16 double quantization
     for (int i = tid; i < N; i += threads) {
-        row_data[i] = f32_to_bf16(bf16_to_f32(row_data[i]) * inv_sum);
+        row_data[i] = f32_to_bf16(metal::fast::exp(bf16_to_f32(row_data[i]) - max_val) * inv_sum);
     }
 }
 
@@ -2608,19 +2602,15 @@ kernel void causal_attention_fused_bf16(
             masked = true;
         }
 
-        if (masked) {
-            shared_scores[key_idx] = -INFINITY;
-        } else {
-            // Dot product: Q[query_idx, head] · K[key_idx, kv_head]
-            float dot = 0.0f;
-            device const ushort *k_row = K_head + key_idx * kv_dim;
-            for (int d = 0; d < head_dim; d++) {
-                dot += shared_q[d] * bf16_to_f32(k_row[d]);
-            }
-            float score = dot * scale;
-            shared_scores[key_idx] = score;
-            local_max = max(local_max, score);
+        // Always compute dot product (no warp divergence)
+        float dot = 0.0f;
+        device const ushort *k_row = K_head + key_idx * kv_dim;
+        for (int d = 0; d < head_dim; d++) {
+            dot += shared_q[d] * bf16_to_f32(k_row[d]);
         }
+        float score = masked ? -INFINITY : (dot * scale);
+        shared_scores[key_idx] = score;
+        local_max = max(local_max, score);
     }
 
     // ========== Phase 2: Find global max (SIMD reduction) ==========
