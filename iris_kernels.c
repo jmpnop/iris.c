@@ -516,8 +516,11 @@ void iris_rms_norm(float *out, const float *x, const float *weight,
         vDSP_svesq(x_row, 1, &sum_sq, hidden);
         float rms = sqrtf(sum_sq / hidden + eps);
         float inv_rms = 1.0f / rms;
-        vDSP_vsmul(x_row, 1, &inv_rms, out_row, 1, hidden);
-        vDSP_vmul(out_row, 1, weight, 1, out_row, 1, hidden);
+        /* Fused normalize + scale in single pass (compiler NEON-vectorizes
+         * with -O3 -ffast-math). Replaces two separate vDSP passes. */
+        for (int i = 0; i < hidden; i++) {
+            out_row[i] = x_row[i] * inv_rms * weight[i];
+        }
 #else
         /* Compute RMS */
         float sum_sq = 0.0f;
@@ -545,35 +548,31 @@ void iris_group_norm(float *out, const float *x, const float *gamma, const float
             int c_start = g * channels_per_group;
             int c_end = c_start + channels_per_group;
 
-            double mean = 0.0;
+            /* Welford single-pass mean + variance (replaces 2 separate passes) */
+            double mean = 0.0, M2 = 0.0;
             int count = 0;
             for (int c = c_start; c < c_end; c++) {
+                const float *src = x + (b * channels + c) * spatial;
                 for (int i = 0; i < spatial; i++) {
-                    int idx = b * channels * spatial + c * spatial + i;
-                    mean += x[idx];
+                    float val = src[i];
                     count++;
+                    double delta = val - mean;
+                    mean += delta / count;
+                    M2 += delta * (val - mean);
                 }
             }
-            mean /= count;
-
-            double var = 0.0;
-            for (int c = c_start; c < c_end; c++) {
-                for (int i = 0; i < spatial; i++) {
-                    int idx = b * channels * spatial + c * spatial + i;
-                    double diff = x[idx] - (float)mean;
-                    var += diff * diff;
-                }
-            }
-            var /= count;
+            double var = M2 / count;
 
             float std_inv = 1.0f / sqrtf((float)var + eps);
-
             float mean_f = (float)mean;
+
+            /* Normalize + scale (single pass over output) */
             for (int c = c_start; c < c_end; c++) {
+                float w = gamma[c], bi = beta[c];
+                int base = (b * channels + c) * spatial;
                 for (int i = 0; i < spatial; i++) {
-                    int idx = b * channels * spatial + c * spatial + i;
-                    float norm = (x[idx] - mean_f) * std_inv;
-                    out[idx] = gamma[c] * norm + beta[c];
+                    int idx = base + i;
+                    out[idx] = (x[idx] - mean_f) * std_inv * w + bi;
                 }
             }
         }
@@ -641,6 +640,23 @@ void iris_softmax_cpu(float *x, int rows, int cols) {
     for (int r = 0; r < rows; r++) {
         float *row = x + r * cols;
 
+#ifdef USE_BLAS
+        /* vDSP-accelerated max, subtract, sum, and scale */
+        float max_val;
+        vDSP_maxv(row, 1, &max_val, cols);
+        float neg_max = -max_val;
+        vDSP_vsadd(row, 1, &neg_max, row, 1, cols);
+
+        /* exp loop (no vectorized exp in vDSP; use fast_expf) */
+        float sum = 0.0f;
+        for (int c = 0; c < cols; c++) {
+            row[c] = fast_expf(row[c]);
+            sum += row[c];
+        }
+
+        float inv_sum = 1.0f / sum;
+        vDSP_vsmul(row, 1, &inv_sum, row, 1, cols);
+#else
         /* Find max for numerical stability */
         float max_val = row[0];
         for (int c = 1; c < cols; c++) {
@@ -659,6 +675,7 @@ void iris_softmax_cpu(float *x, int rows, int cols) {
         for (int c = 0; c < cols; c++) {
             row[c] *= inv_sum;
         }
+#endif
     }
 }
 

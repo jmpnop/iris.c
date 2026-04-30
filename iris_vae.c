@@ -118,6 +118,10 @@ typedef struct iris_vae {
     int max_h, max_w;
     float *work1, *work2, *work3;
     size_t work_size;
+
+    /* Pre-allocated attention scratch buffers (avoid malloc/free per call) */
+    float *attn_q_t, *attn_k_t, *attn_v_t, *attn_o_t, *attn_scores;
+    size_t attn_buf_spatial;  /* spatial size these were allocated for */
 } iris_vae_t;
 
 /* Forward declarations */
@@ -233,11 +237,15 @@ static void resblock_forward(float *out, const float *x,
  * the bottleneck (mid_block) of both encoder and decoder, where the spatial
  * resolution is small enough for O(n^2) attention to be tractable, giving
  * the model global spatial reasoning at the coarsest level.
+ * Uses pre-allocated scratch buffers from the VAE struct when available
+ * (avoids 5 malloc/free per call). Falls back to malloc if vae is NULL or
+ * the pre-allocated buffers are too small.
  * Returns 0 on success, -1 on OOM. */
 static int attnblock_forward(float *out, const float *x,
                              const vae_attnblock_t *block,
                              float *work, int batch, int H, int W,
-                             int num_groups, float eps) {
+                             int num_groups, float eps,
+                             const iris_vae_t *vae) {
     int ch = block->channels;
     int spatial = H * W;
 
@@ -263,21 +271,27 @@ static int attnblock_forward(float *out, const float *x,
 
     float *attn_out = v + batch * ch * spatial;
 
-    /* Allocate attention work buffers once outside the batch loop */
-    float *q_t = (float *)malloc(spatial * ch * sizeof(float));
-    float *k_t = (float *)malloc(spatial * ch * sizeof(float));
-    float *v_t = (float *)malloc(spatial * ch * sizeof(float));
-    float *o_t = (float *)malloc(spatial * ch * sizeof(float));
-    float *scores = (float *)malloc((size_t)spatial * spatial * sizeof(float));
+    /* Use pre-allocated buffers from VAE when they fit; fall back to malloc */
+    int prealloc = (vae && vae->attn_q_t &&
+                    (size_t)spatial <= vae->attn_buf_spatial);
+    float *q_t, *k_t, *v_t, *o_t, *scores;
+    if (prealloc) {
+        q_t     = vae->attn_q_t;
+        k_t     = vae->attn_k_t;
+        v_t     = vae->attn_v_t;
+        o_t     = vae->attn_o_t;
+        scores  = vae->attn_scores;
+    } else {
+        q_t     = (float *)malloc(spatial * ch * sizeof(float));
+        k_t     = (float *)malloc(spatial * ch * sizeof(float));
+        v_t     = (float *)malloc(spatial * ch * sizeof(float));
+        o_t     = (float *)malloc(spatial * ch * sizeof(float));
+        scores  = (float *)malloc((size_t)spatial * spatial * sizeof(float));
 
-    /* Check for allocation failures */
-    if (!q_t || !k_t || !v_t || !o_t || !scores) {
-        free(q_t);
-        free(k_t);
-        free(v_t);
-        free(o_t);
-        free(scores);
-        return -1;  /* OOM */
+        if (!q_t || !k_t || !v_t || !o_t || !scores) {
+            free(q_t); free(k_t); free(v_t); free(o_t); free(scores);
+            return -1;  /* OOM */
+        }
     }
 
     for (int b = 0; b < batch; b++) {
@@ -312,11 +326,9 @@ static int attnblock_forward(float *out, const float *x,
         }
     }
 
-    free(q_t);
-    free(k_t);
-    free(v_t);
-    free(o_t);
-    free(scores);
+    if (!prealloc) {
+        free(q_t); free(k_t); free(v_t); free(o_t); free(scores);
+    }
 
     /* Project output */
     vae_conv2d(work, attn_out, block->out_weight, block->out_bias,
@@ -506,7 +518,8 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
     if (iris_vae_progress_callback)
         iris_vae_progress_callback(progress++, total_blocks);
     if (attnblock_forward(x, work, &vae->enc_mid_attn, vae->work3,
-                          batch, cur_h, cur_w, vae->num_groups, vae->eps) < 0) {
+                          batch, cur_h, cur_w, vae->num_groups, vae->eps,
+                          vae) < 0) {
         return NULL;  /* OOM in attention */
     }
     if (iris_vae_progress_callback)
@@ -744,7 +757,7 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
         float *cpu_attn_out = cpu_x;
         if (attnblock_forward(cpu_attn_out, cpu_attn_in, &vae->dec_mid_attn,
                                vae->work3, batch, cur_h, cur_w,
-                               vae->num_groups, vae->eps) < 0) {
+                               vae->num_groups, vae->eps, vae) < 0) {
             iris_gpu_tensor_free(x);
             return NULL;
         }
@@ -958,7 +971,7 @@ static float *vae_encode_gpu(iris_vae_t *vae, const float *img,
         float *cpu_attn_out = vae->work1;
         if (attnblock_forward(cpu_attn_out, cpu_attn_in, &vae->enc_mid_attn,
                                vae->work3, batch, cur_h, cur_w,
-                               vae->num_groups, vae->eps) < 0) {
+                               vae->num_groups, vae->eps, vae) < 0) {
             iris_gpu_tensor_free(x);
             return NULL;  /* OOM in attention */
         }
@@ -1146,7 +1159,8 @@ iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
     if (iris_vae_progress_callback)
         iris_vae_progress_callback(progress++, total_blocks);
     if (attnblock_forward(x, work, &vae->dec_mid_attn, vae->work3,
-                          batch, cur_h, cur_w, vae->num_groups, vae->eps) < 0) {
+                          batch, cur_h, cur_w, vae->num_groups, vae->eps,
+                          vae) < 0) {
         return NULL;  /* OOM in attention */
     }
     if (iris_vae_progress_callback)
@@ -1426,6 +1440,24 @@ iris_vae_t *iris_vae_load(FILE *f) {
 
     if (!vae->work1 || !vae->work2 || !vae->work3) goto error;
 
+    /* Pre-allocate attention scratch buffers.  Attention runs at the mid-block
+     * resolution (after 3 stride-2 downsamples), so spatial = (H/8)*(W/8).
+     * The encoder may pad +1 before each downsample, so use ceil division. */
+    {
+        int attn_h = (vae->max_h + 7) / 8;
+        int attn_w = (vae->max_w + 7) / 8;
+        size_t attn_spatial = (size_t)attn_h * attn_w;
+        size_t attn_ch = (size_t)mid_ch;
+        vae->attn_buf_spatial = attn_spatial;
+        vae->attn_q_t     = (float *)malloc(attn_spatial * attn_ch * sizeof(float));
+        vae->attn_k_t     = (float *)malloc(attn_spatial * attn_ch * sizeof(float));
+        vae->attn_v_t     = (float *)malloc(attn_spatial * attn_ch * sizeof(float));
+        vae->attn_o_t     = (float *)malloc(attn_spatial * attn_ch * sizeof(float));
+        vae->attn_scores  = (float *)malloc(attn_spatial * attn_spatial * sizeof(float));
+        if (!vae->attn_q_t || !vae->attn_k_t || !vae->attn_v_t ||
+            !vae->attn_o_t || !vae->attn_scores) goto error;
+    }
+
     return vae;
 
 error:
@@ -1500,6 +1532,12 @@ void iris_vae_free(iris_vae_t *vae) {
     free(vae->work1);
     free(vae->work2);
     free(vae->work3);
+
+    free(vae->attn_q_t);
+    free(vae->attn_k_t);
+    free(vae->attn_v_t);
+    free(vae->attn_o_t);
+    free(vae->attn_scores);
 
     free(vae);
 }
@@ -1806,6 +1844,22 @@ iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
     vae->work3 = malloc(vae->work_size);
 
     if (!vae->work1 || !vae->work2 || !vae->work3) goto error;
+
+    /* Pre-allocate attention scratch buffers (same logic as binary loader) */
+    {
+        int attn_h = (vae->max_h + 7) / 8;
+        int attn_w = (vae->max_w + 7) / 8;
+        size_t attn_spatial = (size_t)attn_h * attn_w;
+        size_t attn_ch = (size_t)mid_ch;
+        vae->attn_buf_spatial = attn_spatial;
+        vae->attn_q_t     = (float *)malloc(attn_spatial * attn_ch * sizeof(float));
+        vae->attn_k_t     = (float *)malloc(attn_spatial * attn_ch * sizeof(float));
+        vae->attn_v_t     = (float *)malloc(attn_spatial * attn_ch * sizeof(float));
+        vae->attn_o_t     = (float *)malloc(attn_spatial * attn_ch * sizeof(float));
+        vae->attn_scores  = (float *)malloc(attn_spatial * attn_spatial * sizeof(float));
+        if (!vae->attn_q_t || !vae->attn_k_t || !vae->attn_v_t ||
+            !vae->attn_o_t || !vae->attn_scores) goto error;
+    }
 
     return vae;
 

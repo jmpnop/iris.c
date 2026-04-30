@@ -147,6 +147,69 @@ static MPSMatrixMultiplication *get_cached_mps_matmul(int M, int N, int K) {
 }
 
 /* ========================================================================
+ * General SGEMM MPSMatrixMultiplication Cache (transpose/alpha/beta aware)
+ * ======================================================================== */
+
+#define MAX_SGEMM_MATMUL_CACHE 32
+
+typedef struct {
+    int M, N, K;
+    int transpose_a, transpose_b;
+    float alpha, beta;
+    __strong MPSMatrixMultiplication *op;
+} sgemm_matmul_cache_t;
+
+static sgemm_matmul_cache_t g_sgemm_matmul_cache[MAX_SGEMM_MATMUL_CACHE];
+static int g_sgemm_matmul_count = 0;
+static int g_sgemm_matmul_next = 0;
+static pthread_mutex_t g_sgemm_matmul_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static MPSMatrixMultiplication *get_cached_sgemm_matmul(int M, int N, int K,
+                                                         int transpose_a, int transpose_b,
+                                                         float alpha, float beta) {
+    pthread_mutex_lock(&g_sgemm_matmul_mutex);
+    for (int i = 0; i < g_sgemm_matmul_count; i++) {
+        sgemm_matmul_cache_t *e = &g_sgemm_matmul_cache[i];
+        if (e->M == M && e->N == N && e->K == K &&
+            e->transpose_a == transpose_a && e->transpose_b == transpose_b &&
+            e->alpha == alpha && e->beta == beta) {
+            MPSMatrixMultiplication *op = e->op;
+            pthread_mutex_unlock(&g_sgemm_matmul_mutex);
+            return op;
+        }
+    }
+
+    MPSMatrixMultiplication *op = [[MPSMatrixMultiplication alloc]
+        initWithDevice:g_device
+           transposeLeft:transpose_a ? YES : NO
+          transposeRight:transpose_b ? YES : NO
+              resultRows:M
+           resultColumns:N
+         interiorColumns:K
+                   alpha:alpha
+                    beta:beta];
+
+    int slot;
+    if (g_sgemm_matmul_count < MAX_SGEMM_MATMUL_CACHE) {
+        slot = g_sgemm_matmul_count++;
+    } else {
+        slot = g_sgemm_matmul_next;
+        g_sgemm_matmul_next = (g_sgemm_matmul_next + 1) % MAX_SGEMM_MATMUL_CACHE;
+    }
+    g_sgemm_matmul_cache[slot].M = M;
+    g_sgemm_matmul_cache[slot].N = N;
+    g_sgemm_matmul_cache[slot].K = K;
+    g_sgemm_matmul_cache[slot].transpose_a = transpose_a;
+    g_sgemm_matmul_cache[slot].transpose_b = transpose_b;
+    g_sgemm_matmul_cache[slot].alpha = alpha;
+    g_sgemm_matmul_cache[slot].beta = beta;
+    g_sgemm_matmul_cache[slot].op = op;
+
+    pthread_mutex_unlock(&g_sgemm_matmul_mutex);
+    return op;
+}
+
+/* ========================================================================
  * MPSGraph Conv2D Cache
  * ======================================================================== */
 
@@ -406,14 +469,22 @@ static int g_deferred_pool_count = 0;
 static id<MTLBuffer> pool_get_buffer(size_t size) {
     pthread_mutex_lock(&g_pool_mutex);
 
-    /* Look for existing buffer of sufficient size */
+    /* Best-fit: find smallest available buffer >= size to reduce waste */
+    int best_idx = -1;
+    size_t best_size = SIZE_MAX;
     for (int i = 0; i < g_pool_count; i++) {
         if (!g_activation_pool[i].in_use && g_activation_pool[i].size >= size) {
-            g_activation_pool[i].in_use = 1;
-            id<MTLBuffer> buf = g_activation_pool[i].buffer;
-            pthread_mutex_unlock(&g_pool_mutex);
-            return buf;
+            if (g_activation_pool[i].size < best_size) {
+                best_size = g_activation_pool[i].size;
+                best_idx = i;
+            }
         }
+    }
+    if (best_idx >= 0) {
+        g_activation_pool[best_idx].in_use = 1;
+        id<MTLBuffer> buf = g_activation_pool[best_idx].buffer;
+        pthread_mutex_unlock(&g_pool_mutex);
+        return buf;
     }
 
     /* No suitable buffer found - create new one */
@@ -582,6 +653,12 @@ void iris_metal_cleanup(void) {
         memset(g_mps_matmul_cache, 0, sizeof(g_mps_matmul_cache));
         pthread_mutex_unlock(&g_mps_matmul_mutex);
 
+        pthread_mutex_lock(&g_sgemm_matmul_mutex);
+        g_sgemm_matmul_count = 0;
+        g_sgemm_matmul_next = 0;
+        memset(g_sgemm_matmul_cache, 0, sizeof(g_sgemm_matmul_cache));
+        pthread_mutex_unlock(&g_sgemm_matmul_mutex);
+
         /* Clear SDPA graph cache */
         pthread_mutex_lock(&g_sdpa_graph_mutex);
         memset(g_sdpa_graph_cache, 0, sizeof(g_sdpa_graph_cache));
@@ -704,6 +781,12 @@ void iris_metal_reset(void) {
         g_mps_matmul_count = 0;
         memset(g_mps_matmul_cache, 0, sizeof(g_mps_matmul_cache));
         pthread_mutex_unlock(&g_mps_matmul_mutex);
+
+        pthread_mutex_lock(&g_sgemm_matmul_mutex);
+        g_sgemm_matmul_count = 0;
+        g_sgemm_matmul_next = 0;
+        memset(g_sgemm_matmul_cache, 0, sizeof(g_sgemm_matmul_cache));
+        pthread_mutex_unlock(&g_sgemm_matmul_mutex);
 
         /* Clear batch input cache */
         pthread_mutex_lock(&g_cache_mutex);
@@ -922,16 +1005,9 @@ static void iris_metal_sgemm_impl(int transpose_a, int transpose_b,
         MPSMatrix *matrixB = [[MPSMatrix alloc] initWithBuffer:bufferB descriptor:descB];
         MPSMatrix *matrixC = [[MPSMatrix alloc] initWithBuffer:bufferC descriptor:descC];
 
-        /* Create and configure matrix multiplication */
-        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
-            initWithDevice:g_device
-               transposeLeft:transpose_a ? YES : NO
-              transposeRight:transpose_b ? YES : NO
-                  resultRows:M
-               resultColumns:N
-             interiorColumns:K
-                       alpha:alpha
-                        beta:beta];
+        /* Get cached matrix multiplication kernel */
+        MPSMatrixMultiplication *matmul = get_cached_sgemm_matmul(
+            M, N, K, transpose_a, transpose_b, alpha, beta);
 
         if (g_in_batch && g_pending_count < MAX_BATCH_OUTPUTS) {
             /* Batch mode, room in pending array: encode to shared batch cmd */
@@ -1417,15 +1493,8 @@ void iris_metal_sgemm_bf16(int transpose_a, int transpose_b,
         MPSMatrix *matrixB = [[MPSMatrix alloc] initWithBuffer:bufferB descriptor:descB];
         MPSMatrix *matrixC = [[MPSMatrix alloc] initWithBuffer:bufferC descriptor:descC];
 
-        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
-            initWithDevice:g_device
-               transposeLeft:transpose_a ? YES : NO
-              transposeRight:transpose_b ? YES : NO
-                  resultRows:M
-               resultColumns:N
-             interiorColumns:K
-                       alpha:alpha
-                        beta:beta];
+        MPSMatrixMultiplication *matmul = get_cached_sgemm_matmul(
+            M, N, K, transpose_a, transpose_b, alpha, beta);
 
         if (g_in_batch && g_pending_count < MAX_BATCH_OUTPUTS) {
             /* Batch mode, room in pending array: encode to shared batch cmd */
@@ -1713,15 +1782,22 @@ int iris_metal_conv2d(float *out, const float *in,
     size_t b_bytes = (size_t)out_ch * sizeof(float);
 
     @autoreleasepool {
-        /* Use copy-based buffers for input and output to avoid alignment issues */
-        id<MTLBuffer> in_buf = [g_device newBufferWithBytes:in
-                                                     length:in_bytes
-                                                    options:MTLResourceStorageModeShared];
-        id<MTLBuffer> out_buf = [g_device newBufferWithLength:out_bytes
-                                                      options:MTLResourceStorageModeShared];
+        /* Use pooled buffers for input and output to avoid per-call allocation */
+        id<MTLBuffer> in_buf = pool_get_buffer(in_bytes);
+        id<MTLBuffer> out_buf = pool_get_buffer(out_bytes);
+        if (!in_buf || !out_buf) {
+            if (in_buf) pool_release_buffer(in_buf);
+            if (out_buf) pool_release_buffer(out_buf);
+            return 0;
+        }
+        memcpy([in_buf contents], in, in_bytes);
         id<MTLBuffer> w_buf = get_cached_weight_buffer(weight, w_bytes);
         id<MTLBuffer> b_buf = get_cached_weight_buffer(bias, b_bytes);
-        if (!in_buf || !out_buf || !w_buf || !b_buf) return 0;
+        if (!w_buf || !b_buf) {
+            pool_release_buffer(in_buf);
+            pool_release_buffer(out_buf);
+            return 0;
+        }
 
         MPSGraphTensorData *in_data =
             [[MPSGraphTensorData alloc] initWithMTLBuffer:in_buf
@@ -1739,10 +1815,18 @@ int iris_metal_conv2d(float *out, const float *in,
             [[MPSGraphTensorData alloc] initWithMTLBuffer:out_buf
                                                    shape:cache->outShape
                                                 dataType:MPSDataTypeFloat32];
-        if (!in_data || !w_data || !b_data || !out_data) return 0;
+        if (!in_data || !w_data || !b_data || !out_data) {
+            pool_release_buffer(in_buf);
+            pool_release_buffer(out_buf);
+            return 0;
+        }
 
         MPSCommandBuffer *mps_cmd = [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
-        if (!mps_cmd) return 0;
+        if (!mps_cmd) {
+            pool_release_buffer(in_buf);
+            pool_release_buffer(out_buf);
+            return 0;
+        }
 
         NSDictionary *feeds = @{
             cache->inputTensor : in_data,
@@ -1758,6 +1842,8 @@ int iris_metal_conv2d(float *out, const float *in,
                               resultsDictionary:results
                             executionDescriptor:nil];
         } @catch (NSException *exception) {
+            pool_release_buffer(in_buf);
+            pool_release_buffer(out_buf);
             return 0;
         }
 
@@ -1766,6 +1852,8 @@ int iris_metal_conv2d(float *out, const float *in,
 
         /* Copy result back to output */
         memcpy(out, [out_buf contents], out_bytes);
+        pool_release_buffer(in_buf);
+        pool_release_buffer(out_buf);
         return 1;
     }
 }
@@ -1803,13 +1891,9 @@ void iris_metal_sgemm_batch(int transpose_a, int transpose_b,
                             rowBytes:ldc * sizeof(float)
                             dataType:MPSDataTypeFloat32];
 
-        /* Create kernel once */
-        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
-            initWithDevice:g_device
-               transposeLeft:transpose_a ? YES : NO
-              transposeRight:transpose_b ? YES : NO
-                  resultRows:M resultColumns:N interiorColumns:K
-                       alpha:alpha beta:beta];
+        /* Get cached kernel */
+        MPSMatrixMultiplication *matmul = get_cached_sgemm_matmul(
+            M, N, K, transpose_a, transpose_b, alpha, beta);
 
         size_t sizeA_elem = (size_t)rowsA * lda * sizeof(float);
         size_t sizeB_elem = (size_t)rowsB * ldb * sizeof(float);
@@ -2194,7 +2278,7 @@ void iris_metal_attention_bf16(float *out,
             [encoder setBytes:&total_rows length:sizeof(int) atIndex:1];
             [encoder setBytes:&seq_k length:sizeof(int) atIndex:2];
 
-            NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+            NSUInteger threadsPerGroup = MAX(32, MIN(256, (NSUInteger)seq_k));
             MTLSize numGroups = MTLSizeMake(total_rows, 1, 1);
             MTLSize groupSize = MTLSizeMake(threadsPerGroup, 1, 1);
 
@@ -2311,7 +2395,7 @@ void iris_metal_attention_bf16_native(id<MTLBuffer> bufQ, id<MTLBuffer> bufK,
             [encoder setBytes:&total_rows length:sizeof(int) atIndex:1];
             [encoder setBytes:&seq_k length:sizeof(int) atIndex:2];
 
-            NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+            NSUInteger threadsPerGroup = MAX(32, MIN(256, (NSUInteger)seq_k));
             MTLSize numGroups = MTLSizeMake(total_rows, 1, 1);
             MTLSize groupSize = MTLSizeMake(threadsPerGroup, 1, 1);
 
@@ -2596,7 +2680,7 @@ void iris_bf16_rope_unified(id<MTLBuffer> x,
         [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
 
         [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
         [encoder endEncoding];
 
         [cmdBuffer commit];
@@ -4376,9 +4460,9 @@ void iris_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
         [encoder setBytes:&axis_dim length:sizeof(int) atIndex:6];
 
-        /* One thread per (seq, head) pair */
+        /* One thread per (seq, head) pair — use X≥32 to fill SIMD lanes */
         [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
 
         [encoder endEncoding];
 
@@ -4411,7 +4495,7 @@ void iris_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
                 [enc setBytes:&head_dim length:sizeof(int) atIndex:5];
                 [enc setBytes:&axis_dim length:sizeof(int) atIndex:6];
                 [enc dispatchThreads:MTLSizeMake(seq, heads, 1)
-                   threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+                   threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
                 [enc endEncoding];
                 [oneshot commit];
                 [oneshot waitUntilCompleted];
@@ -4438,17 +4522,18 @@ void iris_gpu_adaln_norm(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
     @autoreleasepool {
         size_t param_size = (size_t)hidden * sizeof(float);
 
-        /* Allocate new buffers with data - shift/scale are timestep-dependent
-         * and change between denoising steps, so they CANNOT use the weight cache.
-         * ARC will release these after the command buffer completes. */
-        id<MTLBuffer> bufShift = [g_device newBufferWithBytes:shift
-                                                       length:param_size
-                                                      options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufScale = [g_device newBufferWithBytes:scale
-                                                       length:param_size
-                                                      options:MTLResourceStorageModeShared];
+        /* Pool buffers for shift/scale — timestep-dependent, change every step,
+         * but reuse the same allocation across steps to avoid ~8550 allocs. */
+        id<MTLBuffer> bufShift = pool_get_buffer(param_size);
+        id<MTLBuffer> bufScale = pool_get_buffer(param_size);
 
-        if (!bufShift || !bufScale) return;
+        if (!bufShift || !bufScale) {
+            if (bufShift) pool_release_buffer(bufShift);
+            if (bufScale) pool_release_buffer(bufScale);
+            return;
+        }
+        memcpy([bufShift contents], shift, param_size);
+        memcpy([bufScale contents], scale, param_size);
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
@@ -4476,7 +4561,8 @@ void iris_gpu_adaln_norm(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
             out->has_pending_work = 0;
             x->has_pending_work = 0;
         }
-        /* ARC will release bufShift and bufScale after command completes */
+        pool_release_buffer(bufShift);
+        pool_release_buffer(bufScale);
     }
 }
 
@@ -4654,7 +4740,7 @@ void iris_gpu_rope_2d(iris_gpu_tensor_t x, const float *cos_freq, const float *s
         [encoder setBytes:&axis_dim length:sizeof(int) atIndex:6];
 
         [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
 
         [encoder endEncoding];
 
@@ -4721,7 +4807,7 @@ void iris_gpu_rope_unified(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
             [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
 
             [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-               threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+               threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
             [encoder endEncoding];
         }
 
@@ -4741,7 +4827,7 @@ void iris_gpu_rope_unified(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
             [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
 
             [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-               threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+               threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
             [encoder endEncoding];
         }
 
@@ -4784,7 +4870,7 @@ static void encode_rope_single_f32(id<MTLCommandBuffer> cmdBuffer,
     [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
     [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
     [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-       threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+       threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
     [encoder endEncoding];
 
     x->has_pending_work = 1;
@@ -4902,13 +4988,10 @@ void iris_gpu_gated_add(iris_gpu_tensor_t out, const float *gate,
     @autoreleasepool {
         size_t gate_size = (size_t)hidden * sizeof(float);
 
-        /* Allocate new buffer with data - gate is timestep-dependent
-         * and changes between denoising steps, so it CANNOT use the weight cache.
-         * ARC will release this after the command buffer completes. */
-        id<MTLBuffer> bufGate = [g_device newBufferWithBytes:gate
-                                                      length:gate_size
-                                                     options:MTLResourceStorageModeShared];
+        /* Pool buffer for gate — timestep-dependent but reuses allocation. */
+        id<MTLBuffer> bufGate = pool_get_buffer(gate_size);
         if (!bufGate) return;
+        memcpy([bufGate contents], gate, gate_size);
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
@@ -4934,7 +5017,7 @@ void iris_gpu_gated_add(iris_gpu_tensor_t out, const float *gate,
             out->has_pending_work = 0;
             proj->has_pending_work = 0;
         }
-        /* ARC will release bufGate after command completes */
+        pool_release_buffer(bufGate);
     }
 }
 
@@ -4950,10 +5033,10 @@ int iris_gpu_norm_gated_add(iris_gpu_tensor_t out, iris_gpu_tensor_t proj,
         id<MTLBuffer> bufWeight = get_cached_weight_buffer(weight, vec_size);
         if (!bufWeight) return 0;
 
-        id<MTLBuffer> bufGate = [g_device newBufferWithBytes:gate
-                                                      length:vec_size
-                                                     options:MTLResourceStorageModeShared];
+        /* Pool buffer for gate — timestep-dependent but reuses allocation. */
+        id<MTLBuffer> bufGate = pool_get_buffer(vec_size);
         if (!bufGate) return 0;
+        memcpy([bufGate contents], gate, vec_size);
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
@@ -4966,7 +5049,7 @@ int iris_gpu_norm_gated_add(iris_gpu_tensor_t out, iris_gpu_tensor_t proj,
         [encoder setBytes:&hidden length:sizeof(int) atIndex:4];
         [encoder setBytes:&eps length:sizeof(float) atIndex:5];
 
-        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)hidden);
+        NSUInteger threadsPerGroup = MAX(64, MIN(256, (NSUInteger)hidden));
         [encoder dispatchThreadgroups:MTLSizeMake(seq, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
 
@@ -4981,6 +5064,7 @@ int iris_gpu_norm_gated_add(iris_gpu_tensor_t out, iris_gpu_tensor_t proj,
             out->has_pending_work = 0;
             proj->has_pending_work = 0;
         }
+        pool_release_buffer(bufGate);
     }
     return 1;
 }
@@ -5276,7 +5360,7 @@ int iris_gpu_attention_bf16_native(iris_gpu_tensor_t out,
             [encoder setBytes:&total_rows length:sizeof(int) atIndex:1];
             [encoder setBytes:&seq_k length:sizeof(int) atIndex:2];
 
-            NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+            NSUInteger threadsPerGroup = MAX(32, MIN(256, (NSUInteger)seq_k));
             [encoder dispatchThreadgroups:MTLSizeMake(total_rows, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
             [encoder endEncoding];
@@ -5978,7 +6062,7 @@ int iris_gpu_head_rms_norm_bf16(iris_gpu_tensor_t x, iris_gpu_tensor_t weight_bf
         [encoder setBytes:&eps length:sizeof(float) atIndex:4];
 
         [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
         [encoder endEncoding];
 
         x->has_pending_work = 1;
@@ -6184,7 +6268,7 @@ void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
             [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
             [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
             [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-               threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+               threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
             [encoder endEncoding];
         }
 
@@ -6203,7 +6287,7 @@ void iris_gpu_rope_unified_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
             [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
             [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
             [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-               threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+               threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
             [encoder endEncoding];
         }
 
@@ -6244,7 +6328,7 @@ void iris_gpu_rope_2d_bf16(iris_gpu_tensor_t x,
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
         [encoder setBytes:&axis_dim length:sizeof(int) atIndex:6];
         [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(heads, 32), 1)];
         [encoder endEncoding];
 
         x->has_pending_work = 1;
@@ -6365,7 +6449,7 @@ void iris_gpu_rope_text_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
         /* Dispatch: one thread per (pos, head) - max of q_heads and kv_heads */
         int max_heads = num_q_heads > num_kv_heads ? num_q_heads : num_kv_heads;
         [encoder dispatchThreads:MTLSizeMake(seq, max_heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(max_heads, 64), 1)];
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, (NSUInteger)seq), MIN(max_heads, 32), 1)];
         [encoder endEncoding];
 
         q->has_pending_work = 1;
@@ -6909,9 +6993,9 @@ void iris_gpu_transpose_to_heads_bf16(iris_gpu_tensor_t in, iris_gpu_tensor_t ou
         [encoder setBytes:&heads length:sizeof(int) atIndex:3];
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:4];
 
-        /* Dispatch: one thread per element */
-        [encoder dispatchThreadgroups:MTLSizeMake((head_dim + 7) / 8, (seq + 7) / 8, heads)
-                threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        /* Dispatch: one thread per element, SIMD-aligned threadgroup */
+        [encoder dispatchThreadgroups:MTLSizeMake((head_dim + 31) / 32, (seq + 1) / 2, heads)
+                threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
         [encoder endEncoding];
 
         out->has_pending_work = 1;
@@ -6943,9 +7027,9 @@ void iris_gpu_transpose_from_heads_bf16(iris_gpu_tensor_t in, iris_gpu_tensor_t 
         [encoder setBytes:&heads length:sizeof(int) atIndex:3];
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:4];
 
-        /* Dispatch: one thread per element */
-        [encoder dispatchThreadgroups:MTLSizeMake((head_dim + 7) / 8, (seq + 7) / 8, heads)
-                threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        /* Dispatch: one thread per element, SIMD-aligned threadgroup */
+        [encoder dispatchThreadgroups:MTLSizeMake((head_dim + 31) / 32, (seq + 1) / 2, heads)
+                threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
         [encoder endEncoding];
 
         out->has_pending_work = 1;

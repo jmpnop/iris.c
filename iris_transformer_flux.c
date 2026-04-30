@@ -122,15 +122,25 @@ static int bf16_debug_enabled(void) {
     } while(0)
 
 /* Gated add: out += gate * proj, where gate is [hidden] and proj is [seq, hidden]
- * Double loop avoids modulo which prevents vectorization.
+ * Uses vDSP_vma (vector multiply-add) when Accelerate is available for ~4x throughput.
+ * vDSP_vma(A, sA, B, sB, C, sC, D, sD, N) computes D[i] = A[i]*B[i] + C[i].
+ * We want out[i] = gate[i]*proj[i] + out[i], so A=gate, B=proj_s, C=out_s, D=out_s.
  */
 static inline void gated_add(float *out, const float *gate, const float *proj,
                              int seq, int hidden) {
+#ifdef USE_BLAS
+    for (int s = 0; s < seq; s++) {
+        float *out_s = out + s * hidden;
+        const float *proj_s = proj + s * hidden;
+        vDSP_vma(gate, 1, proj_s, 1, out_s, 1, out_s, 1, (vDSP_Length)hidden);
+    }
+#else
     for (int s = 0; s < seq; s++) {
         for (int i = 0; i < hidden; i++) {
             out[s * hidden + i] += gate[i] * proj[s * hidden + i];
         }
     }
+#endif
 }
 
 /* ========================================================================
@@ -2643,198 +2653,11 @@ static int double_block_forward_gpu_chained(
  * ======================================================================== */
 
 #ifdef USE_METAL
-/* GPU-optimized single block forward using persistent GPU tensors
- * Keeps activations on GPU throughout the block to minimize memory transfers.
- * Returns 1 if GPU path was used, 0 to fall back to CPU path.
- */
-static int single_block_forward_gpu(float *hidden, const single_block_t *block,
-                                    const float *t_emb, const float *adaln_weight,
-                                    const float *img_rope_cos, const float *img_rope_sin,
-                                    const float *txt_rope_cos, const float *txt_rope_sin,
-                                    int seq, int img_offset, iris_transformer_flux_t *tf) {
-    /* Check if GPU tensors are available */
-    if (!iris_metal_available() || !iris_metal_shaders_available()) return 0;
-    if (block->qkv_mlp_weight_bf16 == NULL) return 0;  /* Need bf16 weights */
-
-    int h_size = tf->hidden_size;
-    int heads = tf->num_heads;
-    int head_dim = tf->head_dim;
-    int mlp_hidden = tf->mlp_hidden;
-    float eps = 1e-6f;
-    int axis_dim = 32;
-
-    /* === Phase 1: AdaLN modulation (small, keep on CPU) === */
-    int mod_size = h_size * 3;
-    float *t_emb_silu = tf->t_emb_silu;
-    for (int i = 0; i < h_size; i++) {
-        float x = t_emb[i];
-        t_emb_silu[i] = x / (1.0f + expf(-x));
-    }
-    /* mod_params goes after fused_out in work2 buffer. Must match single_block_forward. */
-    int fused_dim = h_size * 3 + mlp_hidden * 2;
-    float *mod_params = tf->work2 + seq * fused_dim;
-    iris_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
-
-    float *shift = mod_params;
-    float *scale = mod_params + h_size;
-    float *gate = mod_params + h_size * 2;
-
-    /* === Phase 2: Create GPU tensors and enter batch mode === */
-    iris_gpu_batch_begin();
-
-    /* Create input tensor on GPU */
-    iris_gpu_tensor_t hidden_gpu = iris_gpu_tensor_create(hidden, seq * h_size);
-    if (!hidden_gpu) {
-        iris_gpu_batch_end();
-        return 0;
-    }
-
-    /* Allocate output tensors */
-    iris_gpu_tensor_t norm_gpu = iris_gpu_tensor_alloc(seq * h_size);
-    iris_gpu_tensor_t fused_gpu = iris_gpu_tensor_alloc(seq * fused_dim);
-    iris_gpu_tensor_t q_gpu = iris_gpu_tensor_alloc(seq * h_size);
-    iris_gpu_tensor_t k_gpu = iris_gpu_tensor_alloc(seq * h_size);
-    iris_gpu_tensor_t v_gpu = iris_gpu_tensor_alloc(seq * h_size);
-    iris_gpu_tensor_t gate_gpu = iris_gpu_tensor_alloc(seq * mlp_hidden);
-    iris_gpu_tensor_t up_gpu = iris_gpu_tensor_alloc(seq * mlp_hidden);
-    iris_gpu_tensor_t attn_out_gpu = iris_gpu_tensor_alloc(seq * h_size);
-    iris_gpu_tensor_t concat_gpu = iris_gpu_tensor_alloc(seq * (h_size + mlp_hidden));
-    iris_gpu_tensor_t proj_out_gpu = iris_gpu_tensor_alloc(seq * h_size);
-
-    if (!norm_gpu || !fused_gpu || !q_gpu || !k_gpu || !v_gpu ||
-        !gate_gpu || !up_gpu || !attn_out_gpu || !concat_gpu || !proj_out_gpu) {
-        /* Cleanup and fall back */
-        if (hidden_gpu) iris_gpu_tensor_free(hidden_gpu);
-        if (norm_gpu) iris_gpu_tensor_free(norm_gpu);
-        if (fused_gpu) iris_gpu_tensor_free(fused_gpu);
-        if (q_gpu) iris_gpu_tensor_free(q_gpu);
-        if (k_gpu) iris_gpu_tensor_free(k_gpu);
-        if (v_gpu) iris_gpu_tensor_free(v_gpu);
-        if (gate_gpu) iris_gpu_tensor_free(gate_gpu);
-        if (up_gpu) iris_gpu_tensor_free(up_gpu);
-        if (attn_out_gpu) iris_gpu_tensor_free(attn_out_gpu);
-        if (concat_gpu) iris_gpu_tensor_free(concat_gpu);
-        if (proj_out_gpu) iris_gpu_tensor_free(proj_out_gpu);
-        iris_gpu_batch_end();
-        return 0;
-    }
-
-    /* === Phase 3: AdaLN normalization on GPU === */
-    iris_gpu_adaln_norm(norm_gpu, hidden_gpu, shift, scale, seq, h_size, eps);
-
-    /* === Phase 4: Fused QKV + MLP projection on GPU === */
-    iris_gpu_tensor_t fused_result = iris_gpu_linear_bf16(norm_gpu,
-                                                          block->qkv_mlp_weight_bf16,
-                                                          seq, h_size, fused_dim);
-    if (!fused_result) {
-        /* Cleanup and fall back */
-        iris_gpu_tensor_free(hidden_gpu);
-        iris_gpu_tensor_free(norm_gpu);
-        iris_gpu_tensor_free(fused_gpu);
-        iris_gpu_tensor_free(q_gpu);
-        iris_gpu_tensor_free(k_gpu);
-        iris_gpu_tensor_free(v_gpu);
-        iris_gpu_tensor_free(gate_gpu);
-        iris_gpu_tensor_free(up_gpu);
-        iris_gpu_tensor_free(attn_out_gpu);
-        iris_gpu_tensor_free(concat_gpu);
-        iris_gpu_tensor_free(proj_out_gpu);
-        iris_gpu_batch_end();
-        return 0;
-    }
-
-    /* === Phase 5: Split fused output on GPU === */
-    iris_gpu_split_qkv_mlp(fused_result, q_gpu, k_gpu, v_gpu, gate_gpu, up_gpu,
-                           seq, h_size, mlp_hidden);
-
-    /* === Phase 6: QK RMSNorm on GPU === */
-    iris_gpu_qk_rms_norm(q_gpu, k_gpu, block->norm_q_weight, block->norm_k_weight,
-                         seq, heads, head_dim, eps);
-
-    /* === Phase 7: Apply unified RoPE on GPU (handles text+image in one call) === */
-    iris_gpu_rope_unified(q_gpu, k_gpu,
-                          txt_rope_cos, txt_rope_sin,
-                          img_rope_cos, img_rope_sin,
-                          seq, img_offset, heads, head_dim, axis_dim);
-
-    /* === Phase 8: Self-attention on GPU === */
-    /* Try fused attention (seq <= 1024), then bf16 MPS attention (any seq) */
-    float attn_scale = 1.0f / sqrtf((float)head_dim);
-    if (!iris_gpu_attention_fused(attn_out_gpu, q_gpu, k_gpu, v_gpu,
-                                  seq, seq, heads, head_dim, attn_scale)) {
-        /* Fused attention failed (seq > 1024) - try bf16 MPS attention */
-        iris_gpu_batch_end();
-        if (!iris_gpu_attention_bf16(attn_out_gpu, q_gpu, k_gpu, v_gpu,
-                                     seq, seq, heads, head_dim, attn_scale)) {
-            /* Both GPU attention paths failed - free tensors and fall back to CPU */
-            iris_gpu_tensor_free(hidden_gpu);
-            iris_gpu_tensor_free(norm_gpu);
-            iris_gpu_tensor_free(fused_gpu);
-            iris_gpu_tensor_free(fused_result);
-            iris_gpu_tensor_free(q_gpu);
-            iris_gpu_tensor_free(k_gpu);
-            iris_gpu_tensor_free(v_gpu);
-            iris_gpu_tensor_free(gate_gpu);
-            iris_gpu_tensor_free(up_gpu);
-            iris_gpu_tensor_free(attn_out_gpu);
-            iris_gpu_tensor_free(concat_gpu);
-            iris_gpu_tensor_free(proj_out_gpu);
-            return 0;
-        }
-        iris_gpu_batch_begin();
-    }
-
-    /* === Phase 9: SwiGLU on GPU === */
-    iris_gpu_silu_mul(gate_gpu, up_gpu, seq * mlp_hidden);
-
-    /* === Phase 10: Concat attention + MLP outputs on GPU === */
-    iris_gpu_concat_attn_mlp(attn_out_gpu, gate_gpu, concat_gpu, seq, h_size, mlp_hidden);
-
-    /* === Phase 11: Final projection on GPU === */
-    /* Free pre-allocated tensor since linear returns a new one */
-    iris_gpu_tensor_free(proj_out_gpu);
-    proj_out_gpu = iris_gpu_linear_bf16(concat_gpu, block->proj_mlp_weight_bf16,
-                                        seq, h_size + mlp_hidden, h_size);
-    if (!proj_out_gpu) {
-        /* Fall back to CPU projection */
-        iris_gpu_batch_end();
-        float *concat_cpu = tf->single_concat;
-        iris_gpu_tensor_read(concat_gpu, concat_cpu);
-        float *proj_out_cpu = tf->work1;
-        iris_linear_nobias_bf16(proj_out_cpu, concat_cpu, block->proj_mlp_weight_bf16,
-                                seq, h_size + mlp_hidden, h_size);
-        gated_add(hidden, gate, proj_out_cpu, seq, h_size);
-        goto cleanup;
-    }
-
-    /* === Phase 12: Gated add residual on GPU === */
-    iris_gpu_gated_add(hidden_gpu, gate, proj_out_gpu, seq, h_size);
-
-    /* === Phase 13: Sync and copy result back === */
-    iris_gpu_batch_end();
-    iris_gpu_tensor_read(hidden_gpu, hidden);
-
-cleanup:
-    /* === Cleanup GPU tensors === */
-    iris_gpu_tensor_free(hidden_gpu);
-    iris_gpu_tensor_free(norm_gpu);
-    iris_gpu_tensor_free(fused_gpu);
-    iris_gpu_tensor_free(fused_result);
-    iris_gpu_tensor_free(q_gpu);
-    iris_gpu_tensor_free(k_gpu);
-    iris_gpu_tensor_free(v_gpu);
-    iris_gpu_tensor_free(gate_gpu);
-    iris_gpu_tensor_free(up_gpu);
-    iris_gpu_tensor_free(attn_out_gpu);
-    iris_gpu_tensor_free(concat_gpu);
-    iris_gpu_tensor_free(proj_out_gpu);
-
-    return 1;  /* GPU path succeeded */
-}
 
 /* ========================================================================
- * Scratch buffers for GPU-chained single block (f32 path)
- * Pre-allocating these avoids 10 GPU tensor alloc/frees per block (200 per step)
+ * Scratch buffers for GPU single block (f32 path)
+ * Pre-allocating these avoids 10 GPU tensor alloc/frees per block.
+ * Shared by both the non-chained and chained GPU single block paths.
  * ======================================================================== */
 typedef struct {
     int seq;
@@ -2897,6 +2720,258 @@ static int single_block_gpu_scratch_init(single_block_gpu_scratch_t *s,
     }
 
     return 1;
+}
+
+/* GPU-optimized single block forward using persistent GPU tensors
+ * Keeps activations on GPU throughout the block to minimize memory transfers.
+ * Optional scratch: if provided, reuses pre-allocated buffers to avoid
+ * per-block allocation overhead (10 allocations per block -> 0).
+ * Returns 1 if GPU path was used, 0 to fall back to CPU path.
+ */
+static int single_block_forward_gpu(float *hidden, const single_block_t *block,
+                                    const float *t_emb, const float *adaln_weight,
+                                    const float *img_rope_cos, const float *img_rope_sin,
+                                    const float *txt_rope_cos, const float *txt_rope_sin,
+                                    int seq, int img_offset, iris_transformer_flux_t *tf,
+                                    const float *precomputed_shift,
+                                    const float *precomputed_scale,
+                                    const float *precomputed_gate,
+                                    single_block_gpu_scratch_t *scratch) {
+    /* Check if GPU tensors are available */
+    if (!iris_metal_available() || !iris_metal_shaders_available()) return 0;
+    if (block->qkv_mlp_weight_bf16 == NULL) return 0;  /* Need bf16 weights */
+
+    int h_size = tf->hidden_size;
+    int heads = tf->num_heads;
+    int head_dim = tf->head_dim;
+    int mlp_hidden = tf->mlp_hidden;
+    float eps = 1e-6f;
+    int axis_dim = 32;
+
+    /* === Phase 1: AdaLN modulation (use pre-computed if available) === */
+    float *shift, *scale, *gate;
+    int fused_dim = h_size * 3 + mlp_hidden * 2;
+
+    if (precomputed_shift) {
+        shift = (float *)precomputed_shift;
+        scale = (float *)precomputed_scale;
+        gate  = (float *)precomputed_gate;
+    } else {
+        int mod_size = h_size * 3;
+        float *t_emb_silu = tf->t_emb_silu;
+        for (int i = 0; i < h_size; i++) {
+            float x = t_emb[i];
+            t_emb_silu[i] = x / (1.0f + expf(-x));
+        }
+        float *mod_params = tf->work2 + seq * fused_dim;
+        iris_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
+        shift = mod_params;
+        scale = mod_params + h_size;
+        gate = mod_params + h_size * 2;
+    }
+
+    /* === Phase 2: Create GPU tensors and enter batch mode === */
+    iris_gpu_batch_begin();
+
+    /* Create input tensor on GPU (always per-call — data changes each block) */
+    iris_gpu_tensor_t hidden_gpu = iris_gpu_tensor_create(hidden, seq * h_size);
+    if (!hidden_gpu) {
+        iris_gpu_batch_end();
+        return 0;
+    }
+
+    /* Use scratch buffers if available, otherwise allocate per-call */
+    int own_tensors = (scratch == NULL);
+    iris_gpu_tensor_t norm_gpu, q_gpu, k_gpu, v_gpu;
+    iris_gpu_tensor_t gate_gpu, up_gpu, attn_out_gpu, concat_gpu, proj_out_gpu;
+
+    if (scratch) {
+        /* Validate scratch dimensions match */
+        if (scratch->seq != seq || scratch->hidden != h_size ||
+            scratch->mlp_hidden != mlp_hidden || scratch->fused_dim != fused_dim) {
+            iris_gpu_tensor_free(hidden_gpu);
+            iris_gpu_batch_end();
+            return 0;
+        }
+        norm_gpu = scratch->norm;
+        q_gpu = scratch->q;
+        k_gpu = scratch->k;
+        v_gpu = scratch->v;
+        gate_gpu = scratch->gate_mlp;
+        up_gpu = scratch->up;
+        attn_out_gpu = scratch->attn_out;
+        concat_gpu = scratch->concat;
+        proj_out_gpu = scratch->proj_out;
+    } else {
+        norm_gpu = iris_gpu_tensor_alloc(seq * h_size);
+        q_gpu = iris_gpu_tensor_alloc(seq * h_size);
+        k_gpu = iris_gpu_tensor_alloc(seq * h_size);
+        v_gpu = iris_gpu_tensor_alloc(seq * h_size);
+        gate_gpu = iris_gpu_tensor_alloc(seq * mlp_hidden);
+        up_gpu = iris_gpu_tensor_alloc(seq * mlp_hidden);
+        attn_out_gpu = iris_gpu_tensor_alloc(seq * h_size);
+        concat_gpu = iris_gpu_tensor_alloc(seq * (h_size + mlp_hidden));
+        proj_out_gpu = iris_gpu_tensor_alloc(seq * h_size);
+
+        if (!norm_gpu || !q_gpu || !k_gpu || !v_gpu ||
+            !gate_gpu || !up_gpu || !attn_out_gpu || !concat_gpu || !proj_out_gpu) {
+            /* Cleanup and fall back */
+            iris_gpu_tensor_free(hidden_gpu);
+            if (norm_gpu) iris_gpu_tensor_free(norm_gpu);
+            if (q_gpu) iris_gpu_tensor_free(q_gpu);
+            if (k_gpu) iris_gpu_tensor_free(k_gpu);
+            if (v_gpu) iris_gpu_tensor_free(v_gpu);
+            if (gate_gpu) iris_gpu_tensor_free(gate_gpu);
+            if (up_gpu) iris_gpu_tensor_free(up_gpu);
+            if (attn_out_gpu) iris_gpu_tensor_free(attn_out_gpu);
+            if (concat_gpu) iris_gpu_tensor_free(concat_gpu);
+            if (proj_out_gpu) iris_gpu_tensor_free(proj_out_gpu);
+            iris_gpu_batch_end();
+            return 0;
+        }
+    }
+
+    /* === Phase 3: AdaLN normalization on GPU === */
+    iris_gpu_adaln_norm(norm_gpu, hidden_gpu, shift, scale, seq, h_size, eps);
+
+    /* === Phase 4: Fused QKV + MLP projection on GPU === */
+    iris_gpu_tensor_t fused_result;
+    if (scratch) {
+        fused_result = scratch->fused;
+        if (!iris_gpu_linear_bf16_into(fused_result, norm_gpu,
+                                        block->qkv_mlp_weight_bf16,
+                                        seq, h_size, fused_dim)) {
+            iris_gpu_tensor_free(hidden_gpu);
+            iris_gpu_batch_end();
+            return 0;
+        }
+    } else {
+        fused_result = iris_gpu_linear_bf16(norm_gpu,
+                                             block->qkv_mlp_weight_bf16,
+                                             seq, h_size, fused_dim);
+        if (!fused_result) {
+            /* Cleanup and fall back */
+            iris_gpu_tensor_free(hidden_gpu);
+            iris_gpu_tensor_free(norm_gpu);
+            iris_gpu_tensor_free(q_gpu);
+            iris_gpu_tensor_free(k_gpu);
+            iris_gpu_tensor_free(v_gpu);
+            iris_gpu_tensor_free(gate_gpu);
+            iris_gpu_tensor_free(up_gpu);
+            iris_gpu_tensor_free(attn_out_gpu);
+            iris_gpu_tensor_free(concat_gpu);
+            iris_gpu_tensor_free(proj_out_gpu);
+            iris_gpu_batch_end();
+            return 0;
+        }
+    }
+
+    /* === Phase 5: Split fused output on GPU === */
+    iris_gpu_split_qkv_mlp(fused_result, q_gpu, k_gpu, v_gpu, gate_gpu, up_gpu,
+                           seq, h_size, mlp_hidden);
+
+    /* === Phase 6: QK RMSNorm on GPU === */
+    iris_gpu_qk_rms_norm(q_gpu, k_gpu, block->norm_q_weight, block->norm_k_weight,
+                         seq, heads, head_dim, eps);
+
+    /* === Phase 7: Apply unified RoPE on GPU (handles text+image in one call) === */
+    iris_gpu_rope_unified(q_gpu, k_gpu,
+                          txt_rope_cos, txt_rope_sin,
+                          img_rope_cos, img_rope_sin,
+                          seq, img_offset, heads, head_dim, axis_dim);
+
+    /* === Phase 8: Self-attention on GPU === */
+    /* Try fused attention (seq <= 1024), then bf16 MPS attention (any seq) */
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    if (!iris_gpu_attention_fused(attn_out_gpu, q_gpu, k_gpu, v_gpu,
+                                  seq, seq, heads, head_dim, attn_scale)) {
+        /* Fused attention failed (seq > 1024) - try bf16 MPS attention */
+        iris_gpu_batch_end();
+        if (!iris_gpu_attention_bf16(attn_out_gpu, q_gpu, k_gpu, v_gpu,
+                                     seq, seq, heads, head_dim, attn_scale)) {
+            /* Both GPU attention paths failed - free and fall back to CPU */
+            iris_gpu_tensor_free(hidden_gpu);
+            if (own_tensors) {
+                iris_gpu_tensor_free(norm_gpu);
+                if (fused_result) iris_gpu_tensor_free(fused_result);
+                iris_gpu_tensor_free(q_gpu);
+                iris_gpu_tensor_free(k_gpu);
+                iris_gpu_tensor_free(v_gpu);
+                iris_gpu_tensor_free(gate_gpu);
+                iris_gpu_tensor_free(up_gpu);
+                iris_gpu_tensor_free(attn_out_gpu);
+                iris_gpu_tensor_free(concat_gpu);
+                iris_gpu_tensor_free(proj_out_gpu);
+            }
+            return 0;
+        }
+        iris_gpu_batch_begin();
+    }
+
+    /* === Phase 9: SwiGLU on GPU === */
+    iris_gpu_silu_mul(gate_gpu, up_gpu, seq * mlp_hidden);
+
+    /* === Phase 10: Concat attention + MLP outputs on GPU === */
+    iris_gpu_concat_attn_mlp(attn_out_gpu, gate_gpu, concat_gpu, seq, h_size, mlp_hidden);
+
+    /* === Phase 11: Final projection on GPU === */
+    if (scratch) {
+        if (!iris_gpu_linear_bf16_into(proj_out_gpu, concat_gpu,
+                                        block->proj_mlp_weight_bf16,
+                                        seq, h_size + mlp_hidden, h_size)) {
+            /* Fall back to CPU projection */
+            iris_gpu_batch_end();
+            float *concat_cpu = tf->single_concat;
+            iris_gpu_tensor_read(concat_gpu, concat_cpu);
+            float *proj_out_cpu = tf->work1;
+            iris_linear_nobias_bf16(proj_out_cpu, concat_cpu, block->proj_mlp_weight_bf16,
+                                    seq, h_size + mlp_hidden, h_size);
+            gated_add(hidden, gate, proj_out_cpu, seq, h_size);
+            iris_gpu_tensor_free(hidden_gpu);
+            return 1;
+        }
+    } else {
+        /* Free pre-allocated tensor since linear returns a new one */
+        iris_gpu_tensor_free(proj_out_gpu);
+        proj_out_gpu = iris_gpu_linear_bf16(concat_gpu, block->proj_mlp_weight_bf16,
+                                            seq, h_size + mlp_hidden, h_size);
+        if (!proj_out_gpu) {
+            /* Fall back to CPU projection */
+            iris_gpu_batch_end();
+            float *concat_cpu = tf->single_concat;
+            iris_gpu_tensor_read(concat_gpu, concat_cpu);
+            float *proj_out_cpu = tf->work1;
+            iris_linear_nobias_bf16(proj_out_cpu, concat_cpu, block->proj_mlp_weight_bf16,
+                                    seq, h_size + mlp_hidden, h_size);
+            gated_add(hidden, gate, proj_out_cpu, seq, h_size);
+            goto cleanup;
+        }
+    }
+
+    /* === Phase 12: Gated add residual on GPU === */
+    iris_gpu_gated_add(hidden_gpu, gate, proj_out_gpu, seq, h_size);
+
+    /* === Phase 13: Sync and copy result back === */
+    iris_gpu_batch_end();
+    iris_gpu_tensor_read(hidden_gpu, hidden);
+
+cleanup:
+    /* === Cleanup === */
+    iris_gpu_tensor_free(hidden_gpu);
+    if (own_tensors) {
+        iris_gpu_tensor_free(norm_gpu);
+        if (fused_result) iris_gpu_tensor_free(fused_result);
+        iris_gpu_tensor_free(q_gpu);
+        iris_gpu_tensor_free(k_gpu);
+        iris_gpu_tensor_free(v_gpu);
+        iris_gpu_tensor_free(gate_gpu);
+        iris_gpu_tensor_free(up_gpu);
+        iris_gpu_tensor_free(attn_out_gpu);
+        iris_gpu_tensor_free(concat_gpu);
+        iris_gpu_tensor_free(proj_out_gpu);
+    }
+
+    return 1;  /* GPU path succeeded */
 }
 
 /* GPU-chained single block: operates on a GPU tensor that persists across blocks.
@@ -4221,7 +4296,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     /* Fall back to per-block GPU/CPU path if both bf16 and f32 chained paths failed */
     if (!bf16_path_ok && !gpu_chained_ok) {
 #endif
-        /* Pre-compute single-block modulation ONCE for the CPU fallback path.
+        /* Pre-compute single-block modulation ONCE for the CPU/GPU fallback path.
          * SiLU(t_emb) is already in tf->t_emb_silu from double-block setup. */
         {
             int fb_mod_size = hidden * 3;
@@ -4233,6 +4308,12 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
             float *fb_scale = fb_mod_params + hidden;
             float *fb_gate  = fb_mod_params + hidden * 2;
 
+#ifdef USE_METAL
+            /* Allocate scratch buffers once for all single blocks in this path */
+            single_block_gpu_scratch_t fb_scratch;
+            int fb_scratch_ok = single_block_gpu_scratch_init(&fb_scratch, total_seq, hidden, tf->mlp_hidden);
+#endif
+
         for (int i = 0; i < tf->num_single_layers; i++) {
             /* In mmap mode, load block weights on-demand and free after use */
             if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
@@ -4241,12 +4322,14 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
                                           tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
             }
 #ifdef USE_METAL
-            /* Try GPU-optimized path first */
+            /* Try GPU-optimized path first (with pre-computed modulation + scratch) */
             if (!single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
                                           t_emb, tf->adaln_single_weight,
                                           img_rope_cos, img_rope_sin,
                                           txt_rope_cos, txt_rope_sin,
-                                          total_seq, txt_seq, tf))
+                                          total_seq, txt_seq, tf,
+                                          fb_shift, fb_scale, fb_gate,
+                                          fb_scratch_ok ? &fb_scratch : NULL))
 #endif
             {
                 /* Fall back to CPU path — pass pre-computed modulation */
@@ -4271,6 +4354,9 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
             }
 #endif
         }
+#ifdef USE_METAL
+            if (fb_scratch_ok) single_block_gpu_scratch_free(&fb_scratch);
+#endif
         }  /* end pre-computed modulation block */
 #ifdef USE_METAL
     }
