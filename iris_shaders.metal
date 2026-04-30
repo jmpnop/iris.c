@@ -193,6 +193,24 @@ kernel void silu_mul(
     }
 }
 
+/* Fused split + SiLU + mul for SwiGLU FFN.
+ * Reads fused [seq, 2*mlp_hidden] and writes out = silu(gate) * up
+ * where gate = fused[:, :mlp_hidden], up = fused[:, mlp_hidden:]. */
+kernel void split_silu_mul(
+    device const float *fused [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant int &mlp_hidden [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int n = mlp_hidden;  // mlp_hidden passed; total elements inferred from dispatch
+    int row = gid / n;
+    int col = gid % n;
+    int fused_stride = n * 2;
+    float g = fused[row * fused_stride + col];
+    float u = fused[row * fused_stride + n + col];
+    out[gid] = (g / (1.0f + exp(-g))) * u;
+}
+
 /* ========================================================================
  * Gated Add: out += gate * proj
  * gate: [hidden], proj: [seq, hidden], out: [seq, hidden]

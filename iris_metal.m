@@ -95,6 +95,54 @@ static int g_linear_graph_bf16_disabled = 0;
 static int g_linear_graph_bf16_seen_success = 0;
 
 /* ========================================================================
+ * MPSMatrixMultiplication Cache (for iris_gpu_linear_bf16_into)
+ * ======================================================================== */
+
+#define MAX_MPS_MATMUL_CACHE 16
+
+typedef struct {
+    int M, N, K;
+    __strong MPSMatrixMultiplication *op;
+} mps_matmul_cache_t;
+
+static mps_matmul_cache_t g_mps_matmul_cache[MAX_MPS_MATMUL_CACHE];
+static int g_mps_matmul_count = 0;
+static pthread_mutex_t g_mps_matmul_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static MPSMatrixMultiplication *get_cached_mps_matmul(int M, int N, int K) {
+    pthread_mutex_lock(&g_mps_matmul_mutex);
+    for (int i = 0; i < g_mps_matmul_count; i++) {
+        if (g_mps_matmul_cache[i].M == M &&
+            g_mps_matmul_cache[i].N == N &&
+            g_mps_matmul_cache[i].K == K) {
+            MPSMatrixMultiplication *op = g_mps_matmul_cache[i].op;
+            pthread_mutex_unlock(&g_mps_matmul_mutex);
+            return op;
+        }
+    }
+
+    MPSMatrixMultiplication *op = [[MPSMatrixMultiplication alloc]
+        initWithDevice:g_device
+           transposeLeft:NO
+          transposeRight:YES
+              resultRows:M
+           resultColumns:N
+         interiorColumns:K
+                   alpha:1.0f
+                    beta:0.0f];
+
+    if (g_mps_matmul_count < MAX_MPS_MATMUL_CACHE) {
+        int slot = g_mps_matmul_count++;
+        g_mps_matmul_cache[slot].M = M;
+        g_mps_matmul_cache[slot].N = N;
+        g_mps_matmul_cache[slot].K = K;
+        g_mps_matmul_cache[slot].op = op;
+    }
+    pthread_mutex_unlock(&g_mps_matmul_mutex);
+    return op;
+}
+
+/* ========================================================================
  * MPSGraph Conv2D Cache
  * ======================================================================== */
 
@@ -495,6 +543,10 @@ void iris_metal_cleanup(void) {
         clear_f16_cache();
         clear_rope_cache();
         clear_activation_pool();
+        pthread_mutex_lock(&g_mps_matmul_mutex);
+        g_mps_matmul_count = 0;
+        memset(g_mps_matmul_cache, 0, sizeof(g_mps_matmul_cache));
+        pthread_mutex_unlock(&g_mps_matmul_mutex);
         g_queue = nil;
         g_device = nil;
         g_initialized = 0;
@@ -524,6 +576,10 @@ void iris_metal_reset(void) {
         clear_f16_cache();
         clear_rope_cache();
         clear_activation_pool();
+        pthread_mutex_lock(&g_mps_matmul_mutex);
+        g_mps_matmul_count = 0;
+        memset(g_mps_matmul_cache, 0, sizeof(g_mps_matmul_cache));
+        pthread_mutex_unlock(&g_mps_matmul_mutex);
 
         /* Clear batch input cache */
         pthread_mutex_lock(&g_cache_mutex);
@@ -2641,16 +2697,7 @@ iris_gpu_tensor_t iris_gpu_linear(iris_gpu_tensor_t x,
         MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW descriptor:descW];
         MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:out->buffer descriptor:descOut];
 
-        /* Create matmul: out = x @ W^T */
-        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
-            initWithDevice:g_device
-               transposeLeft:NO
-              transposeRight:YES
-                  resultRows:seq_len
-               resultColumns:out_dim
-             interiorColumns:in_dim
-                       alpha:1.0f
-                        beta:0.0f];
+        MPSMatrixMultiplication *matmul = get_cached_mps_matmul(seq_len, out_dim, in_dim);
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
         [matmul encodeToCommandBuffer:cmdBuffer
@@ -2733,16 +2780,7 @@ iris_gpu_tensor_t iris_gpu_linear_bf16(iris_gpu_tensor_t x,
         MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW descriptor:descW];
         MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:out->buffer descriptor:descOut];
 
-        /* Create matmul: out = x @ W^T */
-        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
-            initWithDevice:g_device
-               transposeLeft:NO
-              transposeRight:YES
-                  resultRows:seq_len
-               resultColumns:out_dim
-             interiorColumns:in_dim
-                       alpha:1.0f
-                        beta:0.0f];
+        MPSMatrixMultiplication *matmul = get_cached_mps_matmul(seq_len, out_dim, in_dim);
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
         [matmul encodeToCommandBuffer:cmdBuffer
@@ -2805,16 +2843,7 @@ int iris_gpu_linear_bf16_into(iris_gpu_tensor_t out,
         MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW descriptor:descW];
         MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:out->buffer descriptor:descOut];
 
-        /* Create matmul: out = x @ W^T */
-        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
-            initWithDevice:g_device
-               transposeLeft:NO
-              transposeRight:YES
-                  resultRows:seq_len
-               resultColumns:out_dim
-             interiorColumns:in_dim
-                       alpha:1.0f
-                        beta:0.0f];
+        MPSMatrixMultiplication *matmul = get_cached_mps_matmul(seq_len, out_dim, in_dim);
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
         [matmul encodeToCommandBuffer:cmdBuffer
@@ -2884,15 +2913,7 @@ iris_gpu_tensor_t iris_gpu_linear_bf16_bf16out(iris_gpu_tensor_t x,
         MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW descriptor:descW];
         MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:out->buffer descriptor:descOut];
 
-        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
-            initWithDevice:g_device
-               transposeLeft:NO
-              transposeRight:YES
-                  resultRows:seq_len
-               resultColumns:out_dim
-             interiorColumns:in_dim
-                       alpha:1.0f
-                        beta:0.0f];
+        MPSMatrixMultiplication *matmul = get_cached_mps_matmul(seq_len, out_dim, in_dim);
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
         [matmul encodeToCommandBuffer:cmdBuffer
@@ -3182,6 +3203,7 @@ static id<MTLComputePipelineState> g_head_rms_norm_bf16_pipeline = nil;
 static id<MTLComputePipelineState> g_attention_fused_pipeline = nil;
 static id<MTLComputePipelineState> g_gated_add_pipeline = nil;
 static id<MTLComputePipelineState> g_split_qkv_mlp_pipeline = nil;
+static id<MTLComputePipelineState> g_split_silu_mul_pipeline = nil;
 static id<MTLComputePipelineState> g_concat_attn_mlp_pipeline = nil;
 static id<MTLComputePipelineState> g_bmm_half_qkt_pipeline = nil;
 static id<MTLComputePipelineState> g_bmm_half_sv_pipeline = nil;
@@ -3387,6 +3409,15 @@ int iris_metal_init_shaders(void) {
             g_split_qkv_mlp_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
             if (!g_split_qkv_mlp_pipeline) {
                 fprintf(stderr, "Metal shaders: split_qkv_mlp pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"split_silu_mul"];
+        if (func) {
+            g_split_silu_mul_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_split_silu_mul_pipeline) {
+                fprintf(stderr, "Metal shaders: split_silu_mul pipeline failed: %s\n",
                         [[error localizedDescription] UTF8String]);
             }
         }
@@ -4304,6 +4335,42 @@ void iris_gpu_silu_mul(iris_gpu_tensor_t gate, iris_gpu_tensor_t up, int n) {
             up->has_pending_work = 0;
         }
     }
+}
+
+/* Fused split + SiLU + mul for SwiGLU FFN.
+ * fused: [seq, 2*mlp_hidden], out: [seq, mlp_hidden]
+ * Returns 1 on success, 0 if pipeline not available (caller falls back). */
+int iris_gpu_split_silu_mul(iris_gpu_tensor_t out, iris_gpu_tensor_t fused,
+                            int seq, int mlp_hidden) {
+    if (!g_shaders_initialized || !g_split_silu_mul_pipeline || !out || !fused) return 0;
+
+    @autoreleasepool {
+        int n = seq * mlp_hidden;
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_split_silu_mul_pipeline];
+        [encoder setBuffer:fused->buffer offset:0 atIndex:0];
+        [encoder setBuffer:out->buffer offset:0 atIndex:1];
+        [encoder setBytes:&mlp_hidden length:sizeof(int) atIndex:2];
+
+        NSUInteger threads = MIN(256, (NSUInteger)n);
+        [encoder dispatchThreads:MTLSizeMake(n, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        fused->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            fused->has_pending_work = 0;
+        }
+    }
+    return 1;
 }
 
 /* GPU tensor version of gated add: out += gate * proj */

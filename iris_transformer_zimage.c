@@ -1018,10 +1018,14 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
             if (zi_gpu_linear_into_f32(scratch->fused, scratch->norm,
                                        block->ffn_w13_weight_bf16, NULL,
                                        seq, dim, 2 * ffn_dim)) {
-                iris_gpu_split_qkv_mlp(scratch->fused,
-                                       scratch->q, scratch->k, scratch->v,
-                                       scratch->gate_up, scratch->up,
-                                       seq, 0, ffn_dim);
+                if (!iris_gpu_split_silu_mul(scratch->gate_up, scratch->fused,
+                                             seq, ffn_dim)) {
+                    iris_gpu_split_qkv_mlp(scratch->fused,
+                                           scratch->q, scratch->k, scratch->v,
+                                           scratch->gate_up, scratch->up,
+                                           seq, 0, ffn_dim);
+                    iris_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
+                }
             } else {
                 if (!zi_gpu_linear_into_f32(scratch->gate_up, scratch->norm,
                                             block->ffn_w1_bf16, block->ffn_w1,
@@ -1029,6 +1033,7 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                 if (!zi_gpu_linear_into_f32(scratch->up, scratch->norm,
                                             block->ffn_w3_bf16, block->ffn_w3,
                                             seq, dim, ffn_dim)) return 0;
+                iris_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
             }
         } else {
             if (!zi_gpu_linear_into_f32(scratch->gate_up, scratch->norm,
@@ -1037,8 +1042,8 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
             if (!zi_gpu_linear_into_f32(scratch->up, scratch->norm,
                                         block->ffn_w3_bf16, block->ffn_w3,
                                         seq, dim, ffn_dim)) return 0;
+            iris_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
         }
-        iris_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
 
         /* GPU: FFN down projection */
         if (!zi_gpu_linear_into_f32(scratch->down, scratch->gate_up,
@@ -1123,10 +1128,14 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
             if (zi_gpu_linear_into_f32(scratch->fused, scratch->norm,
                                        block->ffn_w13_weight_bf16, NULL,
                                        seq, dim, 2 * ffn_dim)) {
-                iris_gpu_split_qkv_mlp(scratch->fused,
-                                       scratch->q, scratch->k, scratch->v,
-                                       scratch->gate_up, scratch->up,
-                                       seq, 0, ffn_dim);
+                if (!iris_gpu_split_silu_mul(scratch->gate_up, scratch->fused,
+                                             seq, ffn_dim)) {
+                    iris_gpu_split_qkv_mlp(scratch->fused,
+                                           scratch->q, scratch->k, scratch->v,
+                                           scratch->gate_up, scratch->up,
+                                           seq, 0, ffn_dim);
+                    iris_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
+                }
             } else {
                 if (!zi_gpu_linear_into_f32(scratch->gate_up, scratch->norm,
                                             block->ffn_w1_bf16, block->ffn_w1,
@@ -1134,6 +1143,7 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                 if (!zi_gpu_linear_into_f32(scratch->up, scratch->norm,
                                             block->ffn_w3_bf16, block->ffn_w3,
                                             seq, dim, ffn_dim)) return 0;
+                iris_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
             }
         } else {
             if (!zi_gpu_linear_into_f32(scratch->gate_up, scratch->norm,
@@ -1142,8 +1152,8 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
             if (!zi_gpu_linear_into_f32(scratch->up, scratch->norm,
                                         block->ffn_w3_bf16, block->ffn_w3,
                                         seq, dim, ffn_dim)) return 0;
+            iris_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
         }
-        iris_gpu_silu_mul(scratch->gate_up, scratch->up, seq * ffn_dim);
         if (!zi_gpu_linear_into_f32(scratch->down, scratch->gate_up,
                                     block->ffn_w2_bf16, block->ffn_w2,
                                     seq, ffn_dim, dim)) return 0;

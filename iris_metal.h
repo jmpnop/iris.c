@@ -383,6 +383,10 @@ void iris_gpu_rope_unified(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
 /* SiLU multiply on GPU: gate = silu(gate) * up */
 void iris_gpu_silu_mul(iris_gpu_tensor_t gate, iris_gpu_tensor_t up, int n);
 
+/* Fused split + SiLU + mul: reads fused [seq, 2*mlp_hidden], writes out [seq, mlp_hidden] */
+int iris_gpu_split_silu_mul(iris_gpu_tensor_t out, iris_gpu_tensor_t fused,
+                            int seq, int mlp_hidden);
+
 /* Gated add on GPU: out += gate * proj */
 void iris_gpu_gated_add(iris_gpu_tensor_t out, const float *gate,
                         iris_gpu_tensor_t proj, int seq, int hidden);
