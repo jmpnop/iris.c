@@ -2341,6 +2341,252 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
 }
 
 /* ========================================================================
+ * GPU-Chained Double-Stream Block
+ * Keeps img_hidden and txt_hidden on GPU across all 5 double blocks,
+ * eliminating CPU↔GPU copies between operations.
+ * ======================================================================== */
+
+#ifdef USE_METAL
+
+typedef struct {
+    int img_seq, txt_seq, hidden, mlp_hidden;
+    iris_gpu_tensor_t img_norm;      /* [img_seq, hidden] */
+    iris_gpu_tensor_t txt_norm;      /* [txt_seq, hidden] */
+    iris_gpu_tensor_t img_q;         /* [img_seq, hidden] */
+    iris_gpu_tensor_t img_k;         /* [img_seq, hidden] */
+    iris_gpu_tensor_t img_v;         /* [img_seq, hidden] */
+    iris_gpu_tensor_t txt_q;         /* [txt_seq, hidden] */
+    iris_gpu_tensor_t txt_k;         /* [txt_seq, hidden] */
+    iris_gpu_tensor_t txt_v;         /* [txt_seq, hidden] */
+    iris_gpu_tensor_t cat_k;         /* [total_seq, hidden] */
+    iris_gpu_tensor_t cat_v;         /* [total_seq, hidden] */
+    iris_gpu_tensor_t img_attn_out;  /* [img_seq, hidden] */
+    iris_gpu_tensor_t txt_attn_out;  /* [txt_seq, hidden] */
+    iris_gpu_tensor_t img_proj;      /* [img_seq, hidden] */
+    iris_gpu_tensor_t txt_proj;      /* [txt_seq, hidden] */
+    iris_gpu_tensor_t ffn_gate;      /* [img_seq, mlp_hidden] (img is larger) */
+    iris_gpu_tensor_t ffn_up;        /* [img_seq, mlp_hidden] */
+    iris_gpu_tensor_t ffn_out;       /* [img_seq, hidden] */
+} double_block_gpu_scratch_t;
+
+static void double_block_gpu_scratch_free(double_block_gpu_scratch_t *s) {
+    if (!s) return;
+    if (s->img_norm) iris_gpu_tensor_free(s->img_norm);
+    if (s->txt_norm) iris_gpu_tensor_free(s->txt_norm);
+    if (s->img_q) iris_gpu_tensor_free(s->img_q);
+    if (s->img_k) iris_gpu_tensor_free(s->img_k);
+    if (s->img_v) iris_gpu_tensor_free(s->img_v);
+    if (s->txt_q) iris_gpu_tensor_free(s->txt_q);
+    if (s->txt_k) iris_gpu_tensor_free(s->txt_k);
+    if (s->txt_v) iris_gpu_tensor_free(s->txt_v);
+    if (s->cat_k) iris_gpu_tensor_free(s->cat_k);
+    if (s->cat_v) iris_gpu_tensor_free(s->cat_v);
+    if (s->img_attn_out) iris_gpu_tensor_free(s->img_attn_out);
+    if (s->txt_attn_out) iris_gpu_tensor_free(s->txt_attn_out);
+    if (s->img_proj) iris_gpu_tensor_free(s->img_proj);
+    if (s->txt_proj) iris_gpu_tensor_free(s->txt_proj);
+    if (s->ffn_gate) iris_gpu_tensor_free(s->ffn_gate);
+    if (s->ffn_up) iris_gpu_tensor_free(s->ffn_up);
+    if (s->ffn_out) iris_gpu_tensor_free(s->ffn_out);
+    memset(s, 0, sizeof(*s));
+}
+
+static int double_block_gpu_scratch_init(double_block_gpu_scratch_t *s,
+                                         int img_seq, int txt_seq, int hidden, int mlp_hidden) {
+    if (!s || img_seq <= 0 || txt_seq <= 0 || hidden <= 0 || mlp_hidden <= 0) return 0;
+    memset(s, 0, sizeof(*s));
+    s->img_seq = img_seq;
+    s->txt_seq = txt_seq;
+    s->hidden = hidden;
+    s->mlp_hidden = mlp_hidden;
+    int total_seq = img_seq + txt_seq;
+
+    s->img_norm     = iris_gpu_tensor_alloc((size_t)img_seq * hidden);
+    s->txt_norm     = iris_gpu_tensor_alloc((size_t)txt_seq * hidden);
+    s->img_q        = iris_gpu_tensor_alloc((size_t)img_seq * hidden);
+    s->img_k        = iris_gpu_tensor_alloc((size_t)img_seq * hidden);
+    s->img_v        = iris_gpu_tensor_alloc((size_t)img_seq * hidden);
+    s->txt_q        = iris_gpu_tensor_alloc((size_t)txt_seq * hidden);
+    s->txt_k        = iris_gpu_tensor_alloc((size_t)txt_seq * hidden);
+    s->txt_v        = iris_gpu_tensor_alloc((size_t)txt_seq * hidden);
+    s->cat_k        = iris_gpu_tensor_alloc((size_t)total_seq * hidden);
+    s->cat_v        = iris_gpu_tensor_alloc((size_t)total_seq * hidden);
+    s->img_attn_out = iris_gpu_tensor_alloc((size_t)img_seq * hidden);
+    s->txt_attn_out = iris_gpu_tensor_alloc((size_t)txt_seq * hidden);
+    s->img_proj     = iris_gpu_tensor_alloc((size_t)img_seq * hidden);
+    s->txt_proj     = iris_gpu_tensor_alloc((size_t)txt_seq * hidden);
+    s->ffn_gate     = iris_gpu_tensor_alloc((size_t)img_seq * mlp_hidden);
+    s->ffn_up       = iris_gpu_tensor_alloc((size_t)img_seq * mlp_hidden);
+    s->ffn_out      = iris_gpu_tensor_alloc((size_t)img_seq * hidden);
+
+    if (!s->img_norm || !s->txt_norm || !s->img_q || !s->img_k || !s->img_v ||
+        !s->txt_q || !s->txt_k || !s->txt_v || !s->cat_k || !s->cat_v ||
+        !s->img_attn_out || !s->txt_attn_out || !s->img_proj || !s->txt_proj ||
+        !s->ffn_gate || !s->ffn_up || !s->ffn_out) {
+        double_block_gpu_scratch_free(s);
+        return 0;
+    }
+    return 1;
+}
+
+static int double_block_forward_gpu_chained(
+    iris_gpu_tensor_t img_hidden_gpu,
+    iris_gpu_tensor_t txt_hidden_gpu,
+    const double_block_t *block,
+    const float *img_mod, const float *txt_mod,
+    const float *img_rope_cos, const float *img_rope_sin,
+    const float *txt_rope_cos, const float *txt_rope_sin,
+    int img_seq, int txt_seq,
+    iris_transformer_flux_t *tf,
+    double_block_gpu_scratch_t *scratch)
+{
+    if (!iris_metal_available() || !iris_metal_shaders_available()) return 0;
+    if (!img_hidden_gpu || !txt_hidden_gpu || !scratch) return 0;
+    if (!block->img_q_weight_bf16 || !block->txt_q_weight_bf16) return 0;
+
+    int hidden = tf->hidden_size;
+    int heads = tf->num_heads;
+    int head_dim = tf->head_dim;
+    int total_seq = img_seq + txt_seq;
+    float eps = 1e-6f;
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+
+    const float *img_shift1 = img_mod;
+    const float *img_scale1 = img_mod + hidden;
+    const float *img_gate1  = img_mod + hidden * 2;
+    const float *img_shift2 = img_mod + hidden * 3;
+    const float *img_scale2 = img_mod + hidden * 4;
+    const float *img_gate2  = img_mod + hidden * 5;
+
+    const float *txt_shift1 = txt_mod;
+    const float *txt_scale1 = txt_mod + hidden;
+    const float *txt_gate1  = txt_mod + hidden * 2;
+    const float *txt_shift2 = txt_mod + hidden * 3;
+    const float *txt_scale2 = txt_mod + hidden * 4;
+    const float *txt_gate2  = txt_mod + hidden * 5;
+
+    /* === Image stream: AdaLN → QKV → QKnorm+RoPE === */
+    iris_gpu_adaln_norm(scratch->img_norm, img_hidden_gpu,
+                        img_shift1, img_scale1, img_seq, hidden, eps);
+
+    if (!iris_gpu_linear_bf16_into(scratch->img_q, scratch->img_norm,
+                                    block->img_q_weight_bf16, img_seq, hidden, hidden) ||
+        !iris_gpu_linear_bf16_into(scratch->img_k, scratch->img_norm,
+                                    block->img_k_weight_bf16, img_seq, hidden, hidden) ||
+        !iris_gpu_linear_bf16_into(scratch->img_v, scratch->img_norm,
+                                    block->img_v_weight_bf16, img_seq, hidden, hidden))
+        return 0;
+
+    if (!iris_gpu_qknorm_rope(scratch->img_q, scratch->img_k,
+                               block->img_norm_q_weight, block->img_norm_k_weight,
+                               img_rope_cos, img_rope_sin,
+                               img_seq, heads, head_dim, eps)) {
+        iris_gpu_qk_rms_norm(scratch->img_q, scratch->img_k,
+                              block->img_norm_q_weight, block->img_norm_k_weight,
+                              img_seq, heads, head_dim, eps);
+        iris_gpu_rope_2d(scratch->img_q, img_rope_cos, img_rope_sin,
+                          img_seq, heads, head_dim, 32);
+        iris_gpu_rope_2d(scratch->img_k, img_rope_cos, img_rope_sin,
+                          img_seq, heads, head_dim, 32);
+    }
+
+    /* === Text stream: AdaLN → QKV → QKnorm+RoPE === */
+    iris_gpu_adaln_norm(scratch->txt_norm, txt_hidden_gpu,
+                        txt_shift1, txt_scale1, txt_seq, hidden, eps);
+
+    if (!iris_gpu_linear_bf16_into(scratch->txt_q, scratch->txt_norm,
+                                    block->txt_q_weight_bf16, txt_seq, hidden, hidden) ||
+        !iris_gpu_linear_bf16_into(scratch->txt_k, scratch->txt_norm,
+                                    block->txt_k_weight_bf16, txt_seq, hidden, hidden) ||
+        !iris_gpu_linear_bf16_into(scratch->txt_v, scratch->txt_norm,
+                                    block->txt_v_weight_bf16, txt_seq, hidden, hidden))
+        return 0;
+
+    if (!iris_gpu_qknorm_rope(scratch->txt_q, scratch->txt_k,
+                               block->txt_norm_q_weight, block->txt_norm_k_weight,
+                               txt_rope_cos, txt_rope_sin,
+                               txt_seq, heads, head_dim, eps)) {
+        iris_gpu_qk_rms_norm(scratch->txt_q, scratch->txt_k,
+                              block->txt_norm_q_weight, block->txt_norm_k_weight,
+                              txt_seq, heads, head_dim, eps);
+        iris_gpu_rope_2d(scratch->txt_q, txt_rope_cos, txt_rope_sin,
+                          txt_seq, heads, head_dim, 32);
+        iris_gpu_rope_2d(scratch->txt_k, txt_rope_cos, txt_rope_sin,
+                          txt_seq, heads, head_dim, 32);
+    }
+
+    /* === Concatenate K,V: [txt, img] order (matches Python) === */
+    iris_gpu_copy_region_f32(scratch->cat_k, 0,
+                              scratch->txt_k, 0, (size_t)txt_seq * hidden);
+    iris_gpu_copy_region_f32(scratch->cat_k, (size_t)txt_seq * hidden,
+                              scratch->img_k, 0, (size_t)img_seq * hidden);
+    iris_gpu_copy_region_f32(scratch->cat_v, 0,
+                              scratch->txt_v, 0, (size_t)txt_seq * hidden);
+    iris_gpu_copy_region_f32(scratch->cat_v, (size_t)txt_seq * hidden,
+                              scratch->img_v, 0, (size_t)img_seq * hidden);
+
+    /* === Joint attention === */
+    if (!iris_gpu_attention_fused(scratch->img_attn_out, scratch->img_q,
+                                   scratch->cat_k, scratch->cat_v,
+                                   img_seq, total_seq, heads, head_dim, attn_scale) ||
+        !iris_gpu_attention_fused(scratch->txt_attn_out, scratch->txt_q,
+                                   scratch->cat_k, scratch->cat_v,
+                                   txt_seq, total_seq, heads, head_dim, attn_scale))
+        return 0;
+
+    /* === Output projections === */
+    if (!iris_gpu_linear_bf16_into(scratch->img_proj, scratch->img_attn_out,
+                                    block->img_proj_weight_bf16, img_seq, hidden, hidden) ||
+        !iris_gpu_linear_bf16_into(scratch->txt_proj, scratch->txt_attn_out,
+                                    block->txt_proj_weight_bf16, txt_seq, hidden, hidden))
+        return 0;
+
+    /* === Gated residual add (attention) === */
+    iris_gpu_gated_add(img_hidden_gpu, img_gate1, scratch->img_proj, img_seq, hidden);
+    iris_gpu_gated_add(txt_hidden_gpu, txt_gate1, scratch->txt_proj, txt_seq, hidden);
+
+    /* === Image FFN: AdaLN → SwiGLU → gated add === */
+    iris_gpu_adaln_norm(scratch->img_norm, img_hidden_gpu,
+                        img_shift2, img_scale2, img_seq, hidden, eps);
+
+    if (!iris_gpu_linear_bf16_into(scratch->ffn_gate, scratch->img_norm,
+                                    block->img_mlp_gate_weight_bf16, img_seq, hidden, tf->mlp_hidden) ||
+        !iris_gpu_linear_bf16_into(scratch->ffn_up, scratch->img_norm,
+                                    block->img_mlp_up_weight_bf16, img_seq, hidden, tf->mlp_hidden))
+        return 0;
+
+    iris_gpu_silu_mul(scratch->ffn_gate, scratch->ffn_up, img_seq * tf->mlp_hidden);
+
+    if (!iris_gpu_linear_bf16_into(scratch->ffn_out, scratch->ffn_gate,
+                                    block->img_mlp_down_weight_bf16, img_seq, tf->mlp_hidden, hidden))
+        return 0;
+
+    iris_gpu_gated_add(img_hidden_gpu, img_gate2, scratch->ffn_out, img_seq, hidden);
+
+    /* === Text FFN: AdaLN → SwiGLU → gated add === */
+    iris_gpu_adaln_norm(scratch->txt_norm, txt_hidden_gpu,
+                        txt_shift2, txt_scale2, txt_seq, hidden, eps);
+
+    if (!iris_gpu_linear_bf16_into(scratch->ffn_gate, scratch->txt_norm,
+                                    block->txt_mlp_gate_weight_bf16, txt_seq, hidden, tf->mlp_hidden) ||
+        !iris_gpu_linear_bf16_into(scratch->ffn_up, scratch->txt_norm,
+                                    block->txt_mlp_up_weight_bf16, txt_seq, hidden, tf->mlp_hidden))
+        return 0;
+
+    iris_gpu_silu_mul(scratch->ffn_gate, scratch->ffn_up, txt_seq * tf->mlp_hidden);
+
+    if (!iris_gpu_linear_bf16_into(scratch->ffn_out, scratch->ffn_gate,
+                                    block->txt_mlp_down_weight_bf16, txt_seq, tf->mlp_hidden, hidden))
+        return 0;
+
+    iris_gpu_gated_add(txt_hidden_gpu, txt_gate2, scratch->ffn_out, txt_seq, hidden);
+
+    return 1;
+}
+
+#endif /* USE_METAL */
+
+/* ========================================================================
  * Single-Stream Block (Parallel DiT)
  * ======================================================================== */
 
@@ -3610,38 +3856,76 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     iris_linear_nobias(tf->double_mod_txt, tf->t_emb_silu, tf->adaln_double_txt_weight,
                        1, hidden, double_mod_size);
 
-    for (int i = 0; i < tf->num_double_layers; i++) {
-        /* In mmap mode, load block weights on-demand and free after use */
-        if (tf->use_mmap && tf->double_blocks[i].img_q_weight == NULL
-                         && tf->double_blocks[i].img_q_weight_bf16 == NULL) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
-                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
-        }
-        double_block_forward(img_hidden, txt_hidden,
-                             &tf->double_blocks[i],
-                             tf->double_mod_img, tf->double_mod_txt,
-                             img_rope_cos, img_rope_sin,
-                             txt_rope_cos, txt_rope_sin,
-                             img_seq, txt_seq, tf);
-        if (tf->use_mmap) free_double_block_weights(&tf->double_blocks[i]);
-        if (iris_substep_callback)
-            iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
-#ifdef DEBUG_TRANSFORMER
-        if (i == 0) {
-            fprintf(stderr, "\n[DEBUG] After double block 0:\n");
-            fprintf(stderr, "[DEBUG] img_hidden[0,0,:10]: ");
-            for (int d = 0; d < 10; d++) fprintf(stderr, "%.6f ", img_hidden[d]);
-            fprintf(stderr, "\n");
-            float sum = 0, sum_sq = 0;
-            for (int d = 0; d < img_seq * hidden; d++) {
-                sum += img_hidden[d];
-                sum_sq += img_hidden[d] * img_hidden[d];
+#ifdef USE_METAL
+    int double_gpu_done = 0;  /* number of blocks completed on GPU */
+    if (iris_metal_available() && iris_metal_shaders_available() && !tf->use_mmap &&
+        tf->double_blocks[0].img_q_weight_bf16) {
+        iris_gpu_tensor_t img_gpu = iris_gpu_tensor_create(img_hidden, (size_t)img_seq * hidden);
+        iris_gpu_tensor_t txt_gpu = iris_gpu_tensor_create(txt_hidden, (size_t)txt_seq * hidden);
+        if (img_gpu && txt_gpu) {
+            iris_gpu_tensor_set_persistent(img_gpu, 1);
+            iris_gpu_tensor_set_persistent(txt_gpu, 1);
+
+            double_block_gpu_scratch_t db_scratch;
+            int scratch_ok = double_block_gpu_scratch_init(&db_scratch, img_seq, txt_seq,
+                                                            hidden, tf->mlp_hidden);
+            iris_gpu_batch_begin();
+
+            for (int i = 0; i < tf->num_double_layers; i++) {
+                if (!double_block_forward_gpu_chained(img_gpu, txt_gpu,
+                                                      &tf->double_blocks[i],
+                                                      tf->double_mod_img, tf->double_mod_txt,
+                                                      img_rope_cos, img_rope_sin,
+                                                      txt_rope_cos, txt_rope_sin,
+                                                      img_seq, txt_seq, tf,
+                                                      scratch_ok ? &db_scratch : NULL)) {
+                    iris_gpu_batch_end();
+                    iris_gpu_tensor_read(img_gpu, img_hidden);
+                    iris_gpu_tensor_read(txt_gpu, txt_hidden);
+                    break;
+                }
+                double_gpu_done = i + 1;
+                if (iris_substep_callback)
+                    iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
             }
-            float mean = sum / (img_seq * hidden);
-            float std = sqrtf(sum_sq / (img_seq * hidden) - mean * mean);
-            fprintf(stderr, "[DEBUG] img_hidden mean=%.6f, std=%.6f\n", mean, std);
+
+            if (scratch_ok) double_block_gpu_scratch_free(&db_scratch);
+
+            if (double_gpu_done == tf->num_double_layers) {
+                iris_gpu_batch_end();
+                iris_gpu_tensor_read(img_gpu, img_hidden);
+                iris_gpu_tensor_read(txt_gpu, txt_hidden);
+            }
+
+            iris_gpu_tensor_free(img_gpu);
+            iris_gpu_tensor_free(txt_gpu);
+        } else {
+            if (img_gpu) iris_gpu_tensor_free(img_gpu);
+            if (txt_gpu) iris_gpu_tensor_free(txt_gpu);
         }
+    }
+
+    if (double_gpu_done < tf->num_double_layers) {
+        for (int i = double_gpu_done; i < tf->num_double_layers; i++) {
+#else
+    {
+        for (int i = 0; i < tf->num_double_layers; i++) {
 #endif
+            if (tf->use_mmap && tf->double_blocks[i].img_q_weight == NULL
+                             && tf->double_blocks[i].img_q_weight_bf16 == NULL) {
+                load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
+                                          tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+            }
+            double_block_forward(img_hidden, txt_hidden,
+                                 &tf->double_blocks[i],
+                                 tf->double_mod_img, tf->double_mod_txt,
+                                 img_rope_cos, img_rope_sin,
+                                 txt_rope_cos, txt_rope_sin,
+                                 img_seq, txt_seq, tf);
+            if (tf->use_mmap) free_double_block_weights(&tf->double_blocks[i]);
+            if (iris_substep_callback)
+                iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
+        }
     }
 
     double double_time = tf_get_time_ms() - double_start;
