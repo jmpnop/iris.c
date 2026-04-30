@@ -980,6 +980,7 @@ static void iris_metal_sgemm_impl(int transpose_a, int transpose_b,
         if (!bufferA || !bufferB || !bufferC) {
             /* Fallback if buffer creation fails */
             if (bufferA && !bufferA_from_cache) pool_release_buffer(bufferA);
+            if (bufferB && !cache_B) pool_release_buffer(bufferB);
             if (bufferC) pool_release_buffer(bufferC);
             return;
         }
@@ -1029,6 +1030,9 @@ static void iris_metal_sgemm_impl(int transpose_a, int transpose_b,
             g_pending_count++;
             if (!bufferA_from_cache) {
                 pool_release_buffer(bufferA);
+            }
+            if (!cache_B) {
+                pool_release_buffer(bufferB);
             }
         } else if (g_in_batch) {
             /* Batch mode, overflow: one-shot cmd buffer, skip g_batch_cmd

@@ -192,6 +192,12 @@ static char **pretokenize(const char *text, int *num_tokens) {
         /* Create token */
         int len = p - start;
         char *token = malloc(len + 1);
+        if (!token) {
+            for (int i = 0; i < count; i++) free(tokens[i]);
+            free(tokens);
+            *num_tokens = 0;
+            return NULL;
+        }
         memcpy(token, start, len);
         token[len] = '\0';
 
@@ -516,6 +522,7 @@ char *iris_detokenize(iris_tokenizer *tok, const int *tokens, int num_tokens) {
 
     /* Build string */
     char *text = malloc(total_len + 1);
+    if (!text) return NULL;
     char *p = text;
     for (int i = 0; i < num_tokens; i++) {
         int id = tokens[i];
@@ -593,12 +600,18 @@ iris_tokenizer *iris_tokenizer_create_simple(void) {
             snprintf(buf, sizeof(buf), "<0x%02X>", i);
         }
         tok->vocab[i] = strdup(buf);
+        if (!tok->vocab[i]) { iris_tokenizer_free(tok); return NULL; }
         vocab_hash_insert(tok->vocab_hash, tok->hash_size, tok->vocab[i], i);
     }
     tok->vocab[256] = strdup("<pad>");
     tok->vocab[257] = strdup("<unk>");
     tok->vocab[258] = strdup("<bos>");
     tok->vocab[259] = strdup("<eos>");
+    if (!tok->vocab[256] || !tok->vocab[257] ||
+        !tok->vocab[258] || !tok->vocab[259]) {
+        iris_tokenizer_free(tok);
+        return NULL;
+    }
 
     vocab_hash_insert(tok->vocab_hash, tok->hash_size, "<pad>", 256);
     vocab_hash_insert(tok->vocab_hash, tok->hash_size, "<unk>", 257);

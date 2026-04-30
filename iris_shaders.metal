@@ -349,7 +349,7 @@ kernel void qknorm_rope(
 
     // --- RoPE: apply rotation to normalized Q and K ---
     // Wait for all normalization writes to complete before reading them back
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
 
     device const float *cos_row = cos_freq + seq_idx * head_dim;
     device const float *sin_row = sin_freq + seq_idx * head_dim;

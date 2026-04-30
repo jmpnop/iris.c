@@ -1582,24 +1582,24 @@ static int qwen3_alloc_work_buffers(qwen3_model_t *model) {
     int head_dim = model->head_dim;
     int intermediate = model->intermediate_size;
 
-    model->hidden_state = malloc(seq_len * hidden * sizeof(float));
-    model->residual = malloc(seq_len * hidden * sizeof(float));
-    model->q_buf = malloc(seq_len * num_heads * head_dim * sizeof(float));
-    model->k_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
-    model->v_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
-    model->attn_scores = malloc(num_heads * seq_len * seq_len * sizeof(float));
-    model->attn_out = malloc(seq_len * num_heads * head_dim * sizeof(float));
-    model->mlp_gate = malloc(seq_len * intermediate * sizeof(float));
-    model->mlp_up = malloc(seq_len * intermediate * sizeof(float));
-    model->mlp_out = malloc(seq_len * hidden * sizeof(float));
-    model->norm_buf = malloc(seq_len * hidden * sizeof(float));
+    model->hidden_state = malloc((size_t)seq_len * hidden * sizeof(float));
+    model->residual = malloc((size_t)seq_len * hidden * sizeof(float));
+    model->q_buf = malloc((size_t)seq_len * num_heads * head_dim * sizeof(float));
+    model->k_buf = malloc((size_t)seq_len * num_kv_heads * head_dim * sizeof(float));
+    model->v_buf = malloc((size_t)seq_len * num_kv_heads * head_dim * sizeof(float));
+    model->attn_scores = malloc((size_t)num_heads * seq_len * seq_len * sizeof(float));
+    model->attn_out = malloc((size_t)seq_len * num_heads * head_dim * sizeof(float));
+    model->mlp_gate = malloc((size_t)seq_len * intermediate * sizeof(float));
+    model->mlp_up = malloc((size_t)seq_len * intermediate * sizeof(float));
+    model->mlp_out = malloc((size_t)seq_len * hidden * sizeof(float));
+    model->norm_buf = malloc((size_t)seq_len * hidden * sizeof(float));
 
-    model->attn_q_head = malloc(seq_len * head_dim * sizeof(float));
-    model->attn_v_head = malloc(seq_len * head_dim * sizeof(float));
-    model->attn_out_head = malloc(seq_len * head_dim * sizeof(float));
+    model->attn_q_head = malloc((size_t)seq_len * head_dim * sizeof(float));
+    model->attn_v_head = malloc((size_t)seq_len * head_dim * sizeof(float));
+    model->attn_out_head = malloc((size_t)seq_len * head_dim * sizeof(float));
 
     for (int i = 0; i < 3; i++) {
-        model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
+        model->layer_outputs[i] = malloc((size_t)seq_len * hidden * sizeof(float));
     }
 
     /* Check all allocations at once */
@@ -1676,8 +1676,12 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
     /* Compute RoPE frequencies */
     int max_seq = QWEN3_MAX_SEQ_LEN;
     int half_dim = model->head_dim / 2;
-    model->rope_cos = malloc(max_seq * half_dim * sizeof(float));
-    model->rope_sin = malloc(max_seq * half_dim * sizeof(float));
+    model->rope_cos = malloc((size_t)max_seq * half_dim * sizeof(float));
+    model->rope_sin = malloc((size_t)max_seq * half_dim * sizeof(float));
+    if (!model->rope_cos || !model->rope_sin) {
+        fprintf(stderr, "qwen3_model_load: RoPE allocation failed\n");
+        goto error;
+    }
     compute_rope_freqs(model->rope_cos, model->rope_sin, max_seq,
                        model->head_dim, model->rope_theta);
 
@@ -1758,8 +1762,12 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
     /* Compute RoPE frequencies */
     int max_seq = QWEN3_MAX_SEQ_LEN;
     int half_dim = model->head_dim / 2;
-    model->rope_cos = malloc(max_seq * half_dim * sizeof(float));
-    model->rope_sin = malloc(max_seq * half_dim * sizeof(float));
+    model->rope_cos = malloc((size_t)max_seq * half_dim * sizeof(float));
+    model->rope_sin = malloc((size_t)max_seq * half_dim * sizeof(float));
+    if (!model->rope_cos || !model->rope_sin) {
+        fprintf(stderr, "qwen3_model_load_mmap: RoPE allocation failed\n");
+        goto error;
+    }
     compute_rope_freqs(model->rope_cos, model->rope_sin, max_seq,
                        model->head_dim, model->rope_theta);
 

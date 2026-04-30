@@ -319,6 +319,11 @@ float *iris_sample_euler_flux(void *transformer, void *text_encoder,
         /* Predict velocity with conditioning */
         v_cond = iris_transformer_forward_flux(tf, z_curr, h, w,
                                           text_emb, text_seq, t_curr);
+        if (!v_cond) {
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
 
         /* Euler step: z_next = z_curr + dt * v */
         iris_axpy(z_curr, dt, v_cond, latent_size);
@@ -427,6 +432,11 @@ float *iris_sample_euler_zimage(void *transformer,
         float *model_out = iris_transformer_forward_zimage(tf, z_curr, h, w,
                                                     timestep,
                                                     cap_feats, cap_seq);
+        if (!model_out) {
+            free(z_curr);
+            free(step_latent);
+            return NULL;
+        }
 
         /* Euler step: z_next = z + dt * (-model_output) */
         for (int i = 0; i < latent_size; i++) {
@@ -551,11 +561,22 @@ float *iris_sample_euler_zimage_cfg(void *transformer,
         float *v_uncond = iris_transformer_forward_zimage(tf, z_curr, h, w,
                                                     timestep,
                                                     cap_feats_uncond, cap_seq_uncond);
+        if (!v_uncond) {
+            free(z_curr);
+            free(step_latent);
+            return NULL;
+        }
 
         /* Conditional prediction (real caption) */
         float *v_cond = iris_transformer_forward_zimage(tf, z_curr, h, w,
                                                     timestep,
                                                     cap_feats_cond, cap_seq_cond);
+        if (!v_cond) {
+            free(v_uncond);
+            free(z_curr);
+            free(step_latent);
+            return NULL;
+        }
 
         /* CFG combine: v = v_uncond + guidance * (v_cond - v_uncond)
          * Then Euler step: z_next = z + dt * (-v) */
@@ -695,6 +716,11 @@ float *iris_sample_euler_zimage_img2img(void *transformer,
         float *model_out = iris_transformer_forward_zimage(tf, z_curr, h, w,
                                                     timestep,
                                                     cap_feats, cap_seq);
+        if (!model_out) {
+            free(z_curr);
+            free(step_latent);
+            return NULL;
+        }
 
         /* Euler step: z_next = z + dt * (-model_output) */
         for (int i = 0; i < latent_size; i++) {
@@ -809,6 +835,11 @@ float *iris_sample_euler_refs_flux(void *transformer, void *text_encoder,
                                                       t_offset,
                                                       text_emb, text_seq,
                                                       t_curr);
+        if (!v) {
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
 
         /* Euler step: z_next = z_curr + dt * v */
         iris_axpy(z_curr, dt, v, latent_size);
@@ -885,6 +916,11 @@ float *iris_sample_euler_multirefs_flux(void *transformer, void *text_encoder,
                                                             refs, num_refs,
                                                             text_emb, text_seq,
                                                             t_curr);
+        if (!v) {
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
 
         /* Euler step */
         iris_axpy(z_curr, dt, v, latent_size);
@@ -965,11 +1001,22 @@ float *iris_sample_euler_cfg_flux(void *transformer, void *text_encoder,
         float *v_uncond = iris_transformer_forward_flux(tf, z_curr, h, w,
                                                     text_emb_uncond, text_seq_uncond,
                                                     t_curr);
+        if (!v_uncond) {
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
 
         /* Conditioned prediction */
         float *v_cond = iris_transformer_forward_flux(tf, z_curr, h, w,
                                                   text_emb_cond, text_seq_cond,
                                                   t_curr);
+        if (!v_cond) {
+            free(v_uncond);
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
 
         /* CFG combine: v = v_uncond + scale * (v_cond - v_uncond) */
         for (int i = 0; i < latent_size; i++) {
@@ -1048,12 +1095,23 @@ float *iris_sample_euler_cfg_refs_flux(void *transformer, void *text_encoder,
                               z_curr, h, w,
                               ref_latent, ref_h, ref_w, t_offset,
                               text_emb_uncond, text_seq_uncond, t_curr);
+        if (!v_uncond) {
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
 
         /* Conditioned prediction (with ref) */
         float *v_cond = iris_transformer_forward_refs_flux(tf,
                             z_curr, h, w,
                             ref_latent, ref_h, ref_w, t_offset,
                             text_emb_cond, text_seq_cond, t_curr);
+        if (!v_cond) {
+            free(v_uncond);
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
 
         /* CFG combine */
         for (int i = 0; i < latent_size; i++) {
@@ -1131,12 +1189,23 @@ float *iris_sample_euler_cfg_multirefs_flux(void *transformer, void *text_encode
                               z_curr, h, w,
                               refs, num_refs,
                               text_emb_uncond, text_seq_uncond, t_curr);
+        if (!v_uncond) {
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
 
         /* Conditioned prediction (with refs) */
         float *v_cond = iris_transformer_forward_multirefs_flux(tf,
                             z_curr, h, w,
                             refs, num_refs,
                             text_emb_cond, text_seq_cond, t_curr);
+        if (!v_cond) {
+            free(v_uncond);
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
 
         /* CFG combine */
         for (int i = 0; i < latent_size; i++) {
@@ -1209,6 +1278,12 @@ float *iris_sample_euler_ancestral(void *transformer,
         /* Predict velocity */
         float *v = iris_transformer_forward_flux(tf, z_curr, h, w,
                                             text_emb, text_seq, t_curr);
+        if (!v) {
+            free(z_curr);
+            free(noise);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
 
         /* Euler step */
         iris_axpy(z_curr, dt, v, latent_size);
@@ -1279,6 +1354,12 @@ float *iris_sample_heun(void *transformer,
         /* First velocity estimate */
         float *v1 = iris_transformer_forward_flux(tf, z_curr, h, w,
                                              text_emb, text_seq, t_curr);
+        if (!v1) {
+            free(z_curr);
+            free(z_pred);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
 
         /* Predict next state */
         iris_copy(z_pred, z_curr, latent_size);
@@ -1288,6 +1369,13 @@ float *iris_sample_heun(void *transformer,
         if (step < num_steps - 1) {
             float *v2 = iris_transformer_forward_flux(tf, z_pred, h, w,
                                                  text_emb, text_seq, t_next);
+            if (!v2) {
+                free(v1);
+                free(z_curr);
+                free(z_pred);
+                iris_transformer_free_mmap_cache_flux(tf);
+                return NULL;
+            }
 
             /* Heun correction: z_next = z_curr + dt/2 * (v1 + v2) */
             for (int i = 0; i < latent_size; i++) {

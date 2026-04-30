@@ -608,6 +608,12 @@ static void zi_precompute_rope(zi_transformer_t *tf) {
 
         tf->rope_cos[ax] = (float *)malloc(max_pos * half_d * sizeof(float));
         tf->rope_sin[ax] = (float *)malloc(max_pos * half_d * sizeof(float));
+        if (!tf->rope_cos[ax] || !tf->rope_sin[ax]) {
+            fprintf(stderr, "zi_precompute_rope: malloc failed for axis %d\n", ax);
+            free(tf->rope_cos[ax]); tf->rope_cos[ax] = NULL;
+            free(tf->rope_sin[ax]); tf->rope_sin[ax] = NULL;
+            return;
+        }
 
         /* Hoist powf: precompute inverse frequencies once per axis */
         float inv_freq[64];  /* max half_d = 48/2 = 24 */

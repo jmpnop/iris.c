@@ -969,6 +969,11 @@ static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
      * where latent_ch = in_ch * ps * ps = 64 */
     int latent_ch = in_ch * ps * ps;
     float *latent = (float *)malloc(latent_ch * post_h * post_w * sizeof(float));
+    if (!latent) {
+        free(denoised);
+        set_error("Failed to allocate latent buffer");
+        return NULL;
+    }
     iris_patchify(latent, denoised, 1, in_ch, pre_h, pre_w, ps);
     free(denoised);
 
@@ -1524,6 +1529,12 @@ static iris_image *iris_img2img_zimage(iris_ctx *ctx, const char *prompt,
     int pre_w = post_w * ps;  /* W/8 */
 
     float *ref_latent = (float *)malloc(in_ch * pre_h * pre_w * sizeof(float));
+    if (!ref_latent) {
+        free(img_latent_post);
+        free(text_emb);
+        set_error("Failed to allocate reference latent buffer");
+        return NULL;
+    }
     iris_unpatchify(ref_latent, img_latent_post, 1, in_ch, pre_h, pre_w, ps);
     free(img_latent_post);
 
@@ -1573,6 +1584,11 @@ static iris_image *iris_img2img_zimage(iris_ctx *ctx, const char *prompt,
     /* Patchify for VAE decode: [in_ch, H/8, W/8] -> [latent_ch, H/16, W/16] */
     int latent_ch = in_ch * ps * ps;
     float *latent = (float *)malloc(latent_ch * post_h * post_w * sizeof(float));
+    if (!latent) {
+        free(denoised);
+        set_error("Failed to allocate latent buffer");
+        return NULL;
+    }
     iris_patchify(latent, denoised, 1, in_ch, pre_h, pre_w, ps);
     free(denoised);
 
@@ -1882,6 +1898,12 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
 
     /* Build reference pixel dimensions, clamped and rounded to 16. */
     int *ref_pixel_dims = (int *)malloc(num_refs * 2 * sizeof(int));
+    if (!ref_pixel_dims) {
+        free(text_emb);
+        free(text_emb_uncond);
+        set_error("Failed to allocate reference dimensions buffer");
+        return NULL;
+    }
     for (int i = 0; i < num_refs; i++) {
         int rh = (refs[i]->height / 16) * 16;
         int rw = (refs[i]->width / 16) * 16;
@@ -1905,6 +1927,17 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
     iris_ref_t *ref_latents = (iris_ref_t *)malloc(num_refs * sizeof(iris_ref_t));
     float **ref_data = (float **)malloc(num_refs * sizeof(float *));
     iris_image **resized_imgs = (iris_image **)calloc(num_refs, sizeof(iris_image *));
+
+    if (!ref_latents || !ref_data || !resized_imgs) {
+        free(ref_latents);
+        free(ref_data);
+        free(resized_imgs);
+        free(ref_pixel_dims);
+        free(text_emb);
+        free(text_emb_uncond);
+        set_error("Failed to allocate reference image buffers");
+        return NULL;
+    }
 
     for (int i = 0; i < num_refs; i++) {
         const iris_image *ref = refs[i];

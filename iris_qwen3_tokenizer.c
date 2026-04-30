@@ -521,6 +521,7 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
                 int len1 = strlen(left);
                 int len2 = strlen(right);
                 char *key = malloc(len1 + len2 + 2);
+                if (!key) { free(left); free(right); goto error; }
                 memcpy(key, left, len1);
                 key[len1] = ' ';
                 memcpy(key + len1 + 1, right, len2);
@@ -789,6 +790,7 @@ static token_node_t *bpe_encode_word(qwen3_tokenizer_t *tok, const char *word) {
             int len1 = strlen(best_node->text);
             int len2 = strlen(best_node->next->text);
             char *merged = malloc(len1 + len2 + 1);
+            if (!merged) break;  /* OOM: stop merging, return what we have */
             memcpy(merged, best_node->text, len1);
             memcpy(merged + len1, best_node->next->text, len2);
             merged[len1 + len2] = '\0';
@@ -841,6 +843,10 @@ static char *text_to_bytes(const char *text) {
 static char **pretokenize(const char *text, int *num_chunks) {
     int capacity = 64;
     char **chunks = malloc(capacity * sizeof(char *));
+    if (!chunks) {
+        *num_chunks = 0;
+        return NULL;
+    }
     int count = 0;
 
     const char *p = text;
@@ -914,6 +920,12 @@ static char **pretokenize(const char *text, int *num_chunks) {
         if (p > start) {
             int len = p - start;
             char *chunk = malloc(len + 1);
+            if (!chunk) {
+                for (int ci = 0; ci < count; ci++) free(chunks[ci]);
+                free(chunks);
+                *num_chunks = 0;
+                return NULL;
+            }
             memcpy(chunk, start, len);
             chunk[len] = '\0';
 
@@ -956,6 +968,12 @@ int *qwen3_tokenize(qwen3_tokenizer_t *tok, const char *text,
     /* Tokenize each chunk */
     int capacity = 256;
     int *tokens = malloc(capacity * sizeof(int));
+    if (!tokens) {
+        for (int c = 0; c < num_chunks; c++) free(chunks[c]);
+        free(chunks);
+        *num_tokens = 0;
+        return NULL;
+    }
     int total = 0;
 
     for (int c = 0; c < num_chunks && total < max_len; c++) {
@@ -1009,6 +1027,7 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
 
     int capacity = 256;
     int *tokens = malloc(capacity * sizeof(int));
+    if (!tokens) { *num_tokens = 0; return NULL; }
     int total = 0;
 
     /* Checked realloc: on failure, free tokens and return NULL */
