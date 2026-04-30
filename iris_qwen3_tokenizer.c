@@ -43,6 +43,11 @@ typedef struct {
     int rank;  /* Lower rank = higher priority (merge first) */
 } bpe_merge_t;
 
+typedef struct {
+    char *key;    /* NULL = empty slot, owned copy of "left right" string */
+    int rank;
+} merge_hash_entry_t;
+
 typedef struct qwen3_tokenizer {
     /* Vocabulary: id -> token string */
     char **vocab;
@@ -56,8 +61,8 @@ typedef struct qwen3_tokenizer {
     bpe_merge_t *merges;
     int num_merges;
 
-    /* Merge rank lookup: "left right" -> rank */
-    int *merge_ranks;  /* Hash table: hash("left right") -> rank, or -1 */
+    /* Merge rank lookup: "left right" -> rank (open-addressed hash table) */
+    merge_hash_entry_t *merge_ranks;
 } qwen3_tokenizer_t;
 
 /* ========================================================================
@@ -453,13 +458,10 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
 
     tok->num_merges = merge_count;
     tok->merges = calloc(merge_count, sizeof(bpe_merge_t));
-    tok->merge_ranks = calloc(tok->hash_size, sizeof(int));
+    tok->merge_ranks = calloc(tok->hash_size, sizeof(merge_hash_entry_t));
     if (!tok->merges || !tok->merge_ranks) goto error;
 
-    /* Initialize merge_ranks to -1 */
-    for (int i = 0; i < tok->hash_size; i++) {
-        tok->merge_ranks[i] = -1;
-    }
+    /* All slots start empty: key=NULL (calloc zeroed) */
 
     /* Parse merges - format is [["left", "right"], ...] */
     p = skip_ws(p);
@@ -504,14 +506,16 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
 
                 unsigned int h = hash_string(key) % tok->hash_size;
                 int probes = 0;
-                while (tok->merge_ranks[h] != -1 && probes < tok->hash_size) {
+                while (tok->merge_ranks[h].key != NULL && probes < tok->hash_size) {
                     h = (h + 1) % tok->hash_size;
                     probes++;
                 }
                 if (probes < tok->hash_size) {
-                    tok->merge_ranks[h] = merge_idx;
+                    tok->merge_ranks[h].key = key;  /* transfer ownership */
+                    tok->merge_ranks[h].rank = merge_idx;
+                    key = NULL;  /* don't free, hash table owns it now */
                 }
-                free(key);
+                free(key);  /* only frees if table was full (key still non-NULL) */
             } else {
                 free(left);
                 free(right);
@@ -628,7 +632,12 @@ void qwen3_tokenizer_free(qwen3_tokenizer_t *tok) {
         free(tok->merges);
     }
 
-    free(tok->merge_ranks);
+    if (tok->merge_ranks) {
+        for (int i = 0; i < tok->hash_size; i++) {
+            free(tok->merge_ranks[i].key);
+        }
+        free(tok->merge_ranks);
+    }
     free(tok);
 }
 
@@ -637,27 +646,22 @@ void qwen3_tokenizer_free(qwen3_tokenizer_t *tok) {
  * ======================================================================== */
 
 static int get_merge_rank(qwen3_tokenizer_t *tok, const char *left, const char *right) {
-    /* Build "left right" string on the stack (max token len is 256) */
+    /* Build "left right" key on the stack (max token len is 256) */
     char key[513];  /* 256 + 1 space + 256 */
     snprintf(key, sizeof(key), "%s %s", left, right);
 
-    /* Lookup in hash table */
+    /* Open-addressed lookup: probe until empty slot or exact key match */
     unsigned int h = hash_string(key) % tok->hash_size;
     int probes = 0;
-    while (tok->merge_ranks[h] != -1 && probes < tok->hash_size) {
-        int rank = tok->merge_ranks[h];
-        if (rank >= 0 && rank < tok->num_merges) {
-            /* Check if this is the right merge */
-            if (strcmp(tok->merges[rank].left, left) == 0 &&
-                strcmp(tok->merges[rank].right, right) == 0) {
-                return rank;
-            }
+    while (tok->merge_ranks[h].key != NULL && probes < tok->hash_size) {
+        if (strcmp(tok->merge_ranks[h].key, key) == 0) {
+            return tok->merge_ranks[h].rank;
         }
         h = (h + 1) % tok->hash_size;
         probes++;
     }
 
-    return -1;
+    return -1;  /* empty slot reached — merge pair does not exist */
 }
 
 /* ========================================================================

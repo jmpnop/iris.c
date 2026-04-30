@@ -178,6 +178,13 @@ static int g_conv_graph_count = 0;
 static int g_conv_graph_next = 0;
 static pthread_mutex_t g_conv_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* BF16 conv2d graph cache — same structure, but the graph computes in BF16.
+ * Input/output placeholders are F32; cast nodes convert at the graph edges. */
+static conv2d_graph_cache_t g_conv_bf16_graph_cache[MAX_CONV_GRAPH_CACHE];
+static int g_conv_bf16_graph_count = 0;
+static int g_conv_bf16_graph_next = 0;
+static pthread_mutex_t g_conv_bf16_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* ========================================================================
  * Batch Execution State
  * When in batch mode, operations are encoded but not executed until
@@ -1445,6 +1452,123 @@ static conv2d_graph_cache_t *get_conv2d_graph_cache(int batch, int in_ch, int ou
     return entry;
 }
 
+/* BF16 variant: graph placeholders are F32 but internal conv runs in BF16.
+ * Halves memory bandwidth for weights and activations during the conv. */
+static conv2d_graph_cache_t *get_conv2d_bf16_graph_cache(int batch, int in_ch, int out_ch,
+                                                          int H, int W, int kH, int kW,
+                                                          int stride, int padding) {
+    pthread_mutex_lock(&g_conv_bf16_graph_mutex);
+    for (int i = 0; i < g_conv_bf16_graph_count && i < MAX_CONV_GRAPH_CACHE; i++) {
+        conv2d_graph_cache_t *entry = &g_conv_bf16_graph_cache[i];
+        if (entry->batch == batch && entry->in_ch == in_ch && entry->out_ch == out_ch &&
+            entry->H == H && entry->W == W && entry->kH == kH && entry->kW == kW &&
+            entry->stride == stride && entry->padding == padding) {
+            pthread_mutex_unlock(&g_conv_bf16_graph_mutex);
+            return entry;
+        }
+    }
+
+    int slot = 0;
+    if (g_conv_bf16_graph_count < MAX_CONV_GRAPH_CACHE) {
+        slot = g_conv_bf16_graph_count++;
+    } else {
+        slot = g_conv_bf16_graph_next++ % MAX_CONV_GRAPH_CACHE;
+    }
+
+    conv2d_graph_cache_t *entry = &g_conv_bf16_graph_cache[slot];
+    entry->batch = batch;
+    entry->in_ch = in_ch;
+    entry->out_ch = out_ch;
+    entry->H = H;
+    entry->W = W;
+    entry->kH = kH;
+    entry->kW = kW;
+    entry->stride = stride;
+    entry->padding = padding;
+
+    int outH = (H + 2 * padding - kH) / stride + 1;
+    int outW = (W + 2 * padding - kW) / stride + 1;
+    if (outH <= 0 || outW <= 0) {
+        pthread_mutex_unlock(&g_conv_bf16_graph_mutex);
+        return NULL;
+    }
+
+    @autoreleasepool {
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        if (!graph) {
+            pthread_mutex_unlock(&g_conv_bf16_graph_mutex);
+            return NULL;
+        }
+
+        /* Placeholders are F32 — the caller feeds F32 buffers. */
+        NSArray<NSNumber *> *inputShape = @[@(batch), @(in_ch), @(H), @(W)];
+        NSArray<NSNumber *> *weightShape = @[@(out_ch), @(in_ch), @(kH), @(kW)];
+        NSArray<NSNumber *> *biasShape = @[@1, @(out_ch), @1, @1];
+        NSArray<NSNumber *> *outShape = @[@(batch), @(out_ch), @(outH), @(outW)];
+
+        MPSGraphTensor *input_f32 = [graph placeholderWithShape:inputShape
+                                                      dataType:MPSDataTypeFloat32
+                                                          name:nil];
+        MPSGraphTensor *weight_f32 = [graph placeholderWithShape:weightShape
+                                                       dataType:MPSDataTypeFloat32
+                                                           name:nil];
+        MPSGraphTensor *bias_f32 = [graph placeholderWithShape:biasShape
+                                                     dataType:MPSDataTypeFloat32
+                                                         name:nil];
+
+        /* Cast inputs to BF16 for the convolution. */
+        MPSGraphTensor *input_bf16 = [graph castTensor:input_f32
+                                                toType:MPSDataTypeBFloat16
+                                                  name:@"cast_input_bf16"];
+        MPSGraphTensor *weight_bf16 = [graph castTensor:weight_f32
+                                                 toType:MPSDataTypeBFloat16
+                                                   name:@"cast_weight_bf16"];
+        MPSGraphTensor *bias_bf16 = [graph castTensor:bias_f32
+                                               toType:MPSDataTypeBFloat16
+                                                 name:@"cast_bias_bf16"];
+
+        MPSGraphConvolution2DOpDescriptor *desc =
+            [MPSGraphConvolution2DOpDescriptor descriptorWithStrideInX:(NSUInteger)stride
+                                                             strideInY:(NSUInteger)stride
+                                                       dilationRateInX:1
+                                                       dilationRateInY:1
+                                                                groups:1
+                                                           paddingLeft:(NSUInteger)padding
+                                                          paddingRight:(NSUInteger)padding
+                                                            paddingTop:(NSUInteger)padding
+                                                         paddingBottom:(NSUInteger)padding
+                                                          paddingStyle:MPSGraphPaddingStyleExplicit
+                                                            dataLayout:MPSGraphTensorNamedDataLayoutNCHW
+                                                         weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
+
+        MPSGraphTensor *conv_bf16 = [graph convolution2DWithSourceTensor:input_bf16
+                                                           weightsTensor:weight_bf16
+                                                              descriptor:desc
+                                                                    name:nil];
+        MPSGraphTensor *sum_bf16 = [graph additionWithPrimaryTensor:conv_bf16
+                                                    secondaryTensor:bias_bf16
+                                                               name:nil];
+
+        /* Cast result back to F32 for the rest of the pipeline. */
+        MPSGraphTensor *out = [graph castTensor:sum_bf16
+                                        toType:MPSDataTypeFloat32
+                                          name:@"cast_output_f32"];
+
+        entry->graph = graph;
+        entry->inputTensor = input_f32;
+        entry->weightTensor = weight_f32;
+        entry->biasTensor = bias_f32;
+        entry->outTensor = out;
+        entry->inputShape = inputShape;
+        entry->weightShape = weightShape;
+        entry->biasShape = biasShape;
+        entry->outShape = outShape;
+    }
+
+    pthread_mutex_unlock(&g_conv_bf16_graph_mutex);
+    return entry;
+}
+
 int iris_metal_conv2d(float *out, const float *in,
                       const float *weight, const float *bias,
                       int batch, int in_ch, int out_ch,
@@ -2259,8 +2383,10 @@ void iris_bf16_qk_rms_norm(id<MTLBuffer> q, id<MTLBuffer> k,
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
         [encoder setBytes:&eps length:sizeof(float) atIndex:6];
 
+        /* One threadgroup per (seq, head), threads cooperate on head_dim reduction */
+        NSUInteger tpg = MIN(128, (NSUInteger)head_dim);
         [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         [encoder endEncoding];
 
         [cmdBuffer commit];
@@ -3756,9 +3882,10 @@ void iris_metal_qk_rms_norm(float *q, float *k,
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
         [encoder setBytes:&eps length:sizeof(float) atIndex:6];
 
-        /* One thread per (seq_idx, head_idx) pair */
-        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+        /* One threadgroup per (seq, head), threads cooperate on head_dim reduction */
+        NSUInteger tpg = MIN(128, (NSUInteger)head_dim);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 
         [encoder endEncoding];
 
@@ -3822,8 +3949,10 @@ int iris_metal_qknorm_rope(float *q, float *k,
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
         [encoder setBytes:&eps length:sizeof(float) atIndex:8];
 
-        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+        /* One threadgroup per (seq, head), threads cooperate on head_dim reduction */
+        NSUInteger tpg = MIN(128, (NSUInteger)head_dim);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         [encoder endEncoding];
 
         [cmdBuffer commit];
@@ -4179,8 +4308,10 @@ int iris_gpu_qknorm_rope(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
         [encoder setBytes:&eps length:sizeof(float) atIndex:8];
 
-        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+        /* One threadgroup per (seq, head), threads cooperate on head_dim reduction */
+        NSUInteger tpg = MIN(128, (NSUInteger)head_dim);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 
         [encoder endEncoding];
 
@@ -4223,8 +4354,10 @@ void iris_gpu_qk_rms_norm(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
         [encoder setBytes:&eps length:sizeof(float) atIndex:6];
 
-        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
-           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+        /* One threadgroup per (seq, head), threads cooperate on head_dim reduction */
+        NSUInteger tpg = MIN(128, (NSUInteger)head_dim);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 
         [encoder endEncoding];
 
@@ -5394,6 +5527,89 @@ int iris_gpu_attention_fused_bf16(iris_gpu_tensor_t out,
 
 }
 
+/* Custom BF16 attention with f32 tensor interface (no MPSGraph SDPA).
+ * Takes f32 GPU tensors, converts to bf16, runs ONLY the custom
+ * attention_fused_bf16 Metal kernel (which does f32 accumulation internally),
+ * then converts output back to f32.
+ *
+ * This avoids MPSGraph SDPA which causes grid artifacts at non-square
+ * resolutions in diffusion models (e.g. Z-Image). The custom kernel
+ * is safe because it does all arithmetic in f32; only I/O is bf16.
+ *
+ * Returns 1 on success, 0 on failure (caller should fall back to f32). */
+int iris_gpu_attention_custom_bf16(iris_gpu_tensor_t out,
+                                    iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
+                                    int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
+    if (!g_shaders_initialized || !g_attention_fused_bf16_pipeline) return 0;
+    if (!out || !Q || !K || !V) return 0;
+
+    /* Check threadgroup memory fits: shared_scores[seq_k] + shared_max/sum/q */
+    NSUInteger bf16_scores_size = (NSUInteger)seq_k * sizeof(float);
+    NSUInteger bf16_static_size = (256 + 256 + 128) * sizeof(float);
+    if (bf16_scores_size + bf16_static_size > 32768) return 0;
+
+    @autoreleasepool {
+        size_t out_elements = (size_t)seq_q * num_heads * head_dim;
+
+        /* Convert f32 inputs to bf16 on GPU */
+        iris_gpu_tensor_t q_bf16 = iris_gpu_tensor_f32_to_bf16(Q);
+        iris_gpu_tensor_t k_bf16 = iris_gpu_tensor_f32_to_bf16(K);
+        iris_gpu_tensor_t v_bf16 = iris_gpu_tensor_f32_to_bf16(V);
+        iris_gpu_tensor_t out_bf16 = iris_gpu_tensor_alloc_f16(out_elements);
+
+        if (!q_bf16 || !k_bf16 || !v_bf16 || !out_bf16) {
+            if (q_bf16) iris_gpu_tensor_free(q_bf16);
+            if (k_bf16) iris_gpu_tensor_free(k_bf16);
+            if (v_bf16) iris_gpu_tensor_free(v_bf16);
+            if (out_bf16) iris_gpu_tensor_free(out_bf16);
+            return 0;
+        }
+
+        /* Ensure conversions have completed */
+        iris_gpu_sync();
+
+        /* Dispatch custom kernel (skip MPSGraph SDPA entirely) */
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        if (bf16_debug_enabled()) {
+            fprintf(stderr, "[ATTN] Using custom BF16 kernel (no SDPA) seq_q=%d seq_k=%d heads=%d head_dim=%d\n",
+                    seq_q, seq_k, num_heads, head_dim);
+        }
+
+        [encoder setComputePipelineState:g_attention_fused_bf16_pipeline];
+        [encoder setBuffer:q_bf16->buffer offset:0 atIndex:0];
+        [encoder setBuffer:k_bf16->buffer offset:0 atIndex:1];
+        [encoder setBuffer:v_bf16->buffer offset:0 atIndex:2];
+        [encoder setBuffer:out_bf16->buffer offset:0 atIndex:3];
+        [encoder setBytes:&seq_q length:sizeof(int) atIndex:4];
+        [encoder setBytes:&seq_k length:sizeof(int) atIndex:5];
+        [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
+        [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+        [encoder setThreadgroupMemoryLength:bf16_scores_size atIndex:0];
+
+        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq_q, num_heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+        [encoder endEncoding];
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        /* Convert bf16 output back to f32 */
+        int ok = iris_gpu_convert_bf16_to_f32_into(out, out_bf16);
+        if (ok) iris_gpu_sync();
+
+        iris_gpu_tensor_free(q_bf16);
+        iris_gpu_tensor_free(k_bf16);
+        iris_gpu_tensor_free(v_bf16);
+        iris_gpu_tensor_free(out_bf16);
+
+        return ok;
+    }
+}
+
 /* ========================================================================
  * BF16 GPU Tensor Operations
  * These operate on bf16 GPU tensors (is_f16 = 1) with f32 internal computation.
@@ -5454,8 +5670,10 @@ void iris_gpu_qk_rms_norm_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
         [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
         [encoder setBytes:&eps length:sizeof(float) atIndex:6];
 
+        /* One threadgroup per (seq, head), threads cooperate on head_dim reduction */
+        NSUInteger tpg = MIN(128, (NSUInteger)head_dim);
         [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         [encoder endEncoding];
 
         q->has_pending_work = 1;
@@ -7045,6 +7263,116 @@ iris_gpu_tensor_t iris_gpu_conv2d_f32(iris_gpu_tensor_t x,
             x->has_pending_work = 0;
         } else {
             /* MPSGraph may commit-and-continue; update the live buffer. */
+            g_tensor_cmd = [mpsCmd rootCommandBuffer];
+        }
+    }
+
+    return out;
+}
+
+/* BF16 Conv2d on f32 GPU tensors — halves memory bandwidth.
+ * Same signature as iris_gpu_conv2d_f32; the graph casts F32→BF16 at input,
+ * runs the convolution in BF16, and casts BF16→F32 at output.
+ * Returns new GPU tensor [batch, out_ch, outH, outW] or NULL on failure. */
+iris_gpu_tensor_t iris_gpu_conv2d_bf16(iris_gpu_tensor_t x,
+                                        const float *weight, const float *bias,
+                                        int batch, int in_ch, int out_ch,
+                                        int H, int W, int kH, int kW,
+                                        int stride, int padding) {
+    if (!g_initialized || !x || !weight || !bias) return NULL;
+    if (batch <= 0 || in_ch <= 0 || out_ch <= 0 ||
+        H <= 0 || W <= 0 || kH <= 0 || kW <= 0 || stride <= 0) return NULL;
+
+    conv2d_graph_cache_t *cache = get_conv2d_bf16_graph_cache(batch, in_ch, out_ch,
+                                                               H, W, kH, kW,
+                                                               stride, padding);
+    if (!cache || !cache->graph) return NULL;
+
+    int outH = (H + 2 * padding - kH) / stride + 1;
+    int outW = (W + 2 * padding - kW) / stride + 1;
+    if (outH <= 0 || outW <= 0) return NULL;
+
+    size_t out_elems = (size_t)batch * out_ch * outH * outW;
+    size_t w_bytes = (size_t)out_ch * in_ch * kH * kW * sizeof(float);
+    size_t b_bytes = (size_t)out_ch * sizeof(float);
+
+    iris_gpu_tensor_t out = iris_gpu_tensor_alloc(out_elems);
+    if (!out) return NULL;
+
+    @autoreleasepool {
+        id<MTLBuffer> w_buf = get_cached_weight_buffer(weight, w_bytes);
+        id<MTLBuffer> b_buf = get_cached_weight_buffer(bias, b_bytes);
+        if (!w_buf || !b_buf) {
+            iris_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        if (!cmdBuffer) {
+            iris_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        MPSCommandBuffer *mpsCmd = nil;
+        if (g_tensor_batch_mode) {
+            mpsCmd = [MPSCommandBuffer commandBufferWithCommandBuffer:cmdBuffer];
+        } else {
+            mpsCmd = [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
+        }
+        if (!mpsCmd) {
+            iris_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        /* Feed F32 data — the graph handles F32→BF16→conv→BF16→F32 internally. */
+        MPSGraphTensorData *in_data =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:x->buffer
+                                                   shape:cache->inputShape
+                                                dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *w_data =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:w_buf
+                                                   shape:cache->weightShape
+                                                dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *b_data =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:b_buf
+                                                   shape:cache->biasShape
+                                                dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *out_data =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:out->buffer
+                                                   shape:cache->outShape
+                                                dataType:MPSDataTypeFloat32];
+        if (!in_data || !w_data || !b_data || !out_data) {
+            iris_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        NSDictionary *feeds = @{
+            cache->inputTensor : in_data,
+            cache->weightTensor : w_data,
+            cache->biasTensor : b_data
+        };
+        NSDictionary *results = @{ cache->outTensor : out_data };
+
+        @try {
+            [cache->graph encodeToCommandBuffer:mpsCmd
+                                          feeds:feeds
+                               targetOperations:nil
+                              resultsDictionary:results
+                            executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            iris_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        out->has_pending_work = 1;
+        x->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [mpsCmd commit];
+            [mpsCmd waitUntilCompleted];
+            out->has_pending_work = 0;
+            x->has_pending_work = 0;
+        } else {
             g_tensor_cmd = [mpsCmd rootCommandBuffer];
         }
     }

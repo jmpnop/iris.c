@@ -64,11 +64,10 @@ kernel void rms_norm(
     }
 }
 
-/* QK RMSNorm - processes Q and K for all heads in a sequence position
- * q: [seq, heads*head_dim], k: [seq, heads*head_dim]
- * q_weight, k_weight: [head_dim]
+/* QK RMSNorm (legacy) - single thread per (seq, head), serial over head_dim.
+ * Kept as fallback. New code uses qk_rms_norm (threadgroup-parallel below).
  */
-kernel void qk_rms_norm(
+kernel void qk_rms_norm_legacy(
     device float *q [[buffer(0)]],
     device float *k [[buffer(1)]],
     device const float *q_weight [[buffer(2)]],
@@ -107,6 +106,82 @@ kernel void qk_rms_norm(
     }
 }
 
+/* QK RMSNorm - threadgroup-parallel version.
+ * One threadgroup per (seq_idx, head_idx). Multiple threads cooperate on the
+ * head_dim reduction via shared memory, then normalize in parallel.
+ * Dispatched with threadgroupsPerGrid=(seq, heads, 1),
+ * threadsPerThreadgroup=(min(128, head_dim), 1, 1).
+ */
+kernel void qk_rms_norm(
+    device float *q [[buffer(0)]],
+    device float *k [[buffer(1)]],
+    device const float *q_weight [[buffer(2)]],
+    device const float *k_weight [[buffer(3)]],
+    constant int &heads [[buffer(4)]],
+    constant int &head_dim [[buffer(5)]],
+    constant float &eps [[buffer(6)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    uint seq_idx = group_id.x;
+    uint head_idx = group_id.y;
+
+    uint hidden = heads * head_dim;
+    device float *q_head = q + seq_idx * hidden + head_idx * head_dim;
+    device float *k_head = k + seq_idx * hidden + head_idx * head_dim;
+
+    threadgroup float shared_sum[256];
+
+    // --- Q: parallel sum-of-squares ---
+    float local_sum = 0.0f;
+    for (int d = tid; d < head_dim; d += threads) {
+        float val = q_head[d];
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float q_rms = rsqrt(shared_sum[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int d = tid; d < head_dim; d += threads) {
+        q_head[d] = q_head[d] * q_rms * q_weight[d];
+    }
+
+    // --- K: parallel sum-of-squares ---
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    local_sum = 0.0f;
+    for (int d = tid; d < head_dim; d += threads) {
+        float val = k_head[d];
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float k_rms = rsqrt(shared_sum[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int d = tid; d < head_dim; d += threads) {
+        k_head[d] = k_head[d] * k_rms * k_weight[d];
+    }
+}
+
 /* ========================================================================
  * Fused QK RMSNorm + RoPE
  * In-place: norm Q and K heads, then apply RoPE rotation.
@@ -114,7 +189,8 @@ kernel void qk_rms_norm(
  * cos/sin: [seq, head_dim], shared across heads.
  * ======================================================================== */
 
-kernel void qknorm_rope(
+/* Legacy: single thread per (seq, head). Kept as fallback. */
+kernel void qknorm_rope_legacy(
     device float *q [[buffer(0)]],
     device float *k [[buffer(1)]],
     device const float *q_weight [[buffer(2)]],
@@ -166,6 +242,114 @@ kernel void qknorm_rope(
         float k0 = k[offset + d], k1 = k[offset + d + 1];
         k[offset + d]     = k0 * c - k1 * s;
         k[offset + d + 1] = k1 * c + k0 * s;
+    }
+}
+
+/* Fused QK RMSNorm + RoPE - threadgroup-parallel version.
+ * One threadgroup per (seq_idx, head_idx). Threads cooperate on the
+ * head_dim reduction, then normalize + apply RoPE in parallel.
+ * Dispatched with threadgroupsPerGrid=(seq, heads, 1),
+ * threadsPerThreadgroup=(min(128, head_dim), 1, 1).
+ * RoPE pairs (d, d+1) are handled by the thread owning element d when
+ * d is even. With threads=128 and head_dim=128, each thread owns exactly
+ * one element, so the even-indexed threads apply RoPE to their pair.
+ */
+kernel void qknorm_rope(
+    device float *q [[buffer(0)]],
+    device float *k [[buffer(1)]],
+    device const float *q_weight [[buffer(2)]],
+    device const float *k_weight [[buffer(3)]],
+    device const float *cos_freq [[buffer(4)]],
+    device const float *sin_freq [[buffer(5)]],
+    constant int &heads [[buffer(6)]],
+    constant int &head_dim [[buffer(7)]],
+    constant float &eps [[buffer(8)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    uint seq_idx = group_id.x;
+    uint head_idx = group_id.y;
+
+    uint hidden = heads * head_dim;
+    device float *q_head = q + seq_idx * hidden + head_idx * head_dim;
+    device float *k_head = k + seq_idx * hidden + head_idx * head_dim;
+
+    threadgroup float shared_sum[256];
+
+    // --- Q: parallel sum-of-squares ---
+    float local_sum = 0.0f;
+    for (int d = tid; d < head_dim; d += threads) {
+        float val = q_head[d];
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float q_rms = rsqrt(shared_sum[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Normalize Q
+    for (int d = tid; d < head_dim; d += threads) {
+        q_head[d] = q_head[d] * q_rms * q_weight[d];
+    }
+
+    // --- K: parallel sum-of-squares ---
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    local_sum = 0.0f;
+    for (int d = tid; d < head_dim; d += threads) {
+        float val = k_head[d];
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float k_rms = rsqrt(shared_sum[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Normalize K
+    for (int d = tid; d < head_dim; d += threads) {
+        k_head[d] = k_head[d] * k_rms * k_weight[d];
+    }
+
+    // --- RoPE: apply rotation to normalized Q and K ---
+    // Wait for all normalization writes to complete
+    threadgroup_barrier(mem_flags::mem_device);
+
+    device const float *cos_row = cos_freq + seq_idx * head_dim;
+    device const float *sin_row = sin_freq + seq_idx * head_dim;
+
+    // Each thread handles pairs (d, d+1) where d is even and owned by this thread.
+    // With stride loops, thread tid handles d = tid, tid+threads, tid+2*threads, ...
+    // We process a pair only when d is even.
+    for (int d = tid; d < head_dim; d += threads) {
+        if ((d & 1) == 0 && d + 1 < head_dim) {
+            float c = cos_row[d];
+            float s = sin_row[d];
+
+            float q0 = q_head[d], q1 = q_head[d + 1];
+            q_head[d]     = q0 * c - q1 * s;
+            q_head[d + 1] = q1 * c + q0 * s;
+
+            float k0 = k_head[d], k1 = k_head[d + 1];
+            k_head[d]     = k0 * c - k1 * s;
+            k_head[d + 1] = k1 * c + k0 * s;
+        }
     }
 }
 
@@ -674,6 +858,8 @@ kernel void apply_rope_unified(
  * Supports different Q and K/V sequence lengths (for joint attention).
  * ======================================================================== */
 
+constant int FUSED_V_TILE = 8;
+
 kernel void attention_fused(
     device const float *Q [[buffer(0)]],      // [seq_q, heads * head_dim]
     device const float *K [[buffer(1)]],      // [seq_k, heads * head_dim]
@@ -692,6 +878,13 @@ kernel void attention_fused(
     // Shared memory for reductions (shared_scores is dynamic via threadgroup(0))
     threadgroup float shared_max[256];
     threadgroup float shared_sum[256];
+    // Q cached in threadgroup memory — avoids re-reading from device per key position
+    threadgroup float shared_q[128];   // head_dim is always 128
+    // V tile buffer for coalesced cooperative loading in Phase 6
+    // FUSED_V_TILE rows * 128 cols = 1024 floats = 4 KB
+    // Total static threadgroup: 2048 (max+sum) + 512 (q) + 4096 (v) = 6656 bytes
+    // Reduces max seq_k from 7680 to 6528 (flash attention handles larger)
+    threadgroup float shared_v[FUSED_V_TILE * 128];
 
     int query_idx = tg_pos.x;
     int head_idx = tg_pos.y;
@@ -710,15 +903,21 @@ kernel void attention_fused(
     device const float *K_head = K + head_idx * head_dim;
     device const float *V_head = V + head_idx * head_dim;
 
+    // Cache Q row in threadgroup memory (read once, used for every key position)
+    for (int d = tid; d < head_dim; d += threads) {
+        shared_q[d] = q_row[d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // ========== Phase 1: Compute Q @ K^T ==========
     float local_max = -INFINITY;
 
     for (int key_idx = tid; key_idx < seq_k; key_idx += threads) {
-        // Dot product: Q[query_idx, head] · K[key_idx, head]
+        // Dot product: Q[query_idx, head] . K[key_idx, head]
         float dot = 0.0f;
         device const float *k_row = K_head + key_idx * hidden;
         for (int d = 0; d < head_dim; d++) {
-            dot += q_row[d] * k_row[d];
+            dot += shared_q[d] * k_row[d];
         }
         float score = dot * scale;
         shared_scores[key_idx] = score;
@@ -763,14 +962,43 @@ kernel void attention_fused(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ========== Phase 6: Compute output = scores @ V ==========
-    for (int d = tid; d < head_dim; d += threads) {
-        float acc = 0.0f;
-        for (int key_idx = 0; key_idx < seq_k; key_idx++) {
-            float v_val = V_head[key_idx * hidden + d];
-            acc += shared_scores[key_idx] * v_val;
+    // ========== Phase 6: Compute output = scores @ V (tiled) ==========
+    // Per-thread accumulator for each dimension this thread owns.
+    // With threads=256 and head_dim=128, each thread handles at most 1 dim.
+    // 8 slots supports head_dim up to 2048 with threads=256.
+    float acc[8] = {0};
+
+    for (int tile_start = 0; tile_start < seq_k; tile_start += FUSED_V_TILE) {
+        int tile_size = min(FUSED_V_TILE, seq_k - tile_start);
+
+        // Cooperative load: all threads load V[tile_start:tile_end, :] into
+        // shared_v[tile_size, 128]. Contiguous device reads across threads.
+        int total_elems = tile_size * head_dim;
+        for (int idx = (int)tid; idx < total_elems; idx += (int)threads) {
+            int k = idx / head_dim;
+            int d = idx % head_dim;
+            shared_v[k * 128 + d] = V_head[(tile_start + k) * hidden + d];
         }
-        out_row[d] = acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate: each thread processes its assigned dimensions
+        int dim_slot = 0;
+        for (int d = (int)tid; d < head_dim; d += (int)threads) {
+            if (dim_slot >= 8) break;
+            for (int k = 0; k < tile_size; k++) {
+                acc[dim_slot] += shared_scores[tile_start + k] * shared_v[k * 128 + d];
+            }
+            dim_slot++;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write output
+    int dim_slot = 0;
+    for (int d = (int)tid; d < head_dim; d += (int)threads) {
+        if (dim_slot >= 8) break;
+        out_row[d] = acc[dim_slot];
+        dim_slot++;
     }
 }
 
@@ -1333,8 +1561,8 @@ kernel void rms_norm_bf16(
     }
 }
 
-/* QK RMSNorm for bf16 - processes Q and K heads in bf16 */
-kernel void qk_rms_norm_bf16(
+/* QK RMSNorm for bf16 (legacy) - single thread per (seq, head). Kept as fallback. */
+kernel void qk_rms_norm_bf16_legacy(
     device ushort *q [[buffer(0)]],
     device ushort *k [[buffer(1)]],
     device const ushort *q_weight [[buffer(2)]],
@@ -1374,6 +1602,86 @@ kernel void qk_rms_norm_bf16(
         float val = bf16_to_f32(k[offset + d]);
         float w = bf16_to_f32(k_weight[d]);
         k[offset + d] = f32_to_bf16(val * rms_inv * w);
+    }
+}
+
+/* QK RMSNorm for bf16 - threadgroup-parallel version.
+ * One threadgroup per (seq_idx, head_idx). Threads cooperate on the
+ * head_dim reduction via shared memory.
+ * Dispatched with threadgroupsPerGrid=(seq, heads, 1),
+ * threadsPerThreadgroup=(min(128, head_dim), 1, 1).
+ */
+kernel void qk_rms_norm_bf16(
+    device ushort *q [[buffer(0)]],
+    device ushort *k [[buffer(1)]],
+    device const ushort *q_weight [[buffer(2)]],
+    device const ushort *k_weight [[buffer(3)]],
+    constant int &heads [[buffer(4)]],
+    constant int &head_dim [[buffer(5)]],
+    constant float &eps [[buffer(6)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    uint seq_idx = group_id.x;
+    uint head_idx = group_id.y;
+
+    uint hidden = heads * head_dim;
+    device ushort *q_head = q + seq_idx * hidden + head_idx * head_dim;
+    device ushort *k_head = k + seq_idx * hidden + head_idx * head_dim;
+
+    threadgroup float shared_sum[256];
+
+    // --- Q: parallel sum-of-squares ---
+    float local_sum = 0.0f;
+    for (int d = tid; d < head_dim; d += threads) {
+        float val = bf16_to_f32(q_head[d]);
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float q_rms = rsqrt(shared_sum[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int d = tid; d < head_dim; d += threads) {
+        float val = bf16_to_f32(q_head[d]);
+        float w = bf16_to_f32(q_weight[d]);
+        q_head[d] = f32_to_bf16(val * q_rms * w);
+    }
+
+    // --- K: parallel sum-of-squares ---
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    local_sum = 0.0f;
+    for (int d = tid; d < head_dim; d += threads) {
+        float val = bf16_to_f32(k_head[d]);
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float k_rms = rsqrt(shared_sum[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int d = tid; d < head_dim; d += threads) {
+        float val = bf16_to_f32(k_head[d]);
+        float w = bf16_to_f32(k_weight[d]);
+        k_head[d] = f32_to_bf16(val * k_rms * w);
     }
 }
 

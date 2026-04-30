@@ -442,6 +442,23 @@ int iris_gpu_attention_fused_bf16(iris_gpu_tensor_t out,
                                    iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
                                    int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
+/*
+ * Custom BF16 attention with f32 tensor interface (no MPSGraph SDPA).
+ * Takes f32 GPU tensors, converts to bf16, runs ONLY the custom
+ * attention_fused_bf16 Metal kernel (f32 accumulation, bf16 I/O),
+ * then converts output back to f32.
+ *
+ * Use this for diffusion models where MPSGraph SDPA causes grid artifacts
+ * at non-square resolutions. The custom kernel is artifact-free because
+ * all arithmetic is in f32; only I/O bandwidth benefits from bf16.
+ *
+ * Returns 1 on success, 0 on failure (seq_k too large for threadgroup
+ * memory, or shaders unavailable -- caller should fall back to f32).
+ */
+int iris_gpu_attention_custom_bf16(iris_gpu_tensor_t out,
+                                    iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
+                                    int seq_q, int seq_k, int num_heads, int head_dim, float scale);
+
 /* ========================================================================
  * BF16 GPU Tensor Operations
  * All operations work on bf16 tensors (is_f16 = 1) with f32 internal computation.
@@ -571,6 +588,18 @@ iris_gpu_tensor_t iris_gpu_conv2d_f32(iris_gpu_tensor_t x,
                                        int batch, int in_ch, int out_ch,
                                        int H, int W, int kH, int kW,
                                        int stride, int padding);
+
+/* Conv2d on f32 GPU tensors using MPSGraph with BF16 internal computation.
+ * Same interface as iris_gpu_conv2d_f32 — drop-in replacement.
+ * Input/output are F32; the graph casts to BF16 for the convolution
+ * (halves memory bandwidth), then casts back to F32.
+ * Returns new GPU tensor [batch, out_ch, outH, outW] or NULL on failure.
+ */
+iris_gpu_tensor_t iris_gpu_conv2d_bf16(iris_gpu_tensor_t x,
+                                        const float *weight, const float *bias,
+                                        int batch, int in_ch, int out_ch,
+                                        int H, int W, int kH, int kW,
+                                        int stride, int padding);
 
 /* 2D transpose with scale on f32 GPU tensors: out[c*rows+r] = in[r*cols+c] * scale
  * Transposes [rows, cols] -> [cols, rows]. Use scale=1.0f for plain transpose. */

@@ -338,17 +338,28 @@ static int zi_gpu_linear_into_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
     return 0;
 }
 
-/* Self-attention dispatcher for GPU. F32 only — BF16 SDPA causes grid
- * artifacts at non-square resolutions. Tries Flash Attention first (tiled,
- * no seq limit), falls back to fused attention (stores full score vector). */
+/* Self-attention dispatcher for GPU. Tries custom BF16 attention first
+ * (bf16 I/O with f32 accumulation — fast and artifact-free), then falls
+ * back to pure F32 (flash → fused).
+ *
+ * Note: MPSGraph SDPA (used by iris_gpu_attention_bf16 and the default
+ * path in iris_gpu_attention_fused_bf16) causes grid artifacts at
+ * non-square resolutions. iris_gpu_attention_custom_bf16 bypasses SDPA
+ * and uses only the custom Metal kernel which is safe. */
 static int zi_gpu_attention(iris_gpu_tensor_t out_f32,
                              iris_gpu_tensor_t q_f32, iris_gpu_tensor_t k_f32, iris_gpu_tensor_t v_f32,
                              int seq, int n_heads, int head_dim, float attn_scale,
                              zi_gpu_scratch_t *scratch) {
     (void)scratch;
+    /* Try custom BF16 kernel (f32 accum, no MPSGraph SDPA — no grid artifacts) */
+    if (iris_gpu_attention_custom_bf16(out_f32, q_f32, k_f32, v_f32,
+                                       seq, seq, n_heads, head_dim, attn_scale))
+        return 1;
+    /* Fall back to F32 flash attention */
     if (iris_gpu_attention_flash(out_f32, q_f32, k_f32, v_f32,
                                  seq, seq, n_heads, head_dim, attn_scale))
         return 1;
+    /* Fall back to F32 fused attention */
     return iris_gpu_attention_fused(out_f32, q_f32, k_f32, v_f32,
                                     seq, seq, n_heads, head_dim, attn_scale);
 }
