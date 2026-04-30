@@ -17,19 +17,9 @@
 #include <string.h>
 #include <math.h>
 
-/* Use BLAS for matrix operations when enabled via Makefile */
-#ifdef USE_BLAS
-#ifdef __APPLE__
+/* Apple Silicon (M3 Ultra) — Accelerate BLAS + Metal GPU always available */
 #include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
-#endif
-
-/* Use Metal for GPU acceleration */
-#ifdef USE_METAL
 #include "iris_metal.h"
-#endif
 
 /* Minimum matrix size for GPU acceleration.
  * Using 10M threshold keeps text encoder on CPU (Accelerate BLAS), which is
@@ -140,12 +130,10 @@ struct qwen3_model {
 /* Forward declarations for mmap streaming mode */
 static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
                               int num_files, int layer_idx);
-#ifdef USE_METAL
 static int load_layer_weights_small_f32(qwen3_layer_t *layer, safetensors_file_t **files,
                                         int num_files, int layer_idx);
 static int load_layer_weights_bf16(qwen3_layer_t *layer, safetensors_file_t **files,
                                    int num_files, int layer_idx);
-#endif
 static void free_layer_weights(qwen3_layer_t *layer);
 
 /* ========================================================================
@@ -154,9 +142,9 @@ static void free_layer_weights(qwen3_layer_t *layer);
 
 static void qwen3_linear(float *y, const float *x, const float *W,
                          int seq_len, int in_dim, int out_dim) {
-    /* y[seq, out] = x[seq, in] @ W[out, in]^T */
-#ifdef USE_METAL
-    /* Use GPU for large matrices */
+    /* y[seq, out] = x[seq, in] @ W[out, in]^T
+     * Two-tier dispatch: Metal GPU for large matrices, Accelerate BLAS for small.
+     * Small matrices are faster on CPU BLAS than GPU due to launch overhead. */
     size_t matrix_elements = (size_t)seq_len * out_dim;
     if (iris_metal_available() && matrix_elements >= QWEN3_MIN_GPU_ELEMENTS) {
         iris_metal_sgemm_cached(0, 1,  /* no transpose A, transpose B */
@@ -168,24 +156,11 @@ static void qwen3_linear(float *y, const float *x, const float *W,
                                 y, out_dim);
         return;
     }
-#endif
 
-#ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 seq_len, out_dim, in_dim,
                 1.0f, x, in_dim, W, in_dim,
                 0.0f, y, out_dim);
-#else
-    for (int s = 0; s < seq_len; s++) {
-        for (int o = 0; o < out_dim; o++) {
-            float sum = 0.0f;
-            for (int i = 0; i < in_dim; i++) {
-                sum += x[s * in_dim + i] * W[o * in_dim + i];
-            }
-            y[s * out_dim + o] = sum;
-        }
-    }
-#endif
 }
 
 static void qwen3_rms_norm(float *out, const float *x, const float *weight,
@@ -363,10 +338,9 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
     apply_rope(model->q_buf, model->k_buf, model->rope_cos, model->rope_sin,
                seq_len, num_heads, num_kv_heads, head_dim);
 
-#ifdef USE_METAL
     /* Try GPU-accelerated causal attention for all heads in parallel.
      * The GPU kernel uses both causal masking and attention mask.
-     * This ensures exact parity with CPU implementation. */
+     * This ensures exact parity with the BLAS path. */
     if (iris_metal_available()) {
         if (iris_metal_causal_attention(model->attn_out,
                                          model->q_buf, model->k_buf, model->v_buf,
@@ -377,10 +351,9 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
             goto output_proj;
         }
     }
-#endif
 
-    /* CPU fallback: compute attention for each head with GQA
-     * Use BLAS for Q@K^T and scores@V matrix multiplications */
+    /* BLAS fallback: compute attention for each head with GQA
+     * Use Accelerate BLAS for Q@K^T and scores@V matrix multiplications */
     {
         int heads_per_kv = num_heads / num_kv_heads;
 
@@ -397,23 +370,10 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
             const float *k_strided = model->k_buf + kv_h * head_dim;
 
             /* scores = scale * Q @ K^T using strided BLAS */
-#ifdef USE_BLAS
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         seq_len, seq_len, head_dim,
                         scale, q_strided, q_dim, k_strided, kv_dim,
                         0.0f, scores, seq_len);
-#else
-            /* Fallback: naive matmul */
-            for (int i = 0; i < seq_len; i++) {
-                for (int j = 0; j < seq_len; j++) {
-                    float dot = 0.0f;
-                    for (int d = 0; d < head_dim; d++) {
-                        dot += q_strided[i * q_dim + d] * k_strided[j * kv_dim + d];
-                    }
-                    scores[i * seq_len + j] = dot * scale;
-                }
-            }
-#endif
 
             /* Apply causal mask and attention mask, then softmax */
             for (int i = 0; i < seq_len; i++) {
@@ -438,30 +398,16 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
 
             /* out = scores @ V using strided BLAS (avoids V copy and output copy)
              * scores: [seq_len, seq_len], V: [seq_len, head_dim] with ldb=kv_dim */
-#ifdef USE_BLAS
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         seq_len, head_dim, seq_len,
                         1.0f, scores, seq_len, v_strided, kv_dim,
                         0.0f, out_strided, q_dim);
-#else
-            for (int i = 0; i < seq_len; i++) {
-                for (int d = 0; d < head_dim; d++) {
-                    float sum = 0.0f;
-                    for (int j = 0; j < seq_len; j++) {
-                        sum += scores[i * seq_len + j] * v_strided[j * kv_dim + d];
-                    }
-                    out_strided[i * q_dim + d] = sum;
-                }
-            }
-#endif
         }
     }
 
     /* Work buffers are pre-allocated in model, no free needed */
 
-#ifdef USE_METAL
 output_proj:
-#endif
     /* Output projection */
     qwen3_linear(model->hidden_state, model->attn_out, layer->attn.o_proj_weight,
                  seq_len, q_dim, hidden);
@@ -535,7 +481,6 @@ static void qwen3_layer_forward(qwen3_model_t *model, qwen3_layer_t *layer,
     }
 }
 
-#ifdef USE_METAL
 /* ========================================================================
  * BF16 GPU-Accelerated Layer Forward
  * Uses GPU for linear layers, keeps attention/norm on CPU for simplicity.
@@ -1064,8 +1009,6 @@ static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *atten
     return read_ok;
 }
 
-#endif /* USE_METAL */
-
 /* ========================================================================
  * Forward Pass
  * ======================================================================== */
@@ -1103,7 +1046,6 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     }
 
     /* Run through transformer layers */
-#ifdef USE_METAL
     /* Try fully GPU-resident path: 1 sync instead of 72, skips unneeded layers */
     if (model->use_bf16 && iris_metal_available() && seq_len <= 512) {
         if (qwen3_forward_gpu(model, seq_len, attention_mask))
@@ -1117,25 +1059,19 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     if (batch_mode) {
         iris_gpu_batch_begin();
     }
-#endif
 
     for (int layer_idx = 0; layer_idx <= last_layer; layer_idx++) {
         /* In mmap mode, load layer weights on-demand */
         if (model->use_mmap) {
-#ifdef USE_METAL
             if (model->use_bf16) {
                 /* Load only small f32 weights (layer norms) + bf16 projection weights */
                 if (load_layer_weights_small_f32(&model->layers[layer_idx], model->sf_files, model->num_sf_files, layer_idx) != 0) {
                     fprintf(stderr, "Failed to load layer %d small weights\n", layer_idx);
-#ifdef USE_METAL
                     if (batch_mode) iris_gpu_batch_end();
-#endif
                     return NULL;
                 }
                 load_layer_weights_bf16(&model->layers[layer_idx], model->sf_files, model->num_sf_files, layer_idx);
-            } else
-#endif
-            {
+            } else {
                 if (load_layer_weights(&model->layers[layer_idx], model->sf_files, model->num_sf_files, layer_idx) != 0) {
                     fprintf(stderr, "Failed to load layer %d weights\n", layer_idx);
                     return NULL;
@@ -1143,12 +1079,9 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
             }
         }
 
-#ifdef USE_METAL
         if (model->use_bf16 && iris_metal_available()) {
             qwen3_layer_forward_bf16(model, &model->layers[layer_idx], seq_len, attention_mask);
-        } else
-#endif
-        {
+        } else {
             qwen3_layer_forward(model, &model->layers[layer_idx], seq_len, attention_mask);
         }
 
@@ -1175,17 +1108,13 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
             iris_text_progress_callback(layer_idx, model->num_layers);
     }
 
-#ifdef USE_METAL
     /* End batch mode */
     if (batch_mode) {
         iris_gpu_batch_end();
     }
-#endif
 
     /* Build output embeddings */
-#ifdef USE_METAL
 concatenate: (void)0; /* label needs a statement; can't precede a declaration in C */
-#endif
     int text_dim = model->text_dim;
     output = malloc(seq_len * text_dim * sizeof(float));
     if (!output) return NULL;
@@ -1227,7 +1156,6 @@ static float *load_tensor(safetensors_file_t **files, int num_files, const char 
     return NULL;
 }
 
-#ifdef USE_METAL
 /* Helper to load bf16 tensor directly (zero-copy from mmap region) */
 static uint16_t *load_tensor_bf16(safetensors_file_t **files, int num_files, const char *name) {
     for (int f = 0; f < num_files; f++) {
@@ -1262,7 +1190,6 @@ static int load_layer_weights_small_f32(qwen3_layer_t *layer, safetensors_file_t
     return (layer->input_layernorm_weight && layer->post_attention_layernorm_weight &&
             layer->attn.q_norm_weight && layer->attn.k_norm_weight) ? 0 : -1;
 }
-#endif
 
 static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
                               int num_files, int layer_idx) {
@@ -1319,7 +1246,6 @@ static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
     return 0;
 }
 
-#ifdef USE_METAL
 /* Load bf16 weights for a layer (GPU acceleration path).
  * Returns 1 if all bf16 weights loaded successfully, 0 otherwise.
  * bf16 pointers are direct into mmap region - do NOT free them. */
@@ -1363,7 +1289,6 @@ static int load_layer_weights_bf16(qwen3_layer_t *layer, safetensors_file_t **fi
             layer->mlp.gate_proj_weight_bf16 && layer->mlp.up_proj_weight_bf16 &&
             layer->mlp.down_proj_weight_bf16);
 }
-#endif
 
 /* Free a single layer's weights (used in mmap streaming mode) */
 static void free_layer_weights(qwen3_layer_t *layer) {
@@ -1717,7 +1642,6 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
         qwen3_set_defaults(model);
     }
 
-#ifdef USE_METAL
     /* Enable bf16 GPU acceleration when Metal is available.
      * Set IRIS_QWEN3_NO_BF16=1 to disable for debugging. */
     model->use_bf16 = (iris_metal_available() && !getenv("IRIS_QWEN3_NO_BF16")) ? 1 : 0;
@@ -1725,7 +1649,6 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
         if (iris_verbose)
             fprintf(stderr, "Qwen3: bf16 GPU acceleration enabled\n");
     }
-#endif
     model->layers = calloc(model->num_layers, sizeof(qwen3_layer_t));
     if (!model->layers) {
         free(model);

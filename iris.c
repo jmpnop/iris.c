@@ -2128,21 +2128,6 @@ iris_image *iris_decode_latent(iris_ctx *ctx, const float *latent,
     return img;
 }
 
-float *iris_denoise_step(iris_ctx *ctx, const float *z, float t,
-                         const float *text_emb, int text_len,
-                         int latent_h, int latent_w) {
-    if (!ctx || !z || !text_emb) return NULL;
-
-    /* Load transformer if not already loaded */
-    if (!iris_load_transformer_if_needed(ctx)) {
-        return NULL;
-    }
-
-    return iris_transformer_forward_flux(ctx->transformer,
-                                    z, latent_h, latent_w,
-                                    text_emb, text_len, t);
-}
-
 /* Debug function: img2img with external inputs from Python */
 iris_image *iris_img2img_debug_py(iris_ctx *ctx, const iris_params *params) {
     if (!ctx) {

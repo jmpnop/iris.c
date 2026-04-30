@@ -69,48 +69,6 @@ kernel void rms_norm(
     }
 }
 
-/* QK RMSNorm (legacy) - single thread per (seq, head), serial over head_dim.
- * Kept as fallback. New code uses qk_rms_norm (threadgroup-parallel below).
- */
-kernel void qk_rms_norm_legacy(
-    device float *q [[buffer(0)]],
-    device float *k [[buffer(1)]],
-    device const float *q_weight [[buffer(2)]],
-    device const float *k_weight [[buffer(3)]],
-    constant int &heads [[buffer(4)]],
-    constant int &head_dim [[buffer(5)]],
-    constant float &eps [[buffer(6)]],
-    uint2 pos [[thread_position_in_grid]]  // (seq_idx, head_idx)
-) {
-    uint seq_idx = pos.x;
-    uint head_idx = pos.y;
-
-    uint hidden = heads * head_dim;
-    uint offset = seq_idx * hidden + head_idx * head_dim;
-
-    // RMSNorm for Q
-    float sum_sq = 0.0f;
-    for (int d = 0; d < head_dim; d++) {
-        float val = q[offset + d];
-        sum_sq += val * val;
-    }
-    float rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
-    for (int d = 0; d < head_dim; d++) {
-        q[offset + d] = q[offset + d] * rms_inv * q_weight[d];
-    }
-
-    // RMSNorm for K
-    sum_sq = 0.0f;
-    for (int d = 0; d < head_dim; d++) {
-        float val = k[offset + d];
-        sum_sq += val * val;
-    }
-    rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
-    for (int d = 0; d < head_dim; d++) {
-        k[offset + d] = k[offset + d] * rms_inv * k_weight[d];
-    }
-}
-
 /* QK RMSNorm - threadgroup-parallel version.
  * One threadgroup per (seq_idx, head_idx). Multiple threads cooperate on the
  * head_dim reduction via shared memory, then normalize in parallel.
@@ -202,62 +160,6 @@ kernel void qk_rms_norm(
  * Eliminates 2 intermediate read+write passes.
  * cos/sin: [seq, head_dim], shared across heads.
  * ======================================================================== */
-
-/* Legacy: single thread per (seq, head). Kept as fallback. */
-kernel void qknorm_rope_legacy(
-    device float *q [[buffer(0)]],
-    device float *k [[buffer(1)]],
-    device const float *q_weight [[buffer(2)]],
-    device const float *k_weight [[buffer(3)]],
-    device const float *cos_freq [[buffer(4)]],
-    device const float *sin_freq [[buffer(5)]],
-    constant int &heads [[buffer(6)]],
-    constant int &head_dim [[buffer(7)]],
-    constant float &eps [[buffer(8)]],
-    uint2 pos [[thread_position_in_grid]]
-) {
-    uint seq_idx = pos.x;
-    uint head_idx = pos.y;
-
-    uint hidden = heads * head_dim;
-    uint offset = seq_idx * hidden + head_idx * head_dim;
-
-    float sum_sq = 0.0f;
-    for (int d = 0; d < head_dim; d++) {
-        float val = q[offset + d];
-        sum_sq += val * val;
-    }
-    float rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
-    for (int d = 0; d < head_dim; d++) {
-        q[offset + d] = q[offset + d] * rms_inv * q_weight[d];
-    }
-
-    sum_sq = 0.0f;
-    for (int d = 0; d < head_dim; d++) {
-        float val = k[offset + d];
-        sum_sq += val * val;
-    }
-    rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
-    for (int d = 0; d < head_dim; d++) {
-        k[offset + d] = k[offset + d] * rms_inv * k_weight[d];
-    }
-
-    device const float *cos_row = cos_freq + seq_idx * head_dim;
-    device const float *sin_row = sin_freq + seq_idx * head_dim;
-
-    for (int d = 0; d < head_dim; d += 2) {
-        float c = cos_row[d];
-        float s = sin_row[d];
-
-        float q0 = q[offset + d], q1 = q[offset + d + 1];
-        q[offset + d]     = q0 * c - q1 * s;
-        q[offset + d + 1] = q1 * c + q0 * s;
-
-        float k0 = k[offset + d], k1 = k[offset + d + 1];
-        k[offset + d]     = k0 * c - k1 * s;
-        k[offset + d + 1] = k1 * c + k0 * s;
-    }
-}
 
 /* Fused QK RMSNorm + RoPE - threadgroup-parallel version.
  * One threadgroup per (seq_idx, head_idx). Threads cooperate on the
@@ -1626,50 +1528,6 @@ kernel void rms_norm_bf16(
         float val = bf16_to_f32(x_row[i]);
         float w = bf16_to_f32(weight[i]);
         out_row[i] = f32_to_bf16(val * rms_inv * w);
-    }
-}
-
-/* QK RMSNorm for bf16 (legacy) - single thread per (seq, head). Kept as fallback. */
-kernel void qk_rms_norm_bf16_legacy(
-    device ushort *q [[buffer(0)]],
-    device ushort *k [[buffer(1)]],
-    device const ushort *q_weight [[buffer(2)]],
-    device const ushort *k_weight [[buffer(3)]],
-    constant int &heads [[buffer(4)]],
-    constant int &head_dim [[buffer(5)]],
-    constant float &eps [[buffer(6)]],
-    uint2 pos [[thread_position_in_grid]]
-) {
-    uint seq_idx = pos.x;
-    uint head_idx = pos.y;
-
-    uint hidden = heads * head_dim;
-    uint offset = seq_idx * hidden + head_idx * head_dim;
-
-    // RMSNorm for Q
-    float sum_sq = 0.0f;
-    for (int d = 0; d < head_dim; d++) {
-        float val = bf16_to_f32(q[offset + d]);
-        sum_sq += val * val;
-    }
-    float rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
-    for (int d = 0; d < head_dim; d++) {
-        float val = bf16_to_f32(q[offset + d]);
-        float w = bf16_to_f32(q_weight[d]);
-        q[offset + d] = f32_to_bf16(val * rms_inv * w);
-    }
-
-    // RMSNorm for K
-    sum_sq = 0.0f;
-    for (int d = 0; d < head_dim; d++) {
-        float val = bf16_to_f32(k[offset + d]);
-        sum_sq += val * val;
-    }
-    rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
-    for (int d = 0; d < head_dim; d++) {
-        float val = bf16_to_f32(k[offset + d]);
-        float w = bf16_to_f32(k_weight[d]);
-        k[offset + d] = f32_to_bf16(val * rms_inv * w);
     }
 }
 

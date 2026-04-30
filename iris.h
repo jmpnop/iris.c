@@ -304,16 +304,6 @@ iris_image *iris_decode_latent(iris_ctx *ctx, const float *latent,
  */
 float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len);
 
-/*
- * Run single denoising step.
- * z: current latent [1, 128, H, W]
- * t: timestep (0.0 to 1.0)
- * text_emb: text embeddings
- * Returns velocity prediction.
- */
-float *iris_denoise_step(iris_ctx *ctx, const float *z, float t,
-                         const float *text_emb, int text_len,
-                         int latent_h, int latent_w);
 
 #ifdef __cplusplus
 }

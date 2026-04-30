@@ -14,9 +14,7 @@
 #include "iris.h"
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
-#ifdef USE_METAL
 #include "iris_metal.h"
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -131,25 +129,13 @@ void iris_vae_free(iris_vae_t *vae);
  * Helper Functions
  * ======================================================================== */
 
+/* CPU-resident conv2d using Accelerate/BLAS.  Only called from the CPU
+ * attention fallback path (data is already on CPU at that point, so
+ * GPU dispatch overhead would exceed benefit). */
 static void vae_conv2d(float *out, const float *in,
                        const float *weight, const float *bias,
                        int batch, int in_ch, int out_ch, int H, int W,
                        int kH, int kW, int stride, int padding) {
-#ifdef USE_METAL
-    if (!iris_metal_available()) {
-        static int metal_init_done = 0;
-        if (!metal_init_done) {
-            iris_metal_init();
-            metal_init_done = 1;
-        }
-    }
-    if (iris_metal_available() &&
-        iris_metal_conv2d(out, in, weight, bias,
-                          batch, in_ch, out_ch, H, W,
-                          kH, kW, stride, padding)) {
-        return;
-    }
-#endif
     iris_conv2d(out, in, weight, bias, batch, in_ch, out_ch,
                 H, W, kH, kW, stride, padding);
 }
@@ -179,57 +165,6 @@ static void vae_pad_right_bottom(float *out, const float *in,
             }
         }
     }
-}
-
-/* Swish activation in-place */
-static void swish_inplace(float *x, int n) {
-    iris_silu(x, n);
-}
-
-/* ResNet residual block: norm -> swish -> conv -> norm -> swish -> conv,
- * with a skip connection that uses 1x1 conv when channels change.
- * This is the core building block of both the VAE encoder and decoder,
- * stacked at each resolution level to learn hierarchical features. */
-static void resblock_forward(float *out, const float *x,
-                             const vae_resblock_t *block,
-                             float *work, int batch, int H, int W,
-                             int num_groups, float eps) {
-    int in_ch = block->in_channels;
-    int out_ch = block->out_channels;
-    int spatial = H * W;
-
-    /* Shortcut/skip connection */
-    if (in_ch != out_ch) {
-        /* 1x1 conv for channel adjustment */
-        vae_conv2d(out, x, block->skip_weight, block->skip_bias,
-                    batch, in_ch, out_ch, H, W, 1, 1, 1, 0);
-    } else {
-        iris_copy(out, x, batch * in_ch * spatial);
-    }
-
-    /* Main path: norm1 -> swish -> conv1 -> norm2 -> swish -> conv2 */
-
-    /* GroupNorm + Swish */
-    iris_group_norm(work, x, block->norm1_weight, block->norm1_bias,
-                    batch, in_ch, H, W, num_groups, eps);
-    swish_inplace(work, batch * in_ch * spatial);
-
-    /* Conv1: in_ch -> out_ch */
-    float *conv1_out = work + batch * in_ch * spatial;
-    vae_conv2d(conv1_out, work, block->conv1_weight, block->conv1_bias,
-                batch, in_ch, out_ch, H, W, 3, 3, 1, 1);
-
-    /* GroupNorm + Swish */
-    iris_group_norm(work, conv1_out, block->norm2_weight, block->norm2_bias,
-                    batch, out_ch, H, W, num_groups, eps);
-    swish_inplace(work, batch * out_ch * spatial);
-
-    /* Conv2: out_ch -> out_ch */
-    vae_conv2d(conv1_out, work, block->conv2_weight, block->conv2_bias,
-                batch, out_ch, out_ch, H, W, 3, 3, 1, 1);
-
-    /* Add residual */
-    iris_add_inplace(out, conv1_out, batch * out_ch * spatial);
 }
 
 /* Single-head self-attention over spatial dimensions. Reshapes [C,H,W]
@@ -339,8 +274,7 @@ static int attnblock_forward(float *out, const float *x,
     return 0;
 }
 
-#ifdef USE_METAL
-/* Forward declarations — defined later in the second USE_METAL block. */
+/* Forward declarations — defined in the GPU-resident decode/encode section. */
 static iris_gpu_tensor_t vae_gpu_conv2d(iris_gpu_tensor_t x,
                                          const float *weight, const float *bias,
                                          int batch, int in_ch, int out_ch,
@@ -355,8 +289,9 @@ static float *vae_encode_gpu(iris_vae_t *vae, const float *img,
                               int *out_h, int *out_w);
 
 /* GPU-accelerated VAE bottleneck attention. Keeps all data on GPU —
- * no CPU↔GPU sync stalls. Returns new GPU tensor or NULL on failure
- * (caller falls back to CPU path). Only supports batch=1. */
+ * no CPU↔GPU sync stalls. Returns new GPU tensor or NULL if the GPU
+ * attention kernel fails (caller runs CPU attention for this step).
+ * Only supports batch=1. */
 static iris_gpu_tensor_t attnblock_forward_gpu(iris_gpu_tensor_t x,
                                                 const vae_attnblock_t *block,
                                                 int batch, int H, int W,
@@ -431,7 +366,6 @@ fail_conv:
     iris_gpu_tensor_free(v_conv);
     return NULL;
 }
-#endif
 
 /* ========================================================================
  * Encoder Forward Pass
@@ -446,153 +380,13 @@ fail_conv:
 float *iris_vae_encode(iris_vae_t *vae, const float *img,
                        int batch, int H, int W,
                        int *out_h, int *out_w) {
-#ifdef USE_METAL
-    /* Try GPU-resident path first (eliminates CPU<->GPU round-trips per conv) */
-    if (iris_metal_available()) {
-        float *gpu_result = vae_encode_gpu(vae, img, batch, H, W, out_h, out_w);
-        if (gpu_result) return gpu_result;
-        /* Fall through to CPU path on failure */
-    }
-#endif
-
-    /*
-     * Encoder path:
-     * [B, 3, H, W] -> conv_in -> down_blocks -> mid_block -> norm -> conv_out
-     * -> [B, 64, H/8, W/8] (32 mean + 32 logvar, use mean only)
-     * -> patchify 2x2 -> [B, 128, H/16, W/16]
-     * -> batch_norm
-     */
-
-    int ch_mult[4] = {1, 2, 4, 4};
-    float *x = vae->work1;
-    float *work = vae->work2;
-
-    int cur_h = H, cur_w = W;
-
-    /* Conv in: 3 -> 128 */
-    vae_conv2d(x, img, vae->enc_conv_in_weight, vae->enc_conv_in_bias,
-                batch, 3, vae->base_channels, H, W, 3, 3, 1, 1);
-
-    int block_idx = 0;
-    int down_idx = 0;
-    int progress = 0;
-    int total_blocks = 4 * vae->num_res_blocks + 3;  /* down resblocks + mid */
-
-    /* Down blocks */
-    for (int level = 0; level < 4; level++) {
-        int ch_out = vae->base_channels * ch_mult[level];
-
-        for (int r = 0; r < vae->num_res_blocks; r++) {
-            vae_resblock_t *block = &vae->enc_down_blocks[block_idx++];
-            resblock_forward(work, x, block, vae->work3,
-                             batch, cur_h, cur_w, vae->num_groups, vae->eps);
-            { float *tmp = x; x = work; work = tmp; }
-            if (iris_vae_progress_callback)
-                iris_vae_progress_callback(progress++, total_blocks);
-        }
-
-        /* Downsample (except last level) */
-        if (level < 3) {
-            vae_downsample_t *ds = &vae->enc_downsample[down_idx++];
-            /* Asymmetric padding: pad right and bottom by 1.
-             * Implemented explicitly to match training/reference impl. */
-            float *padded = vae->work3;
-            int padded_h = cur_h + 1;
-            int padded_w = cur_w + 1;
-            int new_h = (padded_h - 3) / 2 + 1;
-            int new_w = (padded_w - 3) / 2 + 1;
-            vae_pad_right_bottom(padded, x, batch, ch_out, cur_h, cur_w);
-            vae_conv2d(work, padded, ds->conv_weight, ds->conv_bias,
-                       batch, ch_out, ch_out, padded_h, padded_w, 3, 3, 2, 0);
-            cur_h = new_h;
-            cur_w = new_w;
-            { float *tmp = x; x = work; work = tmp; }
-        }
-    }
-
-    int mid_ch = vae->base_channels * ch_mult[3];  /* 512 */
-
-    /* Mid block: resblock -> attn -> resblock */
-    resblock_forward(work, x, &vae->enc_mid_block1, vae->work3,
-                     batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    if (iris_vae_progress_callback)
-        iris_vae_progress_callback(progress++, total_blocks);
-    if (attnblock_forward(x, work, &vae->enc_mid_attn, vae->work3,
-                          batch, cur_h, cur_w, vae->num_groups, vae->eps,
-                          vae) < 0) {
-        return NULL;  /* OOM in attention */
-    }
-    if (iris_vae_progress_callback)
-        iris_vae_progress_callback(progress++, total_blocks);
-    resblock_forward(work, x, &vae->enc_mid_block2, vae->work3,
-                     batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    { float *tmp = x; x = work; work = tmp; }
-    if (iris_vae_progress_callback)
-        iris_vae_progress_callback(progress++, total_blocks);
-
-    /* Output: norm -> swish -> conv */
-    iris_group_norm(work, x, vae->enc_norm_out_weight, vae->enc_norm_out_bias,
-                    batch, mid_ch, cur_h, cur_w, vae->num_groups, vae->eps);
-    swish_inplace(work, batch * mid_ch * cur_h * cur_w);
-
-    /* Conv out: 512 -> 64 (32 mean + 32 logvar) */
-    int z_ch = vae->z_channels * 2;  /* 64 */
-    vae_conv2d(x, work, vae->enc_conv_out_weight, vae->enc_conv_out_bias,
-                batch, mid_ch, z_ch, cur_h, cur_w, 3, 3, 1, 1);
-
-    /* Quant conv: z_ch*2 -> z_ch*2 (1x1 conv) - Flux only */
-    if (vae->quant_conv_weight) {
-        vae_conv2d(work, x, vae->quant_conv_weight, vae->quant_conv_bias,
-                   batch, z_ch, z_ch, cur_h, cur_w, 1, 1, 1, 0);
-        { float *tmp = x; x = work; work = tmp; }
-    }
-
-    /* Take mean only (first 32 channels) */
-    /* x is [B, 64, H/8, W/8], we want [B, 32, H/8, W/8] */
-    int latent_h = cur_h;
-    int latent_w = cur_w;
-    int z_spatial = latent_h * latent_w;
-
-    float *mean = (float *)malloc(batch * vae->z_channels * z_spatial * sizeof(float));
-    if (!mean) return NULL;
-    for (int b = 0; b < batch; b++) {
-        memcpy(mean + b * vae->z_channels * z_spatial,
-               x + b * z_ch * z_spatial,
-               vae->z_channels * z_spatial * sizeof(float));
-    }
-
-    /* Patchify: [B, z_ch, H/8, W/8] -> [B, latent_ch, H/16, W/16] */
-    int patch_h = latent_h / 2;
-    int patch_w = latent_w / 2;
-    int lat_ch = vae->latent_channels;
-    float *latent = (float *)malloc(batch * lat_ch * patch_h * patch_w * sizeof(float));
-    if (!latent) { free(mean); return NULL; }
-    iris_patchify(latent, mean, batch, vae->z_channels, latent_h, latent_w, 2);
-    free(mean);
-
-    /* Normalize latent space */
-    if (vae->scaling_factor != 0.0f) {
-        /* Z-Image: latent = (latent - shift) * scaling */
-        int n = batch * lat_ch * patch_h * patch_w;
-        for (int i = 0; i < n; i++)
-            latent[i] = (latent[i] - vae->shift_factor) * vae->scaling_factor;
-    } else {
-        /* Flux: batch normalize */
-        iris_batch_norm(work, latent, vae->bn_mean, vae->bn_var, NULL, NULL,
-                        batch, lat_ch, patch_h, patch_w, vae->eps);
-        iris_copy(latent, work, batch * lat_ch * patch_h * patch_w);
-    }
-
-    *out_h = patch_h;
-    *out_w = patch_w;
-    return latent;
+    /* GPU-resident encode (Metal always available on Apple Silicon) */
+    return vae_encode_gpu(vae, img, batch, H, W, out_h, out_w);
 }
 
 /* ========================================================================
  * GPU-Resident Decoder
  * ======================================================================== */
-
-#ifdef USE_METAL
 
 /* BF16-first conv2d: try BF16 (halves memory bandwidth) then fall back to F32.
  * Drop-in replacement for iris_gpu_conv2d_f32 in the VAE decode path. */
@@ -664,11 +458,9 @@ static iris_gpu_tensor_t resblock_forward_gpu(iris_gpu_tensor_t x,
 }
 
 /* GPU-resident VAE decode.
- * Keeps all data on GPU, only syncs for mid-block attention (CPU) and final output.
- * Returns NULL on failure (caller falls back to CPU path). */
+ * Keeps all data on GPU, only syncs for mid-block attention (CPU) and final output. */
 static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
                                    int batch, int latent_h, int latent_w) {
-    if (!iris_metal_available()) return NULL;
 
     int ch_mult[4] = {1, 2, 4, 4};
 
@@ -862,12 +654,11 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
 /* GPU-resident VAE encode.
  * Mirrors vae_decode_gpu: keeps all data on GPU, only syncs for downsample
  * padding (asymmetric pad needs CPU, 3 times total) and mid-block attention
- * fallback. Returns NULL on failure (caller falls back to CPU path).
- * Only supports batch=1. */
+ * fallback. Only supports batch=1. */
 static float *vae_encode_gpu(iris_vae_t *vae, const float *img,
                               int batch, int H, int W,
                               int *out_h, int *out_w) {
-    if (!iris_metal_available() || batch != 1) return NULL;
+    if (batch != 1) return NULL;
 
     int ch_mult[4] = {1, 2, 4, 4};
     int cur_h = H, cur_w = W;
@@ -1070,8 +861,6 @@ static float *vae_encode_gpu(iris_vae_t *vae, const float *img,
     return latent;
 }
 
-#endif /* USE_METAL */
-
 /* ========================================================================
  * Decoder Forward Pass
  * ======================================================================== */
@@ -1079,166 +868,11 @@ static float *vae_encode_gpu(iris_vae_t *vae, const float *img,
 /* Decode latents back to an RGB image. Reverses the encode normalization
  * (Flux: batch denorm, Z-Image: x/scale + shift), unpatchifies, then runs
  * the decoder CNN (up_blocks double resolution 3 times). Converts the
- * float output to uint8 RGB. Tries GPU-resident decode first for speed,
- * falling back to CPU on failure. */
+ * float output to uint8 RGB. GPU-resident decode via Metal. */
 iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
                             int batch, int latent_h, int latent_w) {
-#ifdef USE_METAL
-    /* Try GPU-resident path first (eliminates CPU<->GPU round-trips per conv) */
-    if (iris_metal_available()) {
-        iris_image *gpu_result = vae_decode_gpu(vae, latent, batch, latent_h, latent_w);
-        if (gpu_result) return gpu_result;
-        /* Fall through to CPU path on failure */
-    }
-#endif
-
-    /*
-     * Decoder path:
-     * [B, latent_ch, H/16, W/16]
-     * -> denormalize (batch denorm for Flux, scaling/shift for Z-Image)
-     * -> unpatchify -> [B, z_ch, H/8, W/8]
-     * -> [post_quant_conv] -> conv_in -> mid_block -> up_blocks -> norm -> conv_out
-     * -> [B, 3, H, W]
-     */
-
-    int ch_mult[4] = {1, 2, 4, 4};
-    float *x = vae->work1;
-    float *work = vae->work2;
-    int lat_ch = vae->latent_channels;
-
-    /* Denormalize latent space */
-    int z_spatial = latent_h * latent_w;
-    iris_copy(x, latent, batch * lat_ch * z_spatial);
-
-    if (vae->scaling_factor != 0.0f) {
-        /* Z-Image: latent = latent / scaling + shift */
-        int n = batch * lat_ch * z_spatial;
-        for (int i = 0; i < n; i++)
-            x[i] = x[i] / vae->scaling_factor + vae->shift_factor;
-    } else {
-        /* Flux: batch denormalize: x = x * sqrt(var + eps) + mean */
-        for (int b = 0; b < batch; b++) {
-            for (int c = 0; c < lat_ch; c++) {
-                float mean = vae->bn_mean[c];
-                float std = sqrtf(vae->bn_var[c] + vae->eps);
-                for (int i = 0; i < z_spatial; i++) {
-                    int idx = b * lat_ch * z_spatial + c * z_spatial + i;
-                    x[idx] = x[idx] * std + mean;
-                }
-            }
-        }
-    }
-
-    /* Unpatchify: [B, latent_ch, H/16, W/16] -> [B, z_ch, H/8, W/8] */
-    int unpatch_h = latent_h * 2;
-    int unpatch_w = latent_w * 2;
-    iris_unpatchify(work, x, batch, vae->z_channels, latent_h, latent_w, 2);
-    { float *tmp = x; x = work; work = tmp; }
-
-    int cur_h = unpatch_h, cur_w = unpatch_w;
-
-    /* Post-quantization conv (1x1) - Flux only */
-    if (vae->post_quant_conv_weight) {
-        vae_conv2d(work, x, vae->post_quant_conv_weight, vae->post_quant_conv_bias,
-                    batch, vae->z_channels, vae->z_channels, cur_h, cur_w, 1, 1, 1, 0);
-        { float *tmp = x; x = work; work = tmp; }
-    }
-
-    /* Conv in: 32 -> 512 */
-    int mid_ch = vae->base_channels * ch_mult[3];  /* 512 */
-    vae_conv2d(work, x, vae->dec_conv_in_weight, vae->dec_conv_in_bias,
-                batch, vae->z_channels, mid_ch, cur_h, cur_w, 3, 3, 1, 1);
-    { float *tmp = x; x = work; work = tmp; }
-
-    /* Mid block: resblock -> attn -> resblock */
-    int progress = 0;
-    int total_blocks = 3 + 4 * (vae->num_res_blocks + 1);  /* mid + up resblocks */
-
-    resblock_forward(work, x, &vae->dec_mid_block1, vae->work3,
-                     batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    if (iris_vae_progress_callback)
-        iris_vae_progress_callback(progress++, total_blocks);
-    if (attnblock_forward(x, work, &vae->dec_mid_attn, vae->work3,
-                          batch, cur_h, cur_w, vae->num_groups, vae->eps,
-                          vae) < 0) {
-        return NULL;  /* OOM in attention */
-    }
-    if (iris_vae_progress_callback)
-        iris_vae_progress_callback(progress++, total_blocks);
-    resblock_forward(work, x, &vae->dec_mid_block2, vae->work3,
-                     batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    { float *tmp = x; x = work; work = tmp; }
-    if (iris_vae_progress_callback)
-        iris_vae_progress_callback(progress++, total_blocks);
-
-    int block_idx = 0;
-    int up_idx = 0;
-
-    /* Up blocks (reverse order of channels) */
-    for (int level = 3; level >= 0; level--) {
-        int ch_out = vae->base_channels * ch_mult[level];
-
-        /* num_res_blocks + 1 resblocks per level */
-        for (int r = 0; r < vae->num_res_blocks + 1; r++) {
-            vae_resblock_t *block = &vae->dec_up_blocks[block_idx++];
-            resblock_forward(work, x, block, vae->work3,
-                             batch, cur_h, cur_w, vae->num_groups, vae->eps);
-            { float *tmp = x; x = work; work = tmp; }
-            if (iris_vae_progress_callback)
-                iris_vae_progress_callback(progress++, total_blocks);
-        }
-
-        /* Upsample (except level 0) */
-        if (level > 0) {
-            vae_upsample_t *us = &vae->dec_upsample[up_idx++];
-            int new_h = cur_h * 2;
-            int new_w = cur_w * 2;
-
-            /* Nearest neighbor upsample */
-            iris_upsample_nearest(work, x, batch, ch_out, cur_h, cur_w, 2, 2);
-
-            /* Conv for refinement */
-            vae_conv2d(x, work, us->conv_weight, us->conv_bias,
-                        batch, ch_out, ch_out, new_h, new_w, 3, 3, 1, 1);
-
-            cur_h = new_h;
-            cur_w = new_w;
-        }
-    }
-
-    int out_ch = vae->base_channels;  /* 128 */
-
-    /* Output: norm -> swish -> conv */
-    iris_group_norm(work, x, vae->dec_norm_out_weight, vae->dec_norm_out_bias,
-                    batch, out_ch, cur_h, cur_w, vae->num_groups, vae->eps);
-    swish_inplace(work, batch * out_ch * cur_h * cur_w);
-
-    /* Conv out: 128 -> 3 */
-    vae_conv2d(x, work, vae->dec_conv_out_weight, vae->dec_conv_out_bias,
-                batch, out_ch, 3, cur_h, cur_w, 3, 3, 1, 1);
-
-    /* Convert to image */
-    int H = cur_h;
-    int W = cur_w;
-
-    iris_image *img = iris_image_create(W, H, 3);
-    if (!img) return NULL;
-
-    /* Denormalize from [-1, 1] to [0, 255] and convert to uint8 */
-    for (int y = 0; y < H; y++) {
-        for (int c = 0; c < W; c++) {
-            for (int ch = 0; ch < 3; ch++) {
-                float val = x[ch * H * W + y * W + c];
-                val = (val + 1.0f) * 0.5f;  /* [-1,1] -> [0,1] */
-                val = val * 255.0f;
-                if (val < 0) val = 0;
-                if (val > 255) val = 255;
-                img->data[(y * W + c) * 3 + ch] = (uint8_t)(val + 0.5f);
-            }
-        }
-    }
-
-    return img;
+    /* GPU-resident decode (Metal always available on Apple Silicon) */
+    return vae_decode_gpu(vae, latent, batch, latent_h, latent_w);
 }
 
 /* ========================================================================

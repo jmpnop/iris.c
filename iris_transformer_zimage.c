@@ -26,13 +26,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#ifdef USE_BLAS
-#ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
-#endif
 
 #ifdef USE_METAL
 #include "iris_metal.h"
@@ -223,6 +217,29 @@ typedef struct zi_transformer {
     float *gpu_uni_rope_cos;
     float *gpu_uni_rope_sin;
 #endif
+
+    /* Pre-allocated forward buffers (reused across denoising steps).
+     * GPU path uses: fwd_img_patches, fwd_cap_normed, fwd_step_mod,
+     *   fwd_gpu_final_scale, fwd_gpu_final_shift (zero-filled once),
+     *   fwd_gpu_final_scale_param, fwd_final_out.
+     * CPU path uses: fwd_img_patches, fwd_cap_normed, fwd_img_emb,
+     *   fwd_cap_emb, fwd_cap_padded_feats, fwd_img_out, fwd_final_out. */
+    float *fwd_img_patches;         /* GPU: [img_seq * patch_feat]
+                                       CPU: [img_padded * patch_feat] */
+    float *fwd_cap_normed;          /* GPU: [cap_seq * cap_feat_dim]
+                                       CPU: [cap_padded * cap_feat_dim] */
+    float *fwd_step_mod;            /* GPU: [n_mod_blocks * 4 * dim] (fixed size) */
+    float *fwd_gpu_final_scale;     /* GPU: [dim] */
+    float *fwd_gpu_final_shift;     /* GPU: [dim] — zero-filled once, never touched */
+    float *fwd_gpu_final_scale_param; /* GPU: [dim] */
+    float *fwd_final_out;           /* [img_seq * out_ch] */
+    float *fwd_img_emb;             /* CPU: [img_padded * dim] */
+    float *fwd_cap_emb;             /* CPU: [cap_padded * dim] */
+    float *fwd_cap_padded_feats;    /* CPU: [cap_padded * cap_feat_dim] */
+    float *fwd_img_out;             /* CPU: [img_seq * dim] */
+    /* Cached sizes for realloc check */
+    int fwd_img_seq;                /* last img_seq (GPU) or img_padded (CPU) */
+    int fwd_cap_seq;                /* last cap_seq_len (GPU) or cap_padded (CPU) */
 } zi_transformer_t;
 
 void iris_transformer_free_zimage(zi_transformer_t *tf);
@@ -543,6 +560,94 @@ static void zi_rms_norm(float *out, const float *x, const float *weight,
                          int rows, int dim, float eps);
 
 /* ========================================================================
+ * Pre-allocated forward buffers
+ * ======================================================================== */
+
+/* Ensure all per-step temporary buffers are allocated (or grown) to fit the
+ * current image / caption dimensions.  Called once at the top of each forward
+ * function.  Buffers whose required size is constant (fwd_step_mod and the
+ * three GPU final-layer scalars) are allocated on first call and never
+ * reallocated.  fwd_gpu_final_shift is calloc'd once (always zero).
+ *
+ * img_seq:     number of image tokens   (GPU: unpadded, CPU: padded)
+ * cap_seq:     caption sequence length   (GPU: unpadded, CPU: padded)
+ * patch_feat:  ps * ps * in_channels
+ * out_ch:      ps * ps * in_channels  (same value, distinct semantic)
+ *
+ * Returns 1 on success, 0 on allocation failure. */
+static int zi_ensure_forward_buffers(zi_transformer_t *tf,
+                                      int img_seq, int cap_seq,
+                                      int patch_feat, int out_ch) {
+    int dim = tf->dim;
+    int cap_feat_dim = tf->cap_feat_dim;
+
+    /* --- Fixed-size buffers (allocate once) --- */
+
+    /* fwd_step_mod: n_mod_blocks * 4 * dim (only used by GPU path) */
+    if (!tf->fwd_step_mod) {
+        int n_mod = tf->n_refiner + tf->n_layers;
+        if (n_mod > 0) {
+            tf->fwd_step_mod = (float *)malloc((size_t)n_mod * 4 * dim * sizeof(float));
+            if (!tf->fwd_step_mod) return 0;
+        }
+    }
+
+    /* GPU final-layer scalars: [dim] each, allocated once */
+    if (!tf->fwd_gpu_final_scale) {
+        tf->fwd_gpu_final_scale = (float *)malloc(dim * sizeof(float));
+        if (!tf->fwd_gpu_final_scale) return 0;
+    }
+    if (!tf->fwd_gpu_final_shift) {
+        tf->fwd_gpu_final_shift = (float *)calloc(dim, sizeof(float));
+        if (!tf->fwd_gpu_final_shift) return 0;
+    }
+    if (!tf->fwd_gpu_final_scale_param) {
+        tf->fwd_gpu_final_scale_param = (float *)malloc(dim * sizeof(float));
+        if (!tf->fwd_gpu_final_scale_param) return 0;
+    }
+
+    /* --- Variable-size buffers (grow if needed) --- */
+
+    if (img_seq > tf->fwd_img_seq) {
+        free(tf->fwd_img_patches);
+        tf->fwd_img_patches = (float *)malloc((size_t)img_seq * patch_feat * sizeof(float));
+        if (!tf->fwd_img_patches) { tf->fwd_img_seq = 0; return 0; }
+
+        free(tf->fwd_final_out);
+        tf->fwd_final_out = (float *)malloc((size_t)img_seq * out_ch * sizeof(float));
+        if (!tf->fwd_final_out) { tf->fwd_img_seq = 0; return 0; }
+
+        free(tf->fwd_img_emb);
+        tf->fwd_img_emb = (float *)malloc((size_t)img_seq * dim * sizeof(float));
+        if (!tf->fwd_img_emb) { tf->fwd_img_seq = 0; return 0; }
+
+        free(tf->fwd_img_out);
+        tf->fwd_img_out = (float *)malloc((size_t)img_seq * dim * sizeof(float));
+        if (!tf->fwd_img_out) { tf->fwd_img_seq = 0; return 0; }
+
+        tf->fwd_img_seq = img_seq;
+    }
+
+    if (cap_seq > tf->fwd_cap_seq) {
+        free(tf->fwd_cap_normed);
+        tf->fwd_cap_normed = (float *)malloc((size_t)cap_seq * cap_feat_dim * sizeof(float));
+        if (!tf->fwd_cap_normed) { tf->fwd_cap_seq = 0; return 0; }
+
+        free(tf->fwd_cap_emb);
+        tf->fwd_cap_emb = (float *)malloc((size_t)cap_seq * dim * sizeof(float));
+        if (!tf->fwd_cap_emb) { tf->fwd_cap_seq = 0; return 0; }
+
+        free(tf->fwd_cap_padded_feats);
+        tf->fwd_cap_padded_feats = (float *)malloc((size_t)cap_seq * cap_feat_dim * sizeof(float));
+        if (!tf->fwd_cap_padded_feats) { tf->fwd_cap_seq = 0; return 0; }
+
+        tf->fwd_cap_seq = cap_seq;
+    }
+
+    return 1;
+}
+
+/* ========================================================================
  * Timestep Embedding
  * ======================================================================== */
 
@@ -682,10 +787,11 @@ static void zi_rms_norm(float *out, const float *x, const float *weight,
     for (int r = 0; r < rows; r++) {
         const float *xr = x + r * dim;
         float *or_ = out + r * dim;
-        float sum_sq = 0;
-        for (int i = 0; i < dim; i++) sum_sq += xr[i] * xr[i];
+        float sum_sq;
+        vDSP_svesq(xr, 1, &sum_sq, dim);
         float rms = 1.0f / sqrtf(sum_sq / dim + eps);
-        for (int i = 0; i < dim; i++) or_[i] = xr[i] * rms * weight[i];
+        vDSP_vsmul(xr, 1, &rms, or_, 1, dim);
+        vDSP_vmul(or_, 1, weight, 1, or_, 1, dim);
     }
 }
 
@@ -696,10 +802,11 @@ static void zi_qk_norm(float *x, const float *norm_weight, int seq,
     for (int s = 0; s < seq; s++) {
         for (int h = 0; h < n_heads; h++) {
             float *ptr = x + s * n_heads * head_dim + h * head_dim;
-            float sum_sq = 0;
-            for (int i = 0; i < head_dim; i++) sum_sq += ptr[i] * ptr[i];
+            float sum_sq;
+            vDSP_svesq(ptr, 1, &sum_sq, head_dim);
             float rms = 1.0f / sqrtf(sum_sq / head_dim + eps);
-            for (int i = 0; i < head_dim; i++) ptr[i] = ptr[i] * rms * norm_weight[i];
+            vDSP_vsmul(ptr, 1, &rms, ptr, 1, head_dim);
+            vDSP_vmul(ptr, 1, norm_weight, 1, ptr, 1, head_dim);
         }
     }
 }
@@ -755,17 +862,13 @@ static void zi_attention(float *out, const float *x,
     for (int h = 0; h < n_heads; h++) {
         float *scores = tf->work_attn;
 
-        /* Compute Q @ K^T for this head */
-        for (int i = 0; i < seq; i++) {
-            const float *qi = q + i * dim + h * head_dim;
-            for (int j = 0; j < seq; j++) {
-                const float *kj = k + j * dim + h * head_dim;
-                float dot = 0;
-                for (int d = 0; d < head_dim; d++)
-                    dot += qi[d] * kj[d];
-                scores[i * seq + j] = dot * scale;
-            }
-        }
+        /* Q @ K^T: [seq, head_dim] x [head_dim, seq] -> [seq, seq]
+         * Q and K are interleaved across heads with stride = dim = n_heads * head_dim.
+         * Use lda/ldb = dim to read only this head's slice without copying. */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    seq, seq, head_dim,
+                    scale, q + h * head_dim, dim, k + h * head_dim, dim,
+                    0.0f, scores, seq);
 
         /* Apply mask: set padding positions to -inf */
         if (mask) {
@@ -780,17 +883,12 @@ static void zi_attention(float *out, const float *x,
         /* Softmax */
         iris_softmax(scores, seq, seq);
 
-        /* Scores @ V */
-        for (int i = 0; i < seq; i++) {
-            float *oi = attn_out + i * dim + h * head_dim;
-            memset(oi, 0, head_dim * sizeof(float));
-            for (int j = 0; j < seq; j++) {
-                float s = scores[i * seq + j];
-                const float *vj = v + j * dim + h * head_dim;
-                for (int d = 0; d < head_dim; d++)
-                    oi[d] += s * vj[d];
-            }
-        }
+        /* scores @ V: [seq, seq] x [seq, head_dim] -> [seq, head_dim]
+         * V is interleaved with stride = dim; output is also interleaved. */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    seq, head_dim, seq,
+                    1.0f, scores, seq, v + h * head_dim, dim,
+                    0.0f, attn_out + h * head_dim, dim);
     }
 
     /* Output projection */
@@ -823,8 +921,7 @@ static void zi_ffn(float *out, const float *x, const zi_block_t *block,
 
     /* SiLU(gate) * up */
     int n = seq * ffn_dim;
-    iris_silu(gate, n);
-    for (int i = 0; i < n; i++) gate[i] *= up[i];
+    iris_silu_mul(gate, up, n);
 
     /* W2 (down) projection */
     iris_matmul_t(out, gate, block->ffn_w2, seq, ffn_dim, dim);
@@ -855,7 +952,7 @@ static void zi_block_forward(float *x, const zi_block_t *block,
         float *mod = tf->mod_scratch;
         if (!mod) return;
         iris_matmul_t(mod, t_emb, block->adaln_weight, 1, tf->adaln_dim, 4 * dim);
-        for (int i = 0; i < 4 * dim; i++) mod[i] += block->adaln_bias[i];
+        vDSP_vadd(mod, 1, block->adaln_bias, 1, mod, 1, 4 * dim);
 
         float *scale_msa = mod;
         float *gate_msa  = mod + dim;
@@ -863,18 +960,19 @@ static void zi_block_forward(float *x, const zi_block_t *block,
         float *gate_mlp  = mod + 3 * dim;
 
         /* Apply tanh to gates, 1+scale */
-        for (int i = 0; i < dim; i++) {
-            scale_msa[i] = 1.0f + scale_msa[i];
-            gate_msa[i] = tanhf(gate_msa[i]);
-            scale_mlp[i] = 1.0f + scale_mlp[i];
-            gate_mlp[i] = tanhf(gate_mlp[i]);
+        {
+            float one = 1.0f;
+            int dim_int = dim;
+            vDSP_vsadd(scale_msa, 1, &one, scale_msa, 1, dim);
+            vvtanhf(gate_msa, gate_msa, &dim_int);
+            vDSP_vsadd(scale_mlp, 1, &one, scale_mlp, 1, dim);
+            vvtanhf(gate_mlp, gate_mlp, &dim_int);
         }
 
         /* Attention: h = attention(norm1(x) * scale_msa) */
         zi_rms_norm(norm_out, x, block->attn_norm1, seq, dim, ZI_NORM_EPS);
         for (int s = 0; s < seq; s++)
-            for (int i = 0; i < dim; i++)
-                scaled[s * dim + i] = norm_out[s * dim + i] * scale_msa[i];
+            vDSP_vmul(norm_out + s * dim, 1, scale_msa, 1, scaled + s * dim, 1, dim);
 
         zi_attention(attn_out, scaled, block, pos_ids, mask, seq, tf);
 
@@ -882,22 +980,19 @@ static void zi_block_forward(float *x, const zi_block_t *block,
         zi_rms_norm(norm_out, attn_out, block->attn_norm2, seq, dim, ZI_NORM_EPS);
 
         for (int s = 0; s < seq; s++)
-            for (int i = 0; i < dim; i++)
-                x[s * dim + i] += gate_msa[i] * norm_out[s * dim + i];
+            vDSP_vma(gate_msa, 1, norm_out + s * dim, 1, x + s * dim, 1, x + s * dim, 1, dim);
 
         /* FFN: h = ffn(norm1(x) * scale_mlp) */
         zi_rms_norm(norm_out, x, block->ffn_norm1, seq, dim, ZI_NORM_EPS);
         for (int s = 0; s < seq; s++)
-            for (int i = 0; i < dim; i++)
-                scaled[s * dim + i] = norm_out[s * dim + i] * scale_mlp[i];
+            vDSP_vmul(norm_out + s * dim, 1, scale_mlp, 1, scaled + s * dim, 1, dim);
 
         zi_ffn(ffn_out, scaled, block, seq, tf);
 
         /* x = x + gate_mlp * norm2(ffn_out) */
         zi_rms_norm(norm_out, ffn_out, block->ffn_norm2, seq, dim, ZI_NORM_EPS);
         for (int s = 0; s < seq; s++)
-            for (int i = 0; i < dim; i++)
-                x[s * dim + i] += gate_mlp[i] * norm_out[s * dim + i];
+            vDSP_vma(gate_mlp, 1, norm_out + s * dim, 1, x + s * dim, 1, x + s * dim, 1, dim);
 
         /* mod_scratch is reused across blocks — no free needed */
     } else {
@@ -1008,14 +1103,16 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
             /* Fallback path: compute modulation on the fly. */
             float *scratch_mod = scratch->mod;
             iris_matmul_t(scratch_mod, t_emb, block->adaln_weight, 1, tf->adaln_dim, 4 * dim);
-            for (int i = 0; i < 4 * dim; i++) scratch_mod[i] += block->adaln_bias[i];
+            vDSP_vadd(scratch_mod, 1, block->adaln_bias, 1, scratch_mod, 1, 4 * dim);
 
             /* Apply 1+scale to scales, tanh to gates */
-            for (int i = 0; i < dim; i++) {
-                scratch_mod[i] = 1.0f + scratch_mod[i];
-                scratch_mod[dim + i] = tanhf(scratch_mod[dim + i]);
-                scratch_mod[2 * dim + i] = 1.0f + scratch_mod[2 * dim + i];
-                scratch_mod[3 * dim + i] = tanhf(scratch_mod[3 * dim + i]);
+            {
+                float one = 1.0f;
+                int dim_int = dim;
+                vDSP_vsadd(scratch_mod, 1, &one, scratch_mod, 1, dim);
+                vvtanhf(scratch_mod + dim, scratch_mod + dim, &dim_int);
+                vDSP_vsadd(scratch_mod + 2 * dim, 1, &one, scratch_mod + 2 * dim, 1, dim);
+                vvtanhf(scratch_mod + 3 * dim, scratch_mod + 3 * dim, &dim_int);
             }
             mod = scratch_mod;
         }
@@ -1285,13 +1382,14 @@ static int zi_precompute_block_modulation(float *mod_out, const zi_block_t *bloc
     if (!mod_out || !block || !block->adaln_weight || !block->adaln_bias || !t_emb) return 0;
 
     iris_matmul_t(mod_out, t_emb, block->adaln_weight, 1, adaln_dim, 4 * dim);
-    for (int i = 0; i < 4 * dim; i++) mod_out[i] += block->adaln_bias[i];
-
-    for (int i = 0; i < dim; i++) {
-        mod_out[i] = 1.0f + mod_out[i];
-        mod_out[dim + i] = tanhf(mod_out[dim + i]);
-        mod_out[2 * dim + i] = 1.0f + mod_out[2 * dim + i];
-        mod_out[3 * dim + i] = tanhf(mod_out[3 * dim + i]);
+    vDSP_vadd(mod_out, 1, block->adaln_bias, 1, mod_out, 1, 4 * dim);
+    {
+        float one = 1.0f;
+        int dim_int = dim;
+        vDSP_vsadd(mod_out, 1, &one, mod_out, 1, dim);
+        vvtanhf(mod_out + dim, mod_out + dim, &dim_int);
+        vDSP_vsadd(mod_out + 2 * dim, 1, &one, mod_out + 2 * dim, 1, dim);
+        vvtanhf(mod_out + 3 * dim, mod_out + 3 * dim, &dim_int);
     }
 
     return 1;
@@ -1323,25 +1421,25 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     /* No padding for GPU path — GPU attention handles arbitrary seq lengths */
     int cap_padded = cap_seq_len;
     int unified_seq = img_seq + cap_padded;
+    int out_ch = ps * ps * in_ch;
     double t_embed_ms = 0.0, t_noise_ms = 0.0, t_context_ms = 0.0;
     double t_main_ms = 0.0, t_final_ms = 0.0;
     double stage_start = zi_time_ms();
+
+    /* Ensure pre-allocated forward buffers are large enough */
+    if (!zi_ensure_forward_buffers(tf, img_seq, cap_seq_len, patch_feat, out_ch))
+        return NULL;
 
     /* === CPU: Timestep embedding === */
     float t_emb[256];
     zi_timestep_embed(tf, t_emb, timestep);
 
     /* === CPU: Patchify image === */
-    float *img_patches = (float *)malloc((size_t)img_seq * patch_feat * sizeof(float));
-    if (!img_patches) return NULL;
+    float *img_patches = tf->fwd_img_patches;
     zi_patchify(img_patches, latent, in_ch, latent_h, latent_w, ps);
 
     /* === CPU: Caption RMSNorm === */
-    float *cap_normed = (float *)malloc((size_t)cap_seq_len * tf->cap_feat_dim * sizeof(float));
-    if (!cap_normed) {
-        free(img_patches);
-        return NULL;
-    }
+    float *cap_normed = tf->fwd_cap_normed;
     zi_rms_norm(cap_normed, cap_feats, tf->cap_emb_norm,
                 cap_seq_len, tf->cap_feat_dim, ZI_NORM_EPS);
 
@@ -1381,25 +1479,17 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
         if (!img_emb || !cap_emb) {
             free(img_emb);
             free(cap_emb);
-            free(img_patches);
-            free(cap_normed);
             return NULL;
         }
 
         iris_matmul_t(img_emb, img_patches, tf->x_emb_weight, img_seq, patch_feat, dim);
-        for (int s = 0; s < img_seq; s++) {
-            for (int i = 0; i < dim; i++) {
-                img_emb[s * dim + i] += tf->x_emb_bias[i];
-            }
-        }
+        for (int s = 0; s < img_seq; s++)
+            vDSP_vadd(img_emb + s * dim, 1, tf->x_emb_bias, 1, img_emb + s * dim, 1, dim);
 
         iris_matmul_t(cap_emb, cap_normed, tf->cap_emb_linear_w,
                       cap_seq_len, tf->cap_feat_dim, dim);
-        for (int s = 0; s < cap_seq_len; s++) {
-            for (int i = 0; i < dim; i++) {
-                cap_emb[s * dim + i] += tf->cap_emb_linear_b[i];
-            }
-        }
+        for (int s = 0; s < cap_seq_len; s++)
+            vDSP_vadd(cap_emb + s * dim, 1, tf->cap_emb_linear_b, 1, cap_emb + s * dim, 1, dim);
 
         img_gpu = iris_gpu_tensor_create(img_emb, (size_t)img_seq * dim);
         cap_gpu = iris_gpu_tensor_create(cap_emb, (size_t)cap_seq_len * dim);
@@ -1407,8 +1497,7 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
         free(cap_emb);
     }
 
-    free(img_patches);
-    free(cap_normed);
+    /* img_patches and cap_normed are pre-allocated in tf — no free needed */
 
     /* === CPU: Pre-assemble RoPE tables (cached across steps) === */
     if (!zi_gpu_rope_cache_prepare(tf, cap_seq_len, H_tokens, W_tokens)) {
@@ -1441,30 +1530,27 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
         return NULL;
     }
 
-    /* Precompute modulation once per step for all modulated blocks. */
+    /* Precompute modulation once per step for all modulated blocks.
+     * Uses pre-allocated tf->fwd_step_mod buffer. */
     int n_mod_blocks = tf->n_refiner + tf->n_layers;
-    float *step_mod = NULL;
-    if (n_mod_blocks > 0) {
-        step_mod = (float *)malloc((size_t)n_mod_blocks * 4 * dim * sizeof(float));
-        if (step_mod) {
-            int mod_idx = 0;
-            int mod_ok = 1;
-            for (int i = 0; i < tf->n_refiner && mod_ok; i++) {
-                mod_ok = zi_precompute_block_modulation(
-                    step_mod + (size_t)mod_idx * 4 * dim,
-                    &tf->noise_refiner[i], t_emb, tf->adaln_dim, dim);
-                mod_idx++;
-            }
-            for (int i = 0; i < tf->n_layers && mod_ok; i++) {
-                mod_ok = zi_precompute_block_modulation(
-                    step_mod + (size_t)mod_idx * 4 * dim,
-                    &tf->layers[i], t_emb, tf->adaln_dim, dim);
-                mod_idx++;
-            }
-            if (!mod_ok) {
-                free(step_mod);
-                step_mod = NULL;
-            }
+    float *step_mod = tf->fwd_step_mod;  /* pre-allocated in ensure_forward_buffers */
+    if (n_mod_blocks > 0 && step_mod) {
+        int mod_idx = 0;
+        int mod_ok = 1;
+        for (int i = 0; i < tf->n_refiner && mod_ok; i++) {
+            mod_ok = zi_precompute_block_modulation(
+                step_mod + (size_t)mod_idx * 4 * dim,
+                &tf->noise_refiner[i], t_emb, tf->adaln_dim, dim);
+            mod_idx++;
+        }
+        for (int i = 0; i < tf->n_layers && mod_ok; i++) {
+            mod_ok = zi_precompute_block_modulation(
+                step_mod + (size_t)mod_idx * 4 * dim,
+                &tf->layers[i], t_emb, tf->adaln_dim, dim);
+            mod_idx++;
+        }
+        if (!mod_ok) {
+            step_mod = NULL;
         }
     }
 
@@ -1499,7 +1585,6 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     if (!gpu_ok) {
         iris_gpu_batch_end();
         zi_gpu_scratch_free(&scratch);
-        free(step_mod);
         iris_gpu_tensor_free(img_gpu);
         iris_gpu_tensor_free(cap_gpu);
         return NULL;
@@ -1510,7 +1595,6 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     if (!unified_gpu) {
         iris_gpu_batch_end();
         zi_gpu_scratch_free(&scratch);
-        free(step_mod);
         iris_gpu_tensor_free(img_gpu);
         iris_gpu_tensor_free(cap_gpu);
         return NULL;
@@ -1542,34 +1626,27 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     if (!gpu_ok) {
         iris_gpu_batch_end();
         zi_gpu_scratch_free(&scratch);
-        free(step_mod);
         iris_gpu_tensor_free(unified_gpu);
         return NULL;
     }
 
     /* === Final layer on GPU: slice image tokens -> LayerNorm+scale -> Linear === */
     stage_start = zi_time_ms();
-    int out_ch = ps * ps * in_ch;
     iris_gpu_tensor_t img_hidden_gpu = iris_gpu_tensor_alloc((size_t)img_seq * dim);
     iris_gpu_tensor_t final_norm_gpu = iris_gpu_tensor_alloc((size_t)img_seq * dim);
     iris_gpu_tensor_t final_out_gpu = NULL;
 
-    /* Prepare final AdaLN parameters on CPU once per step. */
-    float *final_scale = (float *)malloc(dim * sizeof(float));
-    float *final_shift = (float *)calloc(dim, sizeof(float));  /* zero shift */
-    float *final_scale_param = (float *)malloc(dim * sizeof(float)); /* adaln expects (1+scale) */
-    if (!img_hidden_gpu || !final_norm_gpu || !final_scale || !final_shift ||
-        !final_scale_param ||
+    /* Prepare final AdaLN parameters on CPU using pre-allocated buffers. */
+    float *final_scale = tf->fwd_gpu_final_scale;
+    float *final_shift = tf->fwd_gpu_final_shift;       /* always zero */
+    float *final_scale_param = tf->fwd_gpu_final_scale_param;
+    if (!img_hidden_gpu || !final_norm_gpu ||
         !zi_final_compute_scale(final_scale, &tf->final_layer, t_emb, tf)) {
         iris_gpu_batch_end();
         zi_gpu_scratch_free(&scratch);
-        free(step_mod);
         iris_gpu_tensor_free(unified_gpu);
         if (img_hidden_gpu) iris_gpu_tensor_free(img_hidden_gpu);
         if (final_norm_gpu) iris_gpu_tensor_free(final_norm_gpu);
-        free(final_scale);
-        free(final_shift);
-        free(final_scale_param);
         return NULL;
     }
     for (int i = 0; i < dim; i++) final_scale_param[i] = final_scale[i] - 1.0f;
@@ -1584,43 +1661,31 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
     if (!final_out_gpu) {
         iris_gpu_batch_end();
         zi_gpu_scratch_free(&scratch);
-        free(step_mod);
         iris_gpu_tensor_free(unified_gpu);
         iris_gpu_tensor_free(img_hidden_gpu);
         iris_gpu_tensor_free(final_norm_gpu);
-        free(final_scale);
-        free(final_shift);
-        free(final_scale_param);
         return NULL;
     }
 
     iris_gpu_batch_end();
     zi_gpu_scratch_free(&scratch);
-    free(step_mod);
     iris_gpu_tensor_free(unified_gpu);
     iris_gpu_tensor_free(img_hidden_gpu);
     iris_gpu_tensor_free(final_norm_gpu);
-    free(final_shift);
-    free(final_scale_param);
 
-    /* Read back final projected patches (bias already applied on GPU). */
-    float *final_out = (float *)malloc((size_t)img_seq * out_ch * sizeof(float));
-    if (!final_out) {
-        iris_gpu_tensor_free(final_out_gpu);
-        free(final_scale);
-        return NULL;
-    }
+    /* Read back final projected patches into pre-allocated buffer. */
+    float *final_out = tf->fwd_final_out;
     float *final_out_data = iris_gpu_tensor_data(final_out_gpu);
     memcpy(final_out, final_out_data, (size_t)img_seq * out_ch * sizeof(float));
     iris_gpu_tensor_free(final_out_gpu);
     if (iris_substep_callback)
         iris_substep_callback(IRIS_SUBSTEP_FINAL_LAYER, 0, 1);
-    free(final_scale);
 
-    /* === CPU: Unpatchify === */
-    float *output = (float *)calloc(in_ch * latent_h * latent_w, sizeof(float));
+    /* === CPU: Unpatchify (zi_unpatchify fills all elements, malloc is safe) === */
+    float *output = (float *)malloc((size_t)in_ch * latent_h * latent_w * sizeof(float));
+    if (!output) return NULL;
     zi_unpatchify(output, final_out, in_ch, latent_h, latent_w, ps);
-    free(final_out);
+    /* final_out is pre-allocated in tf — no free needed */
     t_final_ms = zi_time_ms() - stage_start;
 
     /* Accumulate per-step zImage GPU timing. */
@@ -1688,28 +1753,31 @@ static void zi_final_forward(float *out, const float *x, const zi_final_t *fl,
         const float *xr = x + s * dim;
         float *nr = normed + s * dim;
 
-        /* Compute mean and variance */
-        float mean = 0;
-        for (int i = 0; i < dim; i++) mean += xr[i];
-        mean /= dim;
+        /* Compute mean */
+        float mean;
+        vDSP_meanv(xr, 1, &mean, dim);
 
-        float var = 0;
-        for (int i = 0; i < dim; i++) {
-            float d = xr[i] - mean;
-            var += d * d;
-        }
-        var /= dim;
+        /* Subtract mean: nr = xr - mean */
+        float neg_mean = -mean;
+        vDSP_vsadd(xr, 1, &neg_mean, nr, 1, dim);
+
+        /* Compute variance = sum((xr - mean)^2) / dim */
+        float sum_sq;
+        vDSP_svesq(nr, 1, &sum_sq, dim);
+        float var = sum_sq / dim;
         float inv_std = 1.0f / sqrtf(var + 1e-6f); /* Final LayerNorm uses 1e-6 */
 
-        for (int i = 0; i < dim; i++)
-            nr[i] = (xr[i] - mean) * inv_std * scale[i];
+        /* nr = nr * inv_std */
+        vDSP_vsmul(nr, 1, &inv_std, nr, 1, dim);
+
+        /* nr = nr * scale */
+        vDSP_vmul(nr, 1, scale, 1, nr, 1, dim);
     }
 
     /* Linear projection: dim -> out_dim */
     iris_matmul_t(out, normed, fl->linear_weight, seq, dim, out_dim);
     for (int s = 0; s < seq; s++)
-        for (int i = 0; i < out_dim; i++)
-            out[s * out_dim + i] += fl->linear_bias[i];
+        vDSP_vadd(out + s * out_dim, 1, fl->linear_bias, 1, out + s * out_dim, 1, out_dim);
 
     /* scale and normed are pre-allocated — no free needed */
 }
@@ -1852,13 +1920,18 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         tf->max_seq = unified_seq;
     }
 
+    int out_ch = ps * ps * in_ch;
+
+    /* Ensure pre-allocated forward buffers are large enough */
+    if (!zi_ensure_forward_buffers(tf, img_padded, cap_padded, patch_feat, out_ch))
+        return NULL;
+
     /* 1. Timestep embedding */
     float t_emb[256];
     zi_timestep_embed(tf, t_emb, timestep);
 
     /* 2. Patchify image -> [img_seq, patch_feat] */
-    float *img_patches = (float *)malloc((size_t)img_padded * patch_feat * sizeof(float));
-    if (!img_patches) return NULL;
+    float *img_patches = tf->fwd_img_patches;
     zi_patchify(img_patches, latent, in_ch, latent_h, latent_w, ps);
 
     /* Pad image patches (repeat last token) */
@@ -1868,39 +1941,22 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
                patch_feat * sizeof(float));
 
     /* Embed image: [img_padded, patch_feat] -> [img_padded, dim] */
-    float *img_emb = (float *)malloc((size_t)img_padded * dim * sizeof(float));
-    if (!img_emb) {
-        free(img_patches);
-        return NULL;
-    }
+    float *img_emb = tf->fwd_img_emb;
     iris_matmul_t(img_emb, img_patches, tf->x_emb_weight, img_padded, patch_feat, dim);
     for (int s = 0; s < img_padded; s++)
-        for (int i = 0; i < dim; i++)
-            img_emb[s * dim + i] += tf->x_emb_bias[i];
-    free(img_patches);
+        vDSP_vadd(img_emb + s * dim, 1, tf->x_emb_bias, 1, img_emb + s * dim, 1, dim);
+    /* img_patches is pre-allocated in tf — no free needed */
 
     /* Apply pad token to image padding positions */
     for (int s = img_seq; s < img_padded; s++)
         memcpy(img_emb + s * dim, tf->x_pad_token, dim * sizeof(float));
 
     /* 3. Caption embedding: RMSNorm -> Linear */
-    float *cap_emb = (float *)malloc((size_t)cap_padded * dim * sizeof(float));
-    float *cap_normed = (float *)malloc((size_t)cap_padded * tf->cap_feat_dim * sizeof(float));
-    if (!cap_emb || !cap_normed) {
-        free(img_emb);
-        free(cap_emb);
-        free(cap_normed);
-        return NULL;
-    }
+    float *cap_emb = tf->fwd_cap_emb;
+    float *cap_normed = tf->fwd_cap_normed;
 
     /* Pad caption features (repeat last token) */
-    float *cap_padded_feats = (float *)malloc((size_t)cap_padded * tf->cap_feat_dim * sizeof(float));
-    if (!cap_padded_feats) {
-        free(img_emb);
-        free(cap_emb);
-        free(cap_normed);
-        return NULL;
-    }
+    float *cap_padded_feats = tf->fwd_cap_padded_feats;
     memcpy(cap_padded_feats, cap_feats, cap_seq_len * tf->cap_feat_dim * sizeof(float));
     for (int s = cap_seq_len; s < cap_padded; s++)
         memcpy(cap_padded_feats + s * tf->cap_feat_dim,
@@ -1909,14 +1965,13 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
 
     zi_rms_norm(cap_normed, cap_padded_feats, tf->cap_emb_norm,
                 cap_padded, tf->cap_feat_dim, ZI_NORM_EPS);
-    free(cap_padded_feats);
+    /* cap_padded_feats is pre-allocated in tf — no free needed */
 
     iris_matmul_t(cap_emb, cap_normed, tf->cap_emb_linear_w,
                   cap_padded, tf->cap_feat_dim, dim);
     for (int s = 0; s < cap_padded; s++)
-        for (int i = 0; i < dim; i++)
-            cap_emb[s * dim + i] += tf->cap_emb_linear_b[i];
-    free(cap_normed);
+        vDSP_vadd(cap_emb + s * dim, 1, tf->cap_emb_linear_b, 1, cap_emb + s * dim, 1, dim);
+    /* cap_normed is pre-allocated in tf — no free needed */
 
     /* Apply pad token to caption padding positions */
     for (int s = cap_seq_len; s < cap_padded; s++)
@@ -1949,7 +2004,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         /* Image position IDs: (T=cap_padded+1, H=h_idx, W=w_idx) */
         tf->cpu_cache_img_pos = (int *)calloc(img_padded * 3, sizeof(int));
         if (!tf->cpu_cache_img_pos) {
-            free(img_emb); free(cap_emb); return NULL;
+            return NULL;
         }
         for (int h = 0; h < H_tokens; h++) {
             for (int w = 0; w < W_tokens; w++) {
@@ -1963,7 +2018,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         /* Caption position IDs: (T=1+seq_idx, H=0, W=0) */
         tf->cpu_cache_cap_pos = (int *)calloc(cap_padded * 3, sizeof(int));
         if (!tf->cpu_cache_cap_pos) {
-            free(img_emb); free(cap_emb); return NULL;
+            return NULL;
         }
         for (int s = 0; s < cap_padded; s++) {
             tf->cpu_cache_cap_pos[s * 3 + 0] = 1 + s;
@@ -1974,7 +2029,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         /* Image mask */
         tf->cpu_cache_img_mask = (int *)malloc(img_padded * sizeof(int));
         if (!tf->cpu_cache_img_mask) {
-            free(img_emb); free(cap_emb); return NULL;
+            return NULL;
         }
         for (int i = 0; i < img_seq; i++) tf->cpu_cache_img_mask[i] = 1;
         for (int i = img_seq; i < img_padded; i++) tf->cpu_cache_img_mask[i] = 0;
@@ -1982,7 +2037,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         /* Caption mask */
         tf->cpu_cache_cap_mask = (int *)malloc(cap_padded * sizeof(int));
         if (!tf->cpu_cache_cap_mask) {
-            free(img_emb); free(cap_emb); return NULL;
+            return NULL;
         }
         for (int i = 0; i < cap_seq_len; i++) tf->cpu_cache_cap_mask[i] = 1;
         for (int i = cap_seq_len; i < cap_padded; i++) tf->cpu_cache_cap_mask[i] = 0;
@@ -1990,7 +2045,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         /* Unified position IDs */
         tf->cpu_cache_unified_pos = (int *)malloc(unified_seq * 3 * sizeof(int));
         if (!tf->cpu_cache_unified_pos) {
-            free(img_emb); free(cap_emb); return NULL;
+            return NULL;
         }
         memcpy(tf->cpu_cache_unified_pos,
                tf->cpu_cache_img_pos, img_padded * 3 * sizeof(int));
@@ -2000,7 +2055,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
         /* Unified mask */
         tf->cpu_cache_unified_mask = (int *)malloc(unified_seq * sizeof(int));
         if (!tf->cpu_cache_unified_mask) {
-            free(img_emb); free(cap_emb); return NULL;
+            return NULL;
         }
         memcpy(tf->cpu_cache_unified_mask,
                tf->cpu_cache_img_mask, img_padded * sizeof(int));
@@ -2043,8 +2098,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
     float *unified = tf->work_x;
     memcpy(unified, img_emb, img_padded * dim * sizeof(float));
     memcpy(unified + img_padded * dim, cap_emb, cap_padded * dim * sizeof(float));
-    free(img_emb);
-    free(cap_emb);
+    /* img_emb and cap_emb are pre-allocated in tf — no free needed */
 
     /* 8. Main transformer layers */
     for (int i = 0; i < tf->n_layers; i++) {
@@ -2056,30 +2110,24 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
 
     /* Position/mask arrays are cached in transformer struct — no free here */
 
-    /* 9. Final layer: extract image tokens only, then project */
-    float *img_out = (float *)malloc((size_t)img_seq * dim * sizeof(float));
-    if (!img_out) return NULL;
+    /* 9. Final layer: extract image tokens only, then project.
+     * img_out and final_out use pre-allocated buffers. */
+    float *img_out = tf->fwd_img_out;
     memcpy(img_out, unified, (size_t)img_seq * dim * sizeof(float));
 
-    int out_ch = ps * ps * in_ch;  /* 64 */
-    float *final_out = (float *)malloc((size_t)img_seq * out_ch * sizeof(float));
-    if (!final_out) {
-        free(img_out);
-        return NULL;
-    }
+    /* out_ch already declared at top of function */
+    float *final_out = tf->fwd_final_out;
     zi_final_forward(final_out, img_out, &tf->final_layer, t_emb, img_seq, tf);
-    free(img_out);
+    /* img_out is pre-allocated in tf — no free needed */
     if (iris_substep_callback)
         iris_substep_callback(IRIS_SUBSTEP_FINAL_LAYER, 0, 1);
 
-    /* 10. Unpatchify: [n_patches, 64] -> [16, latent_h, latent_w] */
-    float *output = (float *)calloc(in_ch * latent_h * latent_w, sizeof(float));
-    if (!output) {
-        free(final_out);
-        return NULL;
-    }
+    /* 10. Unpatchify: [n_patches, 64] -> [16, latent_h, latent_w]
+     * zi_unpatchify fills all elements, so malloc is safe (no need for calloc). */
+    float *output = (float *)malloc((size_t)in_ch * latent_h * latent_w * sizeof(float));
+    if (!output) return NULL;
     zi_unpatchify(output, final_out, in_ch, latent_h, latent_w, ps);
-    free(final_out);
+    /* final_out is pre-allocated in tf — no free needed */
 
     return output;
 }
@@ -3279,6 +3327,19 @@ void iris_transformer_free_zimage(zi_transformer_t *tf) {
     free(tf->cpu_cache_cap_mask);
     free(tf->cpu_cache_unified_pos);
     free(tf->cpu_cache_unified_mask);
+
+    /* Pre-allocated forward buffers */
+    free(tf->fwd_img_patches);
+    free(tf->fwd_cap_normed);
+    free(tf->fwd_step_mod);
+    free(tf->fwd_gpu_final_scale);
+    free(tf->fwd_gpu_final_shift);
+    free(tf->fwd_gpu_final_scale_param);
+    free(tf->fwd_final_out);
+    free(tf->fwd_img_emb);
+    free(tf->fwd_cap_emb);
+    free(tf->fwd_cap_padded_feats);
+    free(tf->fwd_img_out);
 
 #ifdef USE_METAL
     if (tf->f16_cache_mmap) {

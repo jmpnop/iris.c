@@ -325,6 +325,15 @@ typedef struct iris_transformer_flux {
     int cached_combined_ref_w;
     int cached_combined_t_offset;
 
+    /* Pre-allocated per-step forward buffers (avoid malloc/free churn in the
+     * denoising loop — these are reused across 20-50 calls per image). */
+    float *fwd_t_emb;           /* [hidden] */
+    float *fwd_img_transposed;  /* [fwd_img_alloc * latent_channels] */
+    float *fwd_concat_hidden;   /* [fwd_total_alloc * hidden] */
+    float *fwd_output_nlc;      /* [fwd_img_alloc * latent_channels] */
+    int fwd_img_alloc;          /* max img_seq (or combined_img_seq) allocated */
+    int fwd_total_alloc;        /* max total_seq allocated */
+
     /* Mmap mode: keep safetensors file open, load block weights on-demand */
     int use_mmap;
     #define MAX_TF_SHARDS 4
@@ -1525,6 +1534,53 @@ static int ensure_work_buffers(iris_transformer_flux_t *tf, int total_seq) {
     }
 
     tf->work_seq_alloc = total_seq;
+    return 0;
+}
+
+/* Ensure per-step forward buffers are allocated.
+ * img_seq is the image (or combined image) sequence length for this call;
+ * total_seq is txt_seq + img_seq.  Buffers grow-only — reallocated only
+ * when the current allocation is too small.
+ * Returns 0 on success, -1 on allocation failure. */
+static int ensure_forward_buffers(iris_transformer_flux_t *tf,
+                                  int img_seq, int total_seq) {
+    int hidden = tf->hidden_size;
+    int channels = tf->latent_channels;
+
+    /* fwd_t_emb: one-time allocation [hidden] — size never changes */
+    if (!tf->fwd_t_emb) {
+        tf->fwd_t_emb = (float *)malloc(hidden * sizeof(float));
+        if (!tf->fwd_t_emb) return -1;
+    }
+
+    /* img_transposed and output_nlc are keyed on img_seq */
+    if (tf->fwd_img_alloc < img_seq) {
+        free(tf->fwd_img_transposed);
+        free(tf->fwd_output_nlc);
+        tf->fwd_img_transposed = (float *)malloc((size_t)img_seq * channels * sizeof(float));
+        tf->fwd_output_nlc     = (float *)malloc((size_t)img_seq * channels * sizeof(float));
+        if (!tf->fwd_img_transposed || !tf->fwd_output_nlc) {
+            free(tf->fwd_img_transposed);
+            free(tf->fwd_output_nlc);
+            tf->fwd_img_transposed = NULL;
+            tf->fwd_output_nlc = NULL;
+            tf->fwd_img_alloc = 0;
+            return -1;
+        }
+        tf->fwd_img_alloc = img_seq;
+    }
+
+    /* concat_hidden is keyed on total_seq */
+    if (tf->fwd_total_alloc < total_seq) {
+        free(tf->fwd_concat_hidden);
+        tf->fwd_concat_hidden = (float *)malloc((size_t)total_seq * hidden * sizeof(float));
+        if (!tf->fwd_concat_hidden) {
+            tf->fwd_total_alloc = 0;
+            return -1;
+        }
+        tf->fwd_total_alloc = total_seq;
+    }
+
     return 0;
 }
 
@@ -2759,10 +2815,8 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
     } else {
         int mod_size = h_size * 3;
         float *t_emb_silu = tf->t_emb_silu;
-        for (int i = 0; i < h_size; i++) {
-            float x = t_emb[i];
-            t_emb_silu[i] = x / (1.0f + expf(-x));
-        }
+        memcpy(t_emb_silu, t_emb, h_size * sizeof(float));
+        iris_silu(t_emb_silu, h_size);
         float *mod_params = tf->work2 + seq * fused_dim;
         iris_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
         shift = mod_params;
@@ -3538,10 +3592,8 @@ static float *iris_transformer_forward_bf16_flux(iris_transformer_flux_t *tf,
      * All modulation only depends on t_emb_silu and fixed weight matrices,
      * not on any GPU results, so we can compute everything upfront. */
     step_start = tf_get_time_ms();
-    for (int i = 0; i < hidden; i++) {
-        float x = t_emb[i];
-        tf->t_emb_silu[i] = x / (1.0f + expf(-x));
-    }
+    memcpy(tf->t_emb_silu, t_emb, hidden * sizeof(float));
+    iris_silu(tf->t_emb_silu, hidden);
     iris_linear_nobias(tf->double_mod_img, tf->t_emb_silu, tf->adaln_double_img_weight,
                        1, hidden, hidden * 6);
     iris_linear_nobias(tf->double_mod_txt, tf->t_emb_silu, tf->adaln_double_txt_weight,
@@ -3798,10 +3850,8 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     } else {
         int mod_size = h_size * 3;
         float *t_emb_silu = tf->t_emb_silu;
-        for (int i = 0; i < h_size; i++) {
-            float x = t_emb[i];
-            t_emb_silu[i] = x / (1.0f + expf(-x));
-        }
+        memcpy(t_emb_silu, t_emb, h_size * sizeof(float));
+        iris_silu(t_emb_silu, h_size);
         iris_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
         shift = mod_params;
         scale = mod_params + h_size;
@@ -3936,17 +3986,17 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
         fprintf(stderr, "Failed to allocate attention scores buffer\n");
         return NULL;
     }
+    if (ensure_forward_buffers(tf, img_seq, total_seq) < 0) {
+        fprintf(stderr, "Failed to allocate forward buffers\n");
+        return NULL;
+    }
 
     /* Get timestep embedding
      * FLUX.2-klein uses 256-dim sinusoidal (128 frequencies), not hidden_size
      * Use t_emb_silu as work buffer (it's not used until double blocks)
      */
     int sincos_dim = tf->time_embed.sincos_dim;
-    float *t_emb = (float *)malloc(hidden * sizeof(float));
-    if (!t_emb) {
-        fprintf(stderr, "Failed to allocate t_emb\n");
-        return NULL;
-    }
+    float *t_emb = tf->fwd_t_emb;
     float t_sincos[256];  /* sincos_dim is always 256 */
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
@@ -3964,12 +4014,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
      * Output: transposed[pos * channels + c]
      */
     int channels = tf->latent_channels;
-    float *img_transposed = (float *)malloc(img_seq * channels * sizeof(float));
-    if (!img_transposed) {
-        fprintf(stderr, "Failed to allocate img_transposed\n");
-        free(t_emb);
-        return NULL;
-    }
+    float *img_transposed = tf->fwd_img_transposed;
     for (int pos = 0; pos < img_seq; pos++) {
         for (int c = 0; c < channels; c++) {
             img_transposed[pos * channels + c] = img_latent[c * img_seq + pos];
@@ -3986,8 +4031,6 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
                                                            img_rope_cos, img_rope_sin,
                                                            txt_rope_cos, txt_rope_sin);
         if (bf16_output) {
-            free(img_transposed);
-            free(t_emb);
             /* RoPE buffers are cached in transformer struct - don't free */
             return bf16_output;
         } else {
@@ -4004,7 +4047,6 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     float *img_hidden = tf->img_hidden;
     LINEAR_BF16_OR_F32(img_hidden, img_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
                        img_seq, tf->latent_channels, hidden);
-    free(img_transposed);
 
     /* Project text embeddings to hidden */
     float *txt_hidden = tf->txt_hidden;
@@ -4038,10 +4080,8 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     double double_start = tf_get_time_ms();
 
     /* Compute SiLU(t_emb) ONCE — reused by double blocks, single blocks, and final layer */
-    for (int j = 0; j < hidden; j++) {
-        float x = t_emb[j];
-        tf->t_emb_silu[j] = x / (1.0f + expf(-x));
-    }
+    memcpy(tf->t_emb_silu, t_emb, hidden * sizeof(float));
+    iris_silu(tf->t_emb_silu, hidden);
 
     /* Pre-compute AdaLN modulation ONCE for all 5 double blocks.
      * t_emb and adaln weights are the same for all blocks within a step. */
@@ -4131,12 +4171,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
 
     /* Concatenate text and image for single-stream blocks
      * Python uses [txt, img] order for concatenation */
-    float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
-    if (!concat_hidden) {
-        fprintf(stderr, "Failed to allocate concat_hidden\n");
-        free(t_emb);
-        return NULL;
-    }
+    float *concat_hidden = tf->fwd_concat_hidden;
 
     /* Single-stream blocks */
     double single_start = tf_get_time_ms();
@@ -4390,7 +4425,6 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
 
     /* Extract image hidden states (image is after text) */
     memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
-    free(concat_hidden);
 
 #ifdef DEBUG_FINAL_LAYER
     fprintf(stderr, "[FINAL] Before final layer img_hidden[0,0,:5]: ");
@@ -4413,7 +4447,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     float *final_norm = tf->work1;
     apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
 
-    float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    float *output_nlc = tf->fwd_output_nlc;
     LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
                        img_seq, hidden, tf->latent_channels);
 
@@ -4427,9 +4461,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
             output[c * img_seq + pos] = output_nlc[pos * channels + c];
         }
     }
-    free(output_nlc);
 
-    free(t_emb);
     /* RoPE buffers are cached in the transformer and freed in iris_transformer_free_flux(). */
 
     double final_time = tf_get_time_ms() - final_start;
@@ -4453,7 +4485,6 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     return output;
 
 error:
-    free(t_emb);
     return NULL;
 }
 
@@ -4511,14 +4542,14 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
         fprintf(stderr, "Failed to allocate attention scores buffer\n");
         return NULL;
     }
+    if (ensure_forward_buffers(tf, combined_img_seq, total_seq) < 0) {
+        fprintf(stderr, "Failed to allocate forward buffers\n");
+        return NULL;
+    }
 
     /* Get timestep embedding */
     int sincos_dim = tf->time_embed.sincos_dim;
-    float *t_emb = (float *)malloc(hidden * sizeof(float));
-    if (!t_emb) {
-        fprintf(stderr, "Failed to allocate t_emb\n");
-        return NULL;
-    }
+    float *t_emb = tf->fwd_t_emb;
     float t_sincos[256];
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
@@ -4533,12 +4564,7 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
     get_cached_txt_rope(tf, txt_seq, &txt_rope_cos, &txt_rope_sin);
 
     /* Transpose and concatenate image latents: [target, reference] */
-    float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
-    if (!combined_transposed) {
-        fprintf(stderr, "Failed to allocate combined_transposed\n");
-        free(t_emb);
-        return NULL;
-    }
+    float *combined_transposed = tf->fwd_img_transposed;
 
     /* Target image */
     for (int pos = 0; pos < img_seq; pos++) {
@@ -4564,8 +4590,6 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
                                                            combined_rope_cos, combined_rope_sin,
                                                            txt_rope_cos, txt_rope_sin);
         if (bf16_output) {
-            free(combined_transposed);
-            free(t_emb);
             /* RoPE buffers are cached in transformer struct - don't free */
             return bf16_output;
         } else {
@@ -4574,17 +4598,10 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
     }
 #endif
 
-    /* Project combined image latent to hidden */
-    float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
-    if (!combined_hidden) {
-        fprintf(stderr, "Failed to allocate combined_hidden\n");
-        free(combined_transposed);
-        free(t_emb);
-        return NULL;
-    }
+    /* Project combined image latent to hidden — reuse tf->img_hidden (sized for total_seq >= combined_img_seq) */
+    float *combined_hidden = tf->img_hidden;
     LINEAR_BF16_OR_F32(combined_hidden, combined_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
                        combined_img_seq, tf->latent_channels, hidden);
-    free(combined_transposed);
 
     /* Project text embeddings to hidden */
     float *txt_hidden = tf->txt_hidden;
@@ -4593,10 +4610,8 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
 
     /* Pre-compute AdaLN modulation for double blocks */
     int double_mod_size = hidden * 6;  /* shift1, scale1, gate1, shift2, scale2, gate2 */
-    for (int j = 0; j < hidden; j++) {
-        float x = t_emb[j];
-        tf->t_emb_silu[j] = x / (1.0f + expf(-x));
-    }
+    memcpy(tf->t_emb_silu, t_emb, hidden * sizeof(float));
+    iris_silu(tf->t_emb_silu, hidden);
     iris_linear_nobias(tf->double_mod_img, tf->t_emb_silu, tf->adaln_double_img_weight,
                        1, hidden, double_mod_size);
     iris_linear_nobias(tf->double_mod_txt, tf->t_emb_silu, tf->adaln_double_txt_weight,
@@ -4623,16 +4638,9 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
     }
 
     /* Concatenate for single blocks: [txt, combined_img] */
-    float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
-    if (!concat_hidden) {
-        fprintf(stderr, "Failed to allocate concat_hidden\n");
-        free(combined_hidden);
-        free(t_emb);
-        return NULL;
-    }
+    float *concat_hidden = tf->fwd_concat_hidden;
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, combined_hidden, combined_img_seq * hidden * sizeof(float));
-    free(combined_hidden);
 
     /* Pre-compute single-block modulation ONCE (same for all 20 blocks).
      * t_emb_silu was already computed before the double blocks. */
@@ -4667,10 +4675,11 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
     }
     }  /* end pre-computed modulation block */
 
-    /* Extract ONLY target image hidden states (first img_seq tokens after txt) */
-    float *img_hidden = (float *)malloc(img_seq * hidden * sizeof(float));
+    /* Extract ONLY target image hidden states (first img_seq tokens after txt)
+     * Reuse tf->img_hidden — combined_hidden was an alias to it, but
+     * single blocks operated on concat_hidden, so img_hidden is safe to overwrite. */
+    float *img_hidden = tf->img_hidden;
     memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
-    free(concat_hidden);
 
     /* Final layer - only for target image tokens.
      * t_emb_silu was already computed before the double blocks — reuse it. */
@@ -4682,9 +4691,8 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
 
     float *final_norm = tf->work1;
     apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
-    free(img_hidden);
 
-    float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    float *output_nlc = tf->fwd_output_nlc;
     LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
                        img_seq, hidden, tf->latent_channels);
 
@@ -4695,9 +4703,7 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
             output[c * img_seq + pos] = output_nlc[pos * channels + c];
         }
     }
-    free(output_nlc);
 
-    free(t_emb);
     /* RoPE buffers are cached in the transformer and freed in iris_transformer_free_flux(). */
 
     if (iris_substep_callback)
@@ -4710,7 +4716,6 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
     return output;
 
 error:
-    free(t_emb);
     return NULL;
 }
 
@@ -4770,26 +4775,25 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
         fprintf(stderr, "Failed to allocate attention scores buffer\n");
         return NULL;
     }
+    if (ensure_forward_buffers(tf, combined_img_seq, total_seq) < 0) {
+        fprintf(stderr, "Failed to allocate forward buffers\n");
+        return NULL;
+    }
 
     /* Get timestep embedding */
     int sincos_dim = tf->time_embed.sincos_dim;
-    float *t_emb = (float *)malloc(hidden * sizeof(float));
-    if (!t_emb) {
-        fprintf(stderr, "Failed to allocate t_emb\n");
-        return NULL;
-    }
+    float *t_emb = tf->fwd_t_emb;
     float t_sincos[256];
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
 
-    /* Allocate combined RoPE arrays */
+    /* Allocate combined RoPE arrays (per-call: variable size depends on num_refs) */
     float *combined_rope_cos = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
     float *combined_rope_sin = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
     if (!combined_rope_cos || !combined_rope_sin) {
         fprintf(stderr, "Failed to allocate combined RoPE arrays\n");
         free(combined_rope_cos);
         free(combined_rope_sin);
-        free(t_emb);
         return NULL;
     }
 
@@ -4812,14 +4816,7 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
     get_cached_txt_rope(tf, txt_seq, &txt_rope_cos, &txt_rope_sin);
 
     /* Transpose and concatenate all image latents */
-    float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
-    if (!combined_transposed) {
-        fprintf(stderr, "Failed to allocate combined_transposed\n");
-        free(combined_rope_cos);
-        free(combined_rope_sin);
-        free(t_emb);
-        return NULL;
-    }
+    float *combined_transposed = tf->fwd_img_transposed;
 
     /* Target image */
     for (int pos = 0; pos < img_seq; pos++) {
@@ -4850,8 +4847,6 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
                                                            combined_rope_cos, combined_rope_sin,
                                                            txt_rope_cos, txt_rope_sin);
         if (bf16_output) {
-            free(combined_transposed);
-            free(t_emb);
             free(combined_rope_cos);
             free(combined_rope_sin);
             /* txt_rope is cached - don't free */
@@ -4862,19 +4857,10 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
     }
 #endif
 
-    /* Project combined image latent to hidden */
-    float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
-    if (!combined_hidden) {
-        fprintf(stderr, "Failed to allocate combined_hidden\n");
-        free(combined_transposed);
-        free(combined_rope_cos);
-        free(combined_rope_sin);
-        free(t_emb);
-        return NULL;
-    }
+    /* Project combined image latent to hidden — reuse tf->img_hidden (sized for total_seq >= combined_img_seq) */
+    float *combined_hidden = tf->img_hidden;
     LINEAR_BF16_OR_F32(combined_hidden, combined_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
                        combined_img_seq, tf->latent_channels, hidden);
-    free(combined_transposed);
 
     /* Project text embeddings to hidden */
     float *txt_hidden = tf->txt_hidden;
@@ -4883,10 +4869,8 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
 
     /* Pre-compute AdaLN modulation */
     int double_mod_size = hidden * 6;
-    for (int j = 0; j < hidden; j++) {
-        float x = t_emb[j];
-        tf->t_emb_silu[j] = x / (1.0f + expf(-x));
-    }
+    memcpy(tf->t_emb_silu, t_emb, hidden * sizeof(float));
+    iris_silu(tf->t_emb_silu, hidden);
     iris_linear_nobias(tf->double_mod_img, tf->t_emb_silu, tf->adaln_double_img_weight,
                        1, hidden, double_mod_size);
     iris_linear_nobias(tf->double_mod_txt, tf->t_emb_silu, tf->adaln_double_txt_weight,
@@ -4912,18 +4896,9 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
     }
 
     /* Concatenate for single blocks */
-    float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
-    if (!concat_hidden) {
-        fprintf(stderr, "Failed to allocate concat_hidden\n");
-        free(combined_hidden);
-        free(combined_rope_cos);
-        free(combined_rope_sin);
-        free(t_emb);
-        return NULL;
-    }
+    float *concat_hidden = tf->fwd_concat_hidden;
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, combined_hidden, combined_img_seq * hidden * sizeof(float));
-    free(combined_hidden);
 
     /* Pre-compute single-block modulation ONCE (same for all 20 blocks).
      * t_emb_silu was already computed before the double blocks. */
@@ -4957,10 +4932,10 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
     }
     }  /* end pre-computed modulation block */
 
-    /* Extract ONLY target image hidden states */
-    float *img_hidden = (float *)malloc(img_seq * hidden * sizeof(float));
+    /* Extract ONLY target image hidden states — reuse tf->img_hidden (combined_hidden was
+     * an alias; single blocks operated on concat_hidden, so img_hidden is safe to overwrite) */
+    float *img_hidden = tf->img_hidden;
     memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
-    free(concat_hidden);
 
     /* Final layer — t_emb_silu was already computed before the double blocks. */
     float *final_mod = tf->double_mod_img;
@@ -4971,9 +4946,8 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
 
     float *final_norm = tf->work1;
     apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
-    free(img_hidden);
 
-    float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    float *output_nlc = tf->fwd_output_nlc;
     LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
                        img_seq, hidden, tf->latent_channels);
 
@@ -4984,9 +4958,7 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
             output[c * img_seq + pos] = output_nlc[pos * channels + c];
         }
     }
-    free(output_nlc);
 
-    free(t_emb);
     free(combined_rope_cos);
     free(combined_rope_sin);
     /* Text RoPE buffers are cached in the transformer and freed in iris_transformer_free_flux(). */
@@ -5001,7 +4973,6 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
     return output;
 
 error:
-    free(t_emb);
     free(combined_rope_cos);
     free(combined_rope_sin);
     return NULL;
@@ -5262,6 +5233,12 @@ void iris_transformer_free_flux(iris_transformer_flux_t *tf) {
     free(tf->double_mod_txt);
     free(tf->double_img_attn_out);
     free(tf->double_txt_attn_out);
+
+    /* Free per-step forward buffers */
+    free(tf->fwd_t_emb);
+    free(tf->fwd_img_transposed);
+    free(tf->fwd_concat_hidden);
+    free(tf->fwd_output_nlc);
 
     /* Free cached RoPE buffers */
     free(tf->cached_img_rope_cos);

@@ -2,7 +2,7 @@
  * Iris Math Kernels - Implementation
  *
  * Math operations for Iris inference.
- * Uses Metal/MPS on Apple Silicon, BLAS otherwise.
+ * Apple Silicon M3 Ultra with Metal GPU, Accelerate BLAS, and NEON.
  */
 
 #include "iris_kernels.h"
@@ -11,19 +11,9 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* Use Metal for GPU acceleration on Apple Silicon */
-#ifdef USE_METAL
+#include <arm_neon.h>
 #include "iris_metal.h"
-#endif
-
-/* Use BLAS for matrix operations when enabled via Makefile */
-#ifdef USE_BLAS
-#ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
-#endif
 
 /* Minimum matrix size to use GPU (smaller matrices are faster on CPU) */
 #define MIN_GPU_ELEMENTS (512 * 512)
@@ -108,43 +98,19 @@ void iris_rand(float *out, int n) {
  * ======================================================================== */
 
 void iris_add(float *out, const float *a, const float *b, int n) {
-#ifdef USE_BLAS
     vDSP_vadd(a, 1, b, 1, out, 1, n);
-#else
-    for (int i = 0; i < n; i++) {
-        out[i] = a[i] + b[i];
-    }
-#endif
 }
 
 void iris_add_inplace(float *a, const float *b, int n) {
-#ifdef USE_BLAS
     vDSP_vadd(a, 1, b, 1, a, 1, n);
-#else
-    for (int i = 0; i < n; i++) {
-        a[i] += b[i];
-    }
-#endif
 }
 
 void iris_mul_inplace(float *a, const float *b, int n) {
-#ifdef USE_BLAS
     vDSP_vmul(a, 1, b, 1, a, 1, n);
-#else
-    for (int i = 0; i < n; i++) {
-        a[i] *= b[i];
-    }
-#endif
 }
 
 void iris_axpy(float *a, float scale, const float *b, int n) {
-#ifdef USE_BLAS
     cblas_saxpy(n, scale, b, 1, a, 1);
-#else
-    for (int i = 0; i < n; i++) {
-        a[i] += scale * b[i];
-    }
-#endif
 }
 
 /* ========================================================================
@@ -153,14 +119,13 @@ void iris_axpy(float *a, float scale, const float *b, int n) {
 
 /* General matrix multiply C = A @ B. Routes to Metal GPU when the matrix
  * is large enough that GPU compute outweighs the CPU-GPU transfer cost,
- * otherwise falls back to BLAS sgemm or a naive triple loop. This is the
- * backbone operation: every linear projection in the transformer, text
- * encoder, and VAE bottleneck goes through here. */
+ * otherwise uses Accelerate BLAS sgemm. This is the backbone operation:
+ * every linear projection in the transformer, text encoder, and VAE
+ * bottleneck goes through here. */
 void iris_matmul(float *C, const float *A, const float *B,
                  int M, int K, int N) {
     /* C[M,N] = A[M,K] @ B[K,N] */
 
-#ifdef USE_METAL
     size_t matrix_elements = (size_t)M * N;
     if (iris_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
         iris_metal_sgemm(0, 0,  /* no transpose */
@@ -172,32 +137,17 @@ void iris_matmul(float *C, const float *A, const float *B,
                          C, N);
         return;
     }
-#endif
 
-#ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 M, N, K,
                 1.0f, A, K, B, N,
                 0.0f, C, N);
-#else
-    /* Fallback: naive implementation */
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
-                sum += A[m * K + k] * B[k * N + n];
-            }
-            C[m * N + n] = sum;
-        }
-    }
-#endif
 }
 
 void iris_matmul_t(float *C, const float *A, const float *B,
                    int M, int K, int N) {
     /* C[M,N] = A[M,K] @ B[N,K]^T */
 
-#ifdef USE_METAL
     size_t matrix_elements = (size_t)M * N;
     if (iris_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
         iris_metal_sgemm(0, 1,  /* no transpose A, transpose B */
@@ -209,32 +159,17 @@ void iris_matmul_t(float *C, const float *A, const float *B,
                          C, N);
         return;
     }
-#endif
 
-#ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 M, N, K,
                 1.0f, A, K, B, K,
                 0.0f, C, N);
-#else
-    /* Fallback: naive implementation */
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
-                sum += A[m * K + k] * B[n * K + k];
-            }
-            C[m * N + n] = sum;
-        }
-    }
-#endif
 }
 
 void iris_linear(float *y, const float *x, const float *W, const float *b,
                  int seq_len, int in_dim, int out_dim) {
     /* y[seq, out] = x[seq, in] @ W[out, in]^T + b[out] */
 
-#ifdef USE_METAL
     /* Use Metal GPU for large matrices */
     size_t matrix_elements = (size_t)seq_len * out_dim;
     if (iris_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
@@ -254,16 +189,12 @@ void iris_linear(float *y, const float *x, const float *W, const float *b,
         /* Add bias if present */
         if (b != NULL) {
             for (int s = 0; s < seq_len; s++) {
-                for (int o = 0; o < out_dim; o++) {
-                    y[s * out_dim + o] += b[o];
-                }
+                vDSP_vadd(y + s * out_dim, 1, b, 1, y + s * out_dim, 1, out_dim);
             }
         }
         return;
     }
-#endif
 
-#ifdef USE_BLAS
     /* Use BLAS sgemm: C = alpha * A @ B^T + beta * C
      * A[M, K] = x[seq_len, in_dim]
      * B[N, K] = W[out_dim, in_dim]
@@ -277,26 +208,9 @@ void iris_linear(float *y, const float *x, const float *W, const float *b,
     /* Add bias if present */
     if (b != NULL) {
         for (int s = 0; s < seq_len; s++) {
-            for (int o = 0; o < out_dim; o++) {
-                y[s * out_dim + o] += b[o];
-            }
+            vDSP_vadd(y + s * out_dim, 1, b, 1, y + s * out_dim, 1, out_dim);
         }
     }
-#else
-    /* Fallback: naive implementation */
-    for (int s = 0; s < seq_len; s++) {
-        const float *x_row = x + s * in_dim;
-        float *y_row = y + s * out_dim;
-        for (int o = 0; o < out_dim; o++) {
-            const float *w_row = W + o * in_dim;
-            float sum = (b != NULL) ? b[o] : 0.0f;
-            for (int i = 0; i < in_dim; i++) {
-                sum += x_row[i] * w_row[i];
-            }
-            y_row[o] = sum;
-        }
-    }
-#endif
 }
 
 void iris_linear_nobias(float *y, const float *x, const float *W,
@@ -308,7 +222,6 @@ void iris_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                              int seq_len, int in_dim, int out_dim) {
     /* y[seq, out] = x[seq, in] @ W[out, in]^T */
 
-#ifdef USE_METAL
     /* Use Metal GPU for bf16 matmul - provides 2x memory bandwidth */
     size_t matrix_elements = (size_t)seq_len * out_dim;
     if (iris_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
@@ -326,19 +239,27 @@ void iris_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               y, out_dim);
         return;
     }
-#endif
 
-    /* Fallback: convert bf16 to f32 and use regular linear */
+    /* CPU fallback: convert bf16 to f32 via NEON and use regular linear */
     float *W_f32 = (float *)malloc((size_t)out_dim * in_dim * sizeof(float));
     if (!W_f32) {
         memset(y, 0, (size_t)seq_len * out_dim * sizeof(float));
         return;
     }
 
-    /* Convert bf16 to f32 */
-    for (int i = 0; i < out_dim * in_dim; i++) {
-        uint32_t f32_bits = ((uint32_t)W_bf16[i]) << 16;
-        memcpy(&W_f32[i], &f32_bits, sizeof(float));
+    /* Convert bf16 to f32 (NEON: 4-wide shift) */
+    {
+        int total = out_dim * in_dim;
+        int i = 0;
+        for (; i + 3 < total; i += 4) {
+            uint16x4_t bf16 = vld1_u16((const uint16_t*)(W_bf16 + i));
+            uint32x4_t f32_bits = vshll_n_u16(bf16, 16);
+            vst1q_f32(W_f32 + i, vreinterpretq_f32_u32(f32_bits));
+        }
+        for (; i < total; i++) {
+            uint32_t f32_bits = ((uint32_t)W_bf16[i]) << 16;
+            memcpy(&W_f32[i], &f32_bits, sizeof(float));
+        }
     }
 
     iris_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
@@ -350,15 +271,11 @@ void iris_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
  * ======================================================================== */
 
 void iris_gpu_begin_batch(void) {
-#ifdef USE_METAL
     iris_metal_begin_batch();
-#endif
 }
 
 void iris_gpu_end_batch(void) {
-#ifdef USE_METAL
     iris_metal_end_batch();
-#endif
 }
 
 /* ========================================================================
@@ -376,7 +293,6 @@ void iris_conv2d(float *out, const float *in, const float *weight, const float *
     int outH = (H + 2 * padding - kH) / stride + 1;
     int outW = (W + 2 * padding - kW) / stride + 1;
 
-#ifdef USE_BLAS
     /* im2col + BLAS optimization with tiling for large convolutions */
     size_t col_size = (size_t)in_ch * kH * kW * outH * outW;
     size_t max_col_size = (size_t)256 * 1024 * 1024;  /* 1GB limit */
@@ -393,7 +309,8 @@ void iris_conv2d(float *out, const float *in, const float *weight, const float *
     size_t tile_col_size = (size_t)in_ch * kH * kW * tile_rows * outW;
     float *col = malloc(tile_col_size * sizeof(float));
     if (!col) {
-        goto naive_fallback;
+        memset(out, 0, (size_t)batch * out_ch * outH * outW * sizeof(float));
+        return;
     }
 
     for (int b = 0; b < batch; b++) {
@@ -449,46 +366,12 @@ void iris_conv2d(float *out, const float *in, const float *weight, const float *
             for (int oc = 0; oc < out_ch; oc++) {
                 float b_val = bias[oc];
                 float *out_ch_ptr = out_b + oc * outH * outW;
-                for (int i = 0; i < outH * outW; i++) {
-                    out_ch_ptr[i] += b_val;
-                }
+                vDSP_vsadd(out_ch_ptr, 1, &b_val, out_ch_ptr, 1, outH * outW);
             }
         }
     }
 
     free(col);
-    return;
-
-naive_fallback:
-#endif
-    /* Naive implementation (fallback) */
-    for (int b = 0; b < batch; b++) {
-        for (int oc = 0; oc < out_ch; oc++) {
-            for (int oh = 0; oh < outH; oh++) {
-                for (int ow = 0; ow < outW; ow++) {
-                    float sum = (bias != NULL) ? bias[oc] : 0.0f;
-
-                    for (int ic = 0; ic < in_ch; ic++) {
-                        for (int kh = 0; kh < kH; kh++) {
-                            for (int kw = 0; kw < kW; kw++) {
-                                int ih = oh * stride - padding + kh;
-                                int iw = ow * stride - padding + kw;
-
-                                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                                    int in_idx = b * in_ch * H * W + ic * H * W + ih * W + iw;
-                                    int w_idx = oc * in_ch * kH * kW + ic * kH * kW + kh * kW + kw;
-                                    sum += in[in_idx] * weight[w_idx];
-                                }
-                            }
-                        }
-                    }
-
-                    int out_idx = b * out_ch * outH * outW + oc * outH * outW + oh * outW + ow;
-                    out[out_idx] = sum;
-                }
-            }
-        }
-    }
 }
 
 /* ========================================================================
@@ -497,7 +380,6 @@ naive_fallback:
 
 void iris_rms_norm(float *out, const float *x, const float *weight,
                    int seq_len, int hidden, float eps) {
-#ifdef USE_METAL
     /* Use GPU for RMSNorm only for very large tensors
      * The CPU-GPU sync overhead usually outweighs benefits for smaller ops */
     size_t elements = (size_t)seq_len * hidden;
@@ -505,13 +387,11 @@ void iris_rms_norm(float *out, const float *x, const float *weight,
         iris_metal_rms_norm(out, x, weight, seq_len, hidden, eps);
         return;
     }
-#endif
 
     for (int s = 0; s < seq_len; s++) {
         const float *x_row = x + s * hidden;
         float *out_row = out + s * hidden;
 
-#ifdef USE_BLAS
         float sum_sq;
         vDSP_svesq(x_row, 1, &sum_sq, hidden);
         float rms = sqrtf(sum_sq / hidden + eps);
@@ -521,20 +401,6 @@ void iris_rms_norm(float *out, const float *x, const float *weight,
         for (int i = 0; i < hidden; i++) {
             out_row[i] = x_row[i] * inv_rms * weight[i];
         }
-#else
-        /* Compute RMS */
-        float sum_sq = 0.0f;
-        for (int i = 0; i < hidden; i++) {
-            sum_sq += x_row[i] * x_row[i];
-        }
-        float rms = sqrtf(sum_sq / hidden + eps);
-        float rms_inv = 1.0f / rms;
-
-        /* Normalize and scale */
-        for (int i = 0; i < hidden; i++) {
-            out_row[i] = x_row[i] * rms_inv * weight[i];
-        }
-#endif
     }
 }
 
@@ -592,10 +458,13 @@ void iris_batch_norm(float *out, const float *x,
         float g = (gamma != NULL) ? gamma[c] : 1.0f;
         float b_val = (beta != NULL) ? beta[c] : 0.0f;
 
-        for (int n = 0; n < batch; n++) {
-            for (int i = 0; i < spatial; i++) {
-                int idx = n * channels * spatial + c * spatial + i;
-                out[idx] = g * (x[idx] - mean) * std_inv + b_val;
+        {
+            float scale = g * std_inv;
+            float offset = b_val - g * mean * std_inv;
+            for (int n = 0; n < batch; n++) {
+                const float *src = x + n * channels * spatial + c * spatial;
+                float *dst = out + n * channels * spatial + c * spatial;
+                vDSP_vsmsa(src, 1, &scale, &offset, dst, 1, spatial);
             }
         }
     }
@@ -606,13 +475,11 @@ void iris_batch_norm(float *out, const float *x,
  * ======================================================================== */
 
 void iris_silu(float *x, int n) {
-#ifdef USE_METAL
     /* Use GPU for very large arrays (overhead not worth it for small ones) */
     if (iris_metal_shaders_available() && n >= 4 * 1024 * 1024) {
         iris_metal_silu(x, n);
         return;
     }
-#endif
 
     for (int i = 0; i < n; i++) {
         float val = x[i];
@@ -622,12 +489,10 @@ void iris_silu(float *x, int n) {
 
 /* Fused SiLU(gate) * up in a single pass - avoids double memory traversal */
 void iris_silu_mul(float *gate, const float *up, int n) {
-#ifdef USE_METAL
     if (iris_metal_shaders_available() && n >= 4 * 1024 * 1024) {
         iris_metal_silu_mul(gate, up, n);
         return;
     }
-#endif
 
     for (int i = 0; i < n; i++) {
         float val = gate[i];
@@ -640,7 +505,6 @@ void iris_softmax_cpu(float *x, int rows, int cols) {
     for (int r = 0; r < rows; r++) {
         float *row = x + r * cols;
 
-#ifdef USE_BLAS
         /* vDSP-accelerated max, subtract, sum, and scale */
         float max_val;
         vDSP_maxv(row, 1, &max_val, cols);
@@ -656,38 +520,16 @@ void iris_softmax_cpu(float *x, int rows, int cols) {
 
         float inv_sum = 1.0f / sum;
         vDSP_vsmul(row, 1, &inv_sum, row, 1, cols);
-#else
-        /* Find max for numerical stability */
-        float max_val = row[0];
-        for (int c = 1; c < cols; c++) {
-            if (row[c] > max_val) max_val = row[c];
-        }
-
-        /* Compute exp and sum */
-        float sum = 0.0f;
-        for (int c = 0; c < cols; c++) {
-            row[c] = fast_expf(row[c] - max_val);
-            sum += row[c];
-        }
-
-        /* Normalize */
-        float inv_sum = 1.0f / sum;
-        for (int c = 0; c < cols; c++) {
-            row[c] *= inv_sum;
-        }
-#endif
     }
 }
 
 void iris_softmax(float *x, int rows, int cols) {
-#ifdef USE_METAL
     /* Use GPU only for very large softmax operations
      * Sync overhead usually dominates for smaller ops */
     if (iris_metal_shaders_available() && (size_t)rows * cols >= 4 * 1024 * 1024) {
         iris_metal_softmax(x, rows, cols);
         return;
     }
-#endif
     iris_softmax_cpu(x, rows, cols);
 }
 
@@ -696,7 +538,7 @@ void iris_softmax(float *x, int rows, int cols) {
  * ======================================================================== */
 
 /* Scaled dot-product attention: softmax(Q @ K^T / sqrt(d)) @ V.
- * This is the naive implementation that materializes the full seq_q x seq_k
+ * This is the materializing implementation that builds the full seq_q x seq_k
  * attention matrix. Used only for small sequences; the transformer's main
  * attention path uses iris_flash_attention() or the GPU kernel instead. */
 void iris_attention(float *out, const float *Q, const float *K, const float *V,
@@ -713,30 +555,20 @@ void iris_attention(float *out, const float *Q, const float *K, const float *V,
             const float *v = V + (b * heads + h) * seq_k * head_dim;
             float *o = out + (b * heads + h) * seq_q * head_dim;
 
-            /* scores = Q @ K^T * scale */
-            for (int i = 0; i < seq_q; i++) {
-                for (int j = 0; j < seq_k; j++) {
-                    float dot = 0.0f;
-                    for (int d = 0; d < head_dim; d++) {
-                        dot += q[i * head_dim + d] * k[j * head_dim + d];
-                    }
-                    scores[i * seq_k + j] = dot * scale;
-                }
-            }
+            /* scores[seq_q, seq_k] = scale * Q[seq_q, head_dim] @ K[seq_k, head_dim]^T */
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        seq_q, seq_k, head_dim,
+                        scale, q, head_dim, k, head_dim,
+                        0.0f, scores, seq_k);
 
             /* softmax */
             iris_softmax(scores, seq_q, seq_k);
 
-            /* out = scores @ V */
-            for (int i = 0; i < seq_q; i++) {
-                for (int d = 0; d < head_dim; d++) {
-                    float sum = 0.0f;
-                    for (int j = 0; j < seq_k; j++) {
-                        sum += scores[i * seq_k + j] * v[j * head_dim + d];
-                    }
-                    o[i * head_dim + d] = sum;
-                }
-            }
+            /* out[seq_q, head_dim] = scores[seq_q, seq_k] @ V[seq_k, head_dim] */
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        seq_q, head_dim, seq_k,
+                        1.0f, scores, seq_k, v, head_dim,
+                        0.0f, o, head_dim);
         }
     }
 
@@ -825,7 +657,7 @@ static void flash_attention_head(float *out,
 /*
  * Flash attention with BLAS-optimized tiling.
  * Processes queries in tiles for better cache utilization.
- * Uses BLAS for tile-level matrix operations when available.
+ * Uses Accelerate BLAS for tile-level matrix operations.
  *
  * Q: [seq_q, head_dim], K: [seq_k, head_dim], V: [seq_k, head_dim]
  * out: [seq_q, head_dim]
@@ -868,22 +700,10 @@ static void flash_attention_head_tiled(float *out,
             float *out_tile = out + q_start * head_dim;
 
             /* Compute tile scores: Q_tile @ K_tile^T * scale */
-#ifdef USE_BLAS
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         q_len, k_len, head_dim,
                         scale, Q_tile, head_dim, K_tile, head_dim,
                         0.0f, tile_scores, k_tile_size);
-#else
-            for (int qi = 0; qi < q_len; qi++) {
-                for (int ki = 0; ki < k_len; ki++) {
-                    float dot = 0.0f;
-                    for (int d = 0; d < head_dim; d++) {
-                        dot += Q_tile[qi * head_dim + d] * K_tile[ki * head_dim + d];
-                    }
-                    tile_scores[qi * k_tile_size + ki] = dot * scale;
-                }
-            }
-#endif
 
             /* Online softmax update for this tile */
             for (int qi = 0; qi < q_len; qi++) {

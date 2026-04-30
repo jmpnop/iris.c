@@ -979,7 +979,10 @@ int *qwen3_tokenize(qwen3_tokenizer_t *tok, const char *text,
     for (int c = 0; c < num_chunks && total < max_len; c++) {
         /* Convert to byte-level encoding */
         char *byte_text = text_to_bytes(chunks[c]);
-        if (!byte_text) continue;
+        if (!byte_text) {
+            free(chunks[c]);
+            continue;
+        }
 
         /* Apply BPE */
         token_node_t *bpe_tokens = bpe_encode_word(tok, byte_text);

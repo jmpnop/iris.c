@@ -83,55 +83,6 @@ float *iris_schedule_power(int num_steps, float alpha) {
 }
 
 /*
- * Shifted sigmoid schedule (better for flow matching)
- * shift controls where the inflection point is
- */
-float *iris_schedule_sigmoid(int num_steps, float shift) {
-    float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
-    if (!schedule) return NULL;
-
-    for (int i = 0; i <= num_steps; i++) {
-        float t = (float)i / (float)num_steps;
-        /* Shifted sigmoid: more steps at the end */
-        float x = (t - 0.5f) * 10.0f + shift;
-        schedule[i] = 1.0f - 1.0f / (1.0f + expf(-x));
-    }
-
-    /* Ensure endpoints */
-    schedule[0] = 1.0f;
-    schedule[num_steps] = 0.0f;
-
-    return schedule;
-}
-
-/*
- * Resolution-dependent schedule (as used in FLUX.2)
- * Higher resolutions use more steps at the start
- */
-float *iris_schedule_resolution(int num_steps, int height, int width) {
-    float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
-    if (!schedule) return NULL;
-
-    /* Compute shift based on resolution */
-    int pixels = height * width;
-    float shift = 0.0f;
-    if (pixels >= 1024 * 1024) {
-        shift = 1.0f;  /* High res: more early steps */
-    } else if (pixels >= 512 * 512) {
-        shift = 0.5f;
-    }
-
-    for (int i = 0; i <= num_steps; i++) {
-        float t = (float)i / (float)num_steps;
-        /* Apply shift */
-        t = powf(t, 1.0f + shift * 0.5f);
-        schedule[i] = 1.0f - t;
-    }
-
-    return schedule;
-}
-
-/*
  * FLUX.2 official schedule with empirical mu calculation
  * Matches Python's get_schedule() function from official flux2 code
  */
@@ -439,9 +390,8 @@ float *iris_sample_euler_zimage(void *transformer,
         }
 
         /* Euler step: z_next = z + dt * (-model_output) */
-        for (int i = 0; i < latent_size; i++) {
-            z_curr[i] += dt * (-model_out[i]);
-        }
+        float neg_dt = -dt;
+        iris_axpy(z_curr, neg_dt, model_out, latent_size);
 
         free(model_out);
 
@@ -723,9 +673,8 @@ float *iris_sample_euler_zimage_img2img(void *transformer,
         }
 
         /* Euler step: z_next = z + dt * (-model_output) */
-        for (int i = 0; i < latent_size; i++) {
-            z_curr[i] += dt * (-model_out[i]);
-        }
+        float neg_dt = -dt;
+        iris_axpy(z_curr, neg_dt, model_out, latent_size);
 
         free(model_out);
 
@@ -1245,171 +1194,6 @@ float *iris_sample_euler_cfg_multirefs_flux(void *transformer, void *text_encode
     return z_curr;
 }
 
-/*
- * Sample using Euler method with stochastic noise injection.
- * This can help with diversity and quality.
- */
-float *iris_sample_euler_ancestral(void *transformer,
-                                   float *z, int batch, int channels, int h, int w,
-                                   const float *text_emb, int text_seq,
-                                   const float *schedule, int num_steps,
-                                   float eta,
-                                   void (*progress_callback)(int step, int total)) {
-    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
-    if (num_steps < 1) return NULL;
-    iris_transformer_flux_t *tf = (iris_transformer_flux_t *)transformer;
-    int latent_size = batch * channels * h * w;
-
-    float *z_curr = (float *)malloc(latent_size * sizeof(float));
-    float *noise = (float *)malloc(latent_size * sizeof(float));
-    if (!z_curr || !noise) {
-        free(z_curr);
-        free(noise);
-        return NULL;
-    }
-
-    iris_copy(z_curr, z, latent_size);
-
-    for (int step = 0; step < num_steps; step++) {
-        float t_curr = schedule[step];
-        float t_next = schedule[step + 1];
-        float dt = t_next - t_curr;
-
-        /* Predict velocity */
-        float *v = iris_transformer_forward_flux(tf, z_curr, h, w,
-                                            text_emb, text_seq, t_curr);
-        if (!v) {
-            free(z_curr);
-            free(noise);
-            iris_transformer_free_mmap_cache_flux(tf);
-            return NULL;
-        }
-
-        /* Euler step */
-        iris_axpy(z_curr, dt, v, latent_size);
-
-        /* Add noise (ancestral sampling) */
-        if (eta > 0 && step < num_steps - 1) {
-            float sigma = eta * sqrtf(fabsf(dt));
-            iris_randn(noise, latent_size);
-            iris_axpy(z_curr, sigma, noise, latent_size);
-        }
-
-        free(v);
-
-        if (progress_callback) {
-            progress_callback(step + 1, num_steps);
-        }
-
-        /* Step image callback - decode and display intermediate result */
-        if (iris_step_image_callback && iris_step_image_vae && step + 1 < num_steps) {
-            iris_image *img = iris_vae_decode((iris_vae_t *)iris_step_image_vae,
-                                              z_curr, 1, h, w);
-            if (img) {
-                iris_step_image_callback(step + 1, num_steps, img);
-                iris_image_free(img);
-            }
-        }
-    }
-
-    free(noise);
-    iris_transformer_free_mmap_cache_flux(tf);
-    return z_curr;
-}
-
-/* ========================================================================
- * Heun Sampler (2nd order)
- * ======================================================================== */
-
-/*
- * Heun's method (improved Euler):
- * 1. Predict: z_pred = z_t + dt * v(z_t, t)
- * 2. Correct: z_next = z_t + dt/2 * (v(z_t, t) + v(z_pred, t+dt))
- */
-float *iris_sample_heun(void *transformer,
-                        float *z, int batch, int channels, int h, int w,
-                        const float *text_emb, int text_seq,
-                        const float *schedule, int num_steps,
-                        void (*progress_callback)(int step, int total)) {
-    if (num_steps > IRIS_MAX_STEPS) num_steps = IRIS_MAX_STEPS;
-    if (num_steps < 1) return NULL;
-    iris_transformer_flux_t *tf = (iris_transformer_flux_t *)transformer;
-    int latent_size = batch * channels * h * w;
-
-    float *z_curr = (float *)malloc(latent_size * sizeof(float));
-    float *z_pred = (float *)malloc(latent_size * sizeof(float));
-    if (!z_curr || !z_pred) {
-        free(z_curr);
-        free(z_pred);
-        return NULL;
-    }
-
-    iris_copy(z_curr, z, latent_size);
-
-    for (int step = 0; step < num_steps; step++) {
-        float t_curr = schedule[step];
-        float t_next = schedule[step + 1];
-        float dt = t_next - t_curr;
-
-        /* First velocity estimate */
-        float *v1 = iris_transformer_forward_flux(tf, z_curr, h, w,
-                                             text_emb, text_seq, t_curr);
-        if (!v1) {
-            free(z_curr);
-            free(z_pred);
-            iris_transformer_free_mmap_cache_flux(tf);
-            return NULL;
-        }
-
-        /* Predict next state */
-        iris_copy(z_pred, z_curr, latent_size);
-        iris_axpy(z_pred, dt, v1, latent_size);
-
-        /* Second velocity estimate (only if not last step) */
-        if (step < num_steps - 1) {
-            float *v2 = iris_transformer_forward_flux(tf, z_pred, h, w,
-                                                 text_emb, text_seq, t_next);
-            if (!v2) {
-                free(v1);
-                free(z_curr);
-                free(z_pred);
-                iris_transformer_free_mmap_cache_flux(tf);
-                return NULL;
-            }
-
-            /* Heun correction: z_next = z_curr + dt/2 * (v1 + v2) */
-            for (int i = 0; i < latent_size; i++) {
-                z_curr[i] += 0.5f * dt * (v1[i] + v2[i]);
-            }
-
-            free(v2);
-        } else {
-            /* Last step: just use Euler */
-            iris_axpy(z_curr, dt, v1, latent_size);
-        }
-
-        free(v1);
-
-        if (progress_callback) {
-            progress_callback(step + 1, num_steps);
-        }
-
-        /* Step image callback - decode and display intermediate result */
-        if (iris_step_image_callback && iris_step_image_vae && step + 1 < num_steps) {
-            iris_image *img = iris_vae_decode((iris_vae_t *)iris_step_image_vae,
-                                              z_curr, 1, h, w);
-            if (img) {
-                iris_step_image_callback(step + 1, num_steps, img);
-                iris_image_free(img);
-            }
-        }
-    }
-
-    free(z_pred);
-    iris_transformer_free_mmap_cache_flux(tf);
-    return z_curr;
-}
-
 /* ========================================================================
  * Latent Noise Initialization
  * ======================================================================== */
@@ -1468,56 +1252,3 @@ float *iris_init_noise(int batch, int channels, int h, int w, int64_t seed) {
     return noise;
 }
 
-/* ========================================================================
- * Full Generation Pipeline
- * ======================================================================== */
-
-/* Complete text-to-image pipeline in latent space. Orchestrates:
- * text encoding -> noise initialization -> schedule computation -> Euler
- * sampling -> returns denoised latent (caller handles VAE decode).
- * Routes to the appropriate sampler variant based on model type. */
-typedef struct iris_ctx iris_ctx;
-
-/* Forward declaration */
-extern iris_ctx *iris_get_ctx(void);
-
-float *iris_generate_latent(void *ctx_ptr,
-                            const float *text_emb, int text_seq,
-                            int height, int width,
-                            int num_steps,
-                            int64_t seed,
-                            void (*progress_callback)(int step, int total)) {
-    /* Compute latent dimensions */
-    int latent_h = height / 16;
-    int latent_w = width / 16;
-    int channels = IRIS_LATENT_CHANNELS;
-
-    /* Initialize noise */
-    float *z = iris_init_noise(1, channels, latent_h, latent_w, seed);
-
-    /* Get schedule (4 steps for klein distilled) */
-    float *schedule = iris_schedule_linear(num_steps);
-
-    /* Sample (FLUX.2-klein is guidance-distilled, no CFG needed) */
-    float *latent = iris_sample_euler_flux(ctx_ptr, NULL,
-                                      z, 1, channels, latent_h, latent_w,
-                                      text_emb, text_seq,
-                                      schedule, num_steps,
-                                      progress_callback);
-
-    free(z);
-    free(schedule);
-
-    return latent;
-}
-
-/* ========================================================================
- * Legacy Progress Callback (for backwards compatibility)
- * ======================================================================== */
-
-/* Legacy callback for step-level progress (called from sampling loop) */
-void (*iris_progress_callback)(int, int) = NULL;
-
-void iris_set_progress_callback(void (*callback)(int, int)) {
-    iris_progress_callback = callback;
-}
